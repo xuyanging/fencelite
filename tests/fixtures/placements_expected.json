@@ -15,7 +15,7 @@
    "page": 1,
    "page_index": 0,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "gladstone_dog_park",
    "symbol_index": null
@@ -32,7 +32,7 @@
    "page": 1,
    "page_index": 0,
    "result": {
-    "error": "模板含 95 个图元过多（框选可能不够紧）"
+    "error": "template holds 95 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "gladstone_dog_park",
    "symbol_index": null
@@ -49,7 +49,7 @@
    "page": 1,
    "page_index": 0,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "gladstone_dog_park",
    "symbol_index": null
@@ -66,7 +66,7 @@
    "page": 1,
    "page_index": 0,
    "result": {
-    "error": "模板含 41 个图元过多（框选可能不够紧）"
+    "error": "template holds 41 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "gladstone_dog_park",
    "symbol_index": null
@@ -121,7 +121,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "gladstone_dog_park",
    "symbol_index": null
@@ -138,7 +138,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "模板含 173 个图元过多（框选可能不够紧）"
+    "error": "template holds 173 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "gladstone_dog_park",
    "symbol_index": null
@@ -180,7 +180,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "模板含 67 个图元过多（框选可能不够紧）"
+    "error": "template holds 67 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "gladstone_dog_park",
    "symbol_index": null
@@ -197,7 +197,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "gladstone_dog_park",
    "symbol_index": null
@@ -3464,7 +3464,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -3481,7 +3481,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "模板含 142 个图元过多（框选可能不够紧）"
+    "error": "template holds 142 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -3523,7 +3523,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "模板含 65 个图元过多（框选可能不够紧）"
+    "error": "template holds 65 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -3724,7 +3724,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -3741,7 +3741,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -6114,7 +6114,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -6131,7 +6131,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "模板含 97 个图元过多（框选可能不够紧）"
+    "error": "template holds 97 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -6173,7 +6173,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "模板含 30 个图元过多（框选可能不够紧）"
+    "error": "template holds 30 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -6247,7 +6247,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -6264,7 +6264,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -8291,7 +8291,7 @@
    "page": 7,
    "page_index": 6,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -8308,7 +8308,7 @@
    "page": 7,
    "page_index": 6,
    "result": {
-    "error": "模板含 113 个图元过多（框选可能不够紧）"
+    "error": "template holds 113 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -8483,7 +8483,7 @@
    "page": 7,
    "page_index": 6,
    "result": {
-    "error": "模板含 61 个图元过多（框选可能不够紧）"
+    "error": "template holds 61 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -10387,7 +10387,7 @@
    "page": 7,
    "page_index": 6,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -10404,7 +10404,7 @@
    "page": 7,
    "page_index": 6,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "koch_tennis_center",
    "symbol_index": null
@@ -10485,7 +10485,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -10502,7 +10502,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "模板含 161 个图元过多（框选可能不够紧）"
+    "error": "template holds 161 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -10519,7 +10519,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -10536,7 +10536,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "模板含 138 个图元过多（框选可能不够紧）"
+    "error": "template holds 138 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -10553,7 +10553,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -10595,7 +10595,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -10612,7 +10612,7 @@
    "page": 3,
    "page_index": 2,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -10629,7 +10629,7 @@
    "page": 19,
    "page_index": 18,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": 0
@@ -10646,7 +10646,7 @@
    "page": 19,
    "page_index": 18,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -10663,7 +10663,7 @@
    "page": 19,
    "page_index": 18,
    "result": {
-    "error": "模板含 220 个图元过多（框选可能不够紧）"
+    "error": "template holds 220 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11078,7 +11078,7 @@
    "page": 19,
    "page_index": 18,
    "result": {
-    "error": "模板含 147 个图元过多（框选可能不够紧）"
+    "error": "template holds 147 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11095,7 +11095,7 @@
    "page": 19,
    "page_index": 18,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11137,7 +11137,7 @@
    "page": 19,
    "page_index": 18,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11154,7 +11154,7 @@
    "page": 19,
    "page_index": 18,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11171,7 +11171,7 @@
    "page": 34,
    "page_index": 33,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": 0
@@ -11363,7 +11363,7 @@
    "page": 34,
    "page_index": 33,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11380,7 +11380,7 @@
    "page": 34,
    "page_index": 33,
    "result": {
-    "error": "框选范围过大"
+    "error": "selection box too large"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11397,7 +11397,7 @@
    "page": 34,
    "page_index": 33,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11414,7 +11414,7 @@
    "page": 34,
    "page_index": 33,
    "result": {
-    "error": "框选范围过大"
+    "error": "selection box too large"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11431,7 +11431,7 @@
    "page": 34,
    "page_index": 33,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11473,7 +11473,7 @@
    "page": 34,
    "page_index": 33,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11490,7 +11490,7 @@
    "page": 34,
    "page_index": 33,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "lenexa_fuel_station",
    "symbol_index": null
@@ -11507,7 +11507,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": 0
@@ -11549,7 +11549,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": 2
@@ -11566,7 +11566,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11583,7 +11583,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "模板含 188 个图元过多（框选可能不够紧）"
+    "error": "template holds 188 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11600,7 +11600,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11617,7 +11617,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "模板含 158 个图元过多（框选可能不够紧）"
+    "error": "template holds 158 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11634,7 +11634,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11676,7 +11676,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11693,7 +11693,7 @@
    "page": 4,
    "page_index": 3,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11767,7 +11767,7 @@
    "page": 10,
    "page_index": 9,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11784,7 +11784,7 @@
    "page": 10,
    "page_index": 9,
    "result": {
-    "error": "模板含 417 个图元过多（框选可能不够紧）"
+    "error": "template holds 417 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11826,7 +11826,7 @@
    "page": 10,
    "page_index": 9,
    "result": {
-    "error": "模板含 191 个图元过多（框选可能不够紧）"
+    "error": "template holds 191 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11843,7 +11843,7 @@
    "page": 10,
    "page_index": 9,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11885,7 +11885,7 @@
    "page": 10,
    "page_index": 9,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11902,7 +11902,7 @@
    "page": 10,
    "page_index": 9,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -11995,7 +11995,7 @@
    "page": 11,
    "page_index": 10,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12012,7 +12012,7 @@
    "page": 11,
    "page_index": 10,
    "result": {
-    "error": "模板含 316 个图元过多（框选可能不够紧）"
+    "error": "template holds 316 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12103,7 +12103,7 @@
    "page": 11,
    "page_index": 10,
    "result": {
-    "error": "模板含 243 个图元过多（框选可能不够紧）"
+    "error": "template holds 243 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12120,7 +12120,7 @@
    "page": 11,
    "page_index": 10,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12162,7 +12162,7 @@
    "page": 11,
    "page_index": 10,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12179,7 +12179,7 @@
    "page": 11,
    "page_index": 10,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12221,7 +12221,7 @@
    "page": 27,
    "page_index": 26,
    "result": {
-    "error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"
+    "error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12238,7 +12238,7 @@
    "page": 27,
    "page_index": 26,
    "result": {
-    "error": "模板含 254 个图元过多（框选可能不够紧）"
+    "error": "template holds 254 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12280,7 +12280,7 @@
    "page": 27,
    "page_index": 26,
    "result": {
-    "error": "模板含 202 个图元过多（框选可能不够紧）"
+    "error": "template holds 202 primitives, too many (the selection may not be tight enough)"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12297,7 +12297,7 @@
    "page": 27,
    "page_index": 26,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12339,7 +12339,7 @@
    "page": 27,
    "page_index": 26,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": null
@@ -12356,7 +12356,7 @@
    "page": 27,
    "page_index": 26,
    "result": {
-    "error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"
+    "error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"
    },
    "slug": "rapid_city",
    "symbol_index": null

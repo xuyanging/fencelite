@@ -499,7 +499,7 @@ class TestPlacementsStage(JobTestBase):
         warnings = job._stage_placements(self.slug)
         self.assertEqual(self.seen, [])
         self.assertEqual(len(warnings), 1)
-        self.assertIn("视图分类不当期", warnings[0])
+        self.assertIn("view classification is stale", warnings[0])
         self.assertNotIn("plc_v", store.load_json(self.cache_path,
                                                   {})["1"]["result"])
 
@@ -527,7 +527,7 @@ class TestPlacementsStage(JobTestBase):
         warnings = job._stage_placements(self.slug)
         self.assertEqual(self.seen, [])
         self.assertEqual(len(warnings), 1)
-        self.assertIn("视图分类不当期", warnings[0])
+        self.assertIn("view classification is stale", warnings[0])
 
     def test_page_level_matcher_blowup_is_a_warning_not_a_dead_job(self):
         store.save_json(store.slug_dir(self.slug) / "view_types.json",
@@ -630,8 +630,8 @@ class TestTextStageOffline(JobTestBase):
                                return_value=(set(), None)), \
                 mock.patch("time.sleep") as sleep:      # 别真等退避
             warnings = job._stage_text(self.slug, "find every manhole cover")
-        self.assertTrue(any("文字 VLM 失败" in w for w in warnings), warnings)
-        self.assertTrue(any("不当期" in w for w in warnings), warnings)
+        self.assertTrue(any("text VLM failed" in w for w in warnings), warnings)
+        self.assertTrue(any("stale sheets" in w for w in warnings), warnings)
         # RETRIES=2 → 共 3 次尝试，退避 20*(n+1) 秒
         self.assertEqual(len(self.blocked_calls), 3)
         self.assertEqual([c.args[0] for c in sleep.call_args_list], [20, 40])

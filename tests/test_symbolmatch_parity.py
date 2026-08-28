@@ -185,7 +185,7 @@ class SymbolPlacementParityTests(unittest.TestCase):
             result = find_symbol_placements(str(pdf), case["page_index"],
                                             case["box_2d"])
             self.assertEqual(case["result"], result, case["box_2d"])
-            if str(result.get("error", "")).startswith("框内只有线段"):
+            if str(result.get("error", "")).startswith("the box holds only line segments"):
                 refused += 1
         self.assertGreater(refused, 0,
                            "no line sample reached the segments-only branch")

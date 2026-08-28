@@ -6093,7 +6093,347 @@ try {
     const heads = found.filter((r) => r.terminalKind === "arrowhead");
     return heads.length && heads.length !== found.length ? heads : found;
   };
-  const first = resolveCalloutBoxes(prepared, boxes, { automaticCallouts });
+  const anchorLabels = job.anchor_labels ?? [];
+  const anchorTexts = job.anchor_texts ?? [];
+  const anchorVecBacked = job.anchor_vec_backed ?? [];
+
+  // A vector supplement can be only the final fence-bearing row of a wrapped
+  // paragraph while the authored leader is attached to its first row.  Reuse
+  // only a unique marked automatic owner reached through a short same-column
+  // decoded-text chain; never borrow merely-nearby loose geometry.
+  const decodedTextRows = prepared.scene.ops.flatMap((op, opIndex) =>
+    op?.kind === "text" && op.bounds
+      ? [{ opIndex, bounds: finiteBounds(op.bounds),
+          frame: boundsToFrame(page, finiteBounds(op.bounds)),
+          text: String(op.text ?? "") }]
+      : []
+  );
+  const boundsOfOps = (opIndices) => {
+    const rows = opIndices.map((opIndex) => prepared.scene.ops[opIndex])
+      .filter((op) => op?.bounds).map((op) => finiteBounds(op.bounds));
+    return rows.length
+      ? rows.reduce((combined, bounds) => unionBounds(combined, bounds))
+      : null;
+  };
+  const wordTokens = (value) => new Set(String(value ?? "").toUpperCase()
+    .replace(/[^A-Z0-9]+/g, " ").trim().split(/\s+/)
+    .filter((token) => token.length >= 4));
+  const compactText = (value) => String(value ?? "").toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "");
+  const axisGap = (value, low, high) =>
+    Math.max(0, low - value, value - high);
+  const frameAxes = (frame) => {
+    const height = Math.max(1e-6, frame[2] - frame[0]);
+    const width = Math.max(1e-6, frame[3] - frame[1]);
+    const horizontal = width >= height;
+    return horizontal ? {
+      horizontal,
+      shortMin: frame[0], shortMax: frame[2],
+      longMin: frame[1], longMax: frame[3],
+      shortSize: height,
+      shortCenter: (frame[0] + frame[2]) / 2
+    } : {
+      horizontal,
+      shortMin: frame[1], shortMax: frame[3],
+      longMin: frame[0], longMax: frame[2],
+      shortSize: width,
+      shortCenter: (frame[1] + frame[3]) / 2
+    };
+  };
+  const domainText = (value) => {
+    const raw = String(value ?? "").toUpperCase();
+    const compact = compactText(raw);
+    const tokens = wordTokens(raw);
+    const gateLike = compact.includes("GATE")
+      && !compact.includes("AGGREGATE");
+    return compact.includes("FENC") || compact.includes("CHAINLINK")
+      || compact.includes("GUARDRAIL") || gateLike
+      || tokens.has("GATE") || tokens.has("GATES")
+      || compact === "GATE" || compact === "GATES";
+  };
+  const semanticallySameText = (leftValue, rightValue) => {
+    const left = compactText(leftValue);
+    const right = compactText(rightValue);
+    if (Math.min(left.length, right.length) >= 8
+        && (left.includes(right) || right.includes(left))) return true;
+    const leftTokens = wordTokens(leftValue);
+    const rightTokens = wordTokens(rightValue);
+    if (!leftTokens.size || !rightTokens.size) return false;
+    const overlap = [...leftTokens].filter((token) =>
+      rightTokens.has(token)).length;
+    return overlap / Math.max(leftTokens.size, rightTokens.size) >= 0.7;
+  };
+  const orientedFrameAxes = (frame, horizontal) => horizontal ? {
+    horizontal,
+    shortMin: frame[0], shortMax: frame[2],
+    longMin: frame[1], longMax: frame[3],
+    shortSize: Math.max(1e-6, frame[2] - frame[0]),
+    shortCenter: (frame[0] + frame[2]) / 2
+  } : {
+    horizontal,
+    shortMin: frame[1], shortMax: frame[3],
+    longMin: frame[0], longMax: frame[2],
+    shortSize: Math.max(1e-6, frame[3] - frame[1]),
+    shortCenter: (frame[1] + frame[3]) / 2
+  };
+  const buildDecodedLines = (horizontal) => {
+    const glyphs = decodedTextRows.map((row) => ({
+      ...row,
+      axes: orientedFrameAxes(row.frame, horizontal)
+    })).sort((left, right) => left.axes.shortCenter - right.axes.shortCenter
+      || left.axes.longMin - right.axes.longMin || left.opIndex - right.opIndex);
+    const bands = [];
+    for (const glyph of glyphs) {
+      const held = bands[bands.length - 1];
+      const tolerance = held
+        ? Math.max(held.shortSize, glyph.axes.shortSize) * 0.45 : 0;
+      if (!held || glyph.axes.shortCenter - held.shortCenter > tolerance) {
+        bands.push({ glyphs: [glyph], shortCenter: glyph.axes.shortCenter,
+          shortSize: glyph.axes.shortSize });
+      } else {
+        held.glyphs.push(glyph);
+        held.shortCenter = held.glyphs.reduce((sum, row) =>
+          sum + row.axes.shortCenter, 0) / held.glyphs.length;
+        held.shortSize = Math.max(held.shortSize, glyph.axes.shortSize);
+      }
+    }
+    const lines = [];
+    for (const band of bands) {
+      const ordered = band.glyphs.sort((left, right) =>
+        left.axes.longMin - right.axes.longMin || left.opIndex - right.opIndex);
+      let segment = [];
+      const publish = () => {
+        if (!segment.length) return;
+        const frame = segment.map((row) => row.frame)
+          .reduce((combined, row) => [
+            Math.min(combined[0], row[0]), Math.min(combined[1], row[1]),
+            Math.max(combined[2], row[2]), Math.max(combined[3], row[3])
+          ]);
+        lines.push({
+          opIndex: Math.min(...segment.map((row) => row.opIndex)),
+          opIndices: segment.map((row) => row.opIndex),
+          frame,
+          text: segment.map((row) => row.text).join(""),
+          axes: orientedFrameAxes(frame, horizontal)
+        });
+        segment = [];
+      };
+      for (const glyph of ordered) {
+        const previous = segment[segment.length - 1];
+        if (previous) {
+          const longGap = glyph.axes.longMin - previous.axes.longMax;
+          const splitGap = Math.max(4,
+            previous.axes.shortSize * 2, glyph.axes.shortSize * 2);
+          if (longGap > splitGap) publish();
+        }
+        segment.push(glyph);
+      }
+      publish();
+    }
+    return lines;
+  };
+  const decodedOwnerLines = {};
+  const ownerLinesFor = (horizontal) => {
+    const key = horizontal ? "horizontal" : "vertical";
+    if (!decodedOwnerLines[key]) {
+      decodedOwnerLines[key] = buildDecodedLines(horizontal);
+    }
+    return decodedOwnerLines[key];
+  };
+  const spatialOwnershipDebug = [];
+
+  // A geometry-only recovery must not borrow a real leader whose root belongs
+  // to a closer, non-fence text paragraph omitted from the supplied union.  A
+  // common failure is two adjacent notes in the same column: both marked
+  // packets pass the generous root radius, so the fence anchor receives the
+  // aluminium/concrete note's leader as a second branch.  Compare the visual
+  // short axis (Y for horizontal text, X for vertical text), then reconstruct
+  // the seed row's compact paragraph.  Repeated fence/gate wording stays
+  // eligible because the UI intentionally merges identical callouts.
+  const foreignDecodedTextOwnsRoot = (root, anchorIndex) => {
+    if (!domainText(anchorTexts[anchorIndex])) return false;
+    const targetFrame = boundsToFrame(page, boxes[anchorIndex]);
+    const target = frameAxes(targetFrame);
+    const [rootY, rootX] = pointToFrame(page, root);
+    const shortValue = target.horizontal ? rootY : rootX;
+    const longValue = target.horizontal ? rootX : rootY;
+    const targetShortGap = axisGap(
+      shortValue, target.shortMin, target.shortMax
+    );
+    const ownershipMargin = Math.max(
+      1.2, Math.min(4, target.shortSize * 0.25)
+    );
+    if (targetShortGap < Math.max(6, ownershipMargin)) {
+      if (job.debug_spatial_candidates) spatialOwnershipDebug.push({
+        anchor_index: anchorIndex, root: [rootY, rootX],
+        target_short_gap: targetShortGap, reason: "target-short-axis"
+      });
+      return false;
+    }
+
+    const ownerLines = ownerLinesFor(target.horizontal);
+    const nearby = ownerLines.filter((row) => {
+      const longGap = axisGap(
+        longValue, row.axes.longMin, row.axes.longMax
+      );
+      return longGap <= Math.max(18, row.axes.shortSize * 8,
+        target.shortSize * 2.4);
+    }).map((row) => ({
+      ...row,
+      shortGap: axisGap(shortValue, row.axes.shortMin, row.axes.shortMax),
+      longGap: axisGap(longValue, row.axes.longMin, row.axes.longMax)
+    })).sort((left, right) => left.shortGap - right.shortGap
+      || left.longGap - right.longGap || left.opIndex - right.opIndex);
+    const seed = nearby[0];
+    if (!seed || seed.shortGap + ownershipMargin >= targetShortGap) {
+      if (job.debug_spatial_candidates) spatialOwnershipDebug.push({
+        anchor_index: anchorIndex, root: [rootY, rootX],
+        target_short_gap: targetShortGap,
+        reason: seed ? "no-closer-decoded-row" : "no-decoded-row",
+        ...seed ? { seed: { text: seed.text, frame: seed.frame,
+          short_gap: seed.shortGap, long_gap: seed.longGap } } : {}
+        , nearest_any: ownerLines.map((row) => ({
+          text: row.text, frame: row.frame,
+          dy: axisGap(rootY, row.frame[0], row.frame[2]),
+          dx: axisGap(rootX, row.frame[1], row.frame[3])
+        })).sort((left, right) => Math.hypot(left.dy, left.dx)
+          - Math.hypot(right.dy, right.dx)).slice(0, 6)
+      });
+      return false;
+    }
+
+    const columnTolerance = Math.max(3,
+      seed.axes.shortSize * 2.2);
+    const column = ownerLines.filter((row) =>
+      Math.abs(row.axes.longMin - seed.axes.longMin) <= columnTolerance
+      && row.axes.shortSize / seed.axes.shortSize >= 0.45
+      && row.axes.shortSize / seed.axes.shortSize <= 2.2
+    ).sort((left, right) => left.axes.shortCenter - right.axes.shortCenter
+      || left.opIndex - right.opIndex);
+    let seedAt = column.findIndex((row) => row.opIndex === seed.opIndex);
+    if (seedAt < 0) return false;
+    let firstRow = seedAt;
+    let lastRow = seedAt;
+    while (firstRow > 0 && lastRow - firstRow + 1 < 5) {
+      const previous = column[firstRow - 1];
+      const current = column[firstRow];
+      const maxStep = Math.max(previous.axes.shortSize,
+        current.axes.shortSize) * 1.85;
+      if (current.axes.shortCenter - previous.axes.shortCenter > maxStep) break;
+      firstRow -= 1;
+    }
+    while (lastRow + 1 < column.length && lastRow - firstRow + 1 < 5) {
+      const current = column[lastRow];
+      const next = column[lastRow + 1];
+      const maxStep = Math.max(current.axes.shortSize,
+        next.axes.shortSize) * 1.85;
+      if (next.axes.shortCenter - current.axes.shortCenter > maxStep) break;
+      lastRow += 1;
+    }
+    const ownerText = column.slice(firstRow, lastRow + 1)
+      .map((row) => row.text).join(" ");
+    const blocked = !domainText(ownerText)
+      || !semanticallySameText(ownerText, anchorTexts[anchorIndex]);
+    if (job.debug_spatial_candidates) spatialOwnershipDebug.push({
+      anchor_index: anchorIndex,
+      root: [rootY, rootX],
+      target_short_gap: targetShortGap,
+      seed: { text: seed.text, frame: seed.frame,
+        short_gap: seed.shortGap, long_gap: seed.longGap },
+      owner_text: ownerText,
+      blocked
+    });
+    return blocked;
+  };
+  const resolveWrappedParagraph = (resolution, index) => {
+    if (resolution.source === "automatic") return resolution;
+    if (String(anchorLabels[index] ?? "").trim().toLowerCase()
+        !== "vector supplement") return resolution;
+    const anchorText = String(anchorTexts[index] ?? "");
+    if (!/(?:FENC\w*|GUARDRAIL\w*|GATE\w*)/i.test(anchorText)) {
+      return resolution;
+    }
+    if (/\b(?:DETAIL|SECTION|ELEVATION|PLAN)\b/i.test(anchorText)) {
+      return resolution;
+    }
+    const seedOps = (resolution.callout.textOps ?? [])
+      .filter((opIndex) => prepared.scene.ops[opIndex]?.kind === "text");
+    const seedBounds = boundsOfOps(seedOps);
+    if (!seedBounds) return resolution;
+    const suppliedTokens = wordTokens(anchorText);
+    const decodedTokens = wordTokens(seedOps.map((opIndex) =>
+      prepared.scene.ops[opIndex]?.text ?? "").join(" "));
+    const suppliedCompact = compactText(anchorText);
+    const decodedCompact = compactText(seedOps.map((opIndex) =>
+      prepared.scene.ops[opIndex]?.text ?? "").join(""));
+    const tokenMatch = [...suppliedTokens]
+      .some((token) => decodedTokens.has(token));
+    const compactMatch = decodedCompact.length >= 4
+      && (suppliedCompact.includes(decodedCompact)
+        || decodedCompact.includes(suppliedCompact));
+    if (!tokenMatch && !compactMatch) {
+      return resolution;
+    }
+    // Compare paragraph rows in the public display frame.  PDF user-space X/Y
+    // swap on 90/270-degree sheets; frame coordinates keep "same left edge"
+    // and "next visual row" invariant under page rotation.
+    const seedFrame = boundsToFrame(page, seedBounds);
+    const seedHeight = Math.max(1, seedFrame[2] - seedFrame[0]);
+    const seedCenterY = (seedFrame[0] + seedFrame[2]) / 2;
+    const candidates = [];
+    for (const callout of automaticCallouts) {
+      if (!(callout.leaders?.length ?? 0)) continue;
+      const carrierOps = (callout.textOps ?? [])
+        .filter((opIndex) => prepared.scene.ops[opIndex]?.kind === "text");
+      const carrierBounds = boundsOfOps(carrierOps);
+      if (!carrierBounds) continue;
+      const carrierFrame = boundsToFrame(page, carrierBounds);
+      const carrierHeight = Math.max(1, carrierFrame[2] - carrierFrame[0]);
+      const heightRatio = carrierHeight / seedHeight;
+      if (heightRatio < 0.55 || heightRatio > 1.8) continue;
+      const rowHeight = Math.max(seedHeight, carrierHeight);
+      const xTolerance = Math.max(rowHeight * 0.9, 1.2);
+      if (Math.abs(carrierFrame[1] - seedFrame[1]) > xTolerance) continue;
+      const carrierCenterY = (carrierFrame[0] + carrierFrame[2]) / 2;
+      if (Math.abs(carrierCenterY - seedCenterY) > rowHeight * 4.4) continue;
+      const low = Math.min(carrierCenterY, seedCenterY) - rowHeight * 0.35;
+      const high = Math.max(carrierCenterY, seedCenterY) + rowHeight * 0.35;
+      const centers = decodedTextRows.filter((row) => {
+        const height = Math.max(1, row.frame[2] - row.frame[0]);
+        const ratio = height / rowHeight;
+        const center = (row.frame[0] + row.frame[2]) / 2;
+        return ratio >= 0.5 && ratio <= 1.55
+          && center >= low && center <= high
+          && Math.abs(row.frame[1] - seedFrame[1]) <= xTolerance;
+      }).map((row) => (row.frame[0] + row.frame[2]) / 2)
+        .sort((left, right) => left - right);
+      const rows = [];
+      for (const center of centers) {
+        if (!rows.length || center - rows[rows.length - 1] > rowHeight * 0.35) {
+          rows.push(center);
+        }
+      }
+      if (rows.length < 2 || rows.length > 5) continue;
+      if (rows.some((center, rowIndex) => rowIndex > 0
+          && center - rows[rowIndex - 1] > rowHeight * 2.0)) continue;
+      candidates.push(callout);
+    }
+    const unique = new Map(candidates.map((callout) => [callout.id, callout]));
+    if (unique.size !== 1) return resolution;
+    const callout = [...unique.values()][0];
+    return {
+      ...resolution,
+      source: "automatic",
+      callout,
+      hasLeader: callout.leaders.length > 0,
+      intersectingOps: seedOps,
+      targetRegions: buildCalloutTargetRegions(
+        prepared.scene, [callout], prepared.pageBounds
+      )
+    };
+  };
+  const first = resolveCalloutBoxes(prepared, boxes, { automaticCallouts })
+    .map(resolveWrappedParagraph);
   const claimants = /* @__PURE__ */ new Map();
   first.forEach((resolution, index) => {
     if (resolution.source !== "automatic") return;
@@ -6117,6 +6457,34 @@ try {
     displaced += 1;
     return resolveCalloutBox(prepared, boxes[index], {});
   });
+  const spatialCandidateDebug = job.debug_spatial_candidates ? (() => {
+    const pageDiagonal = Math.max(1, boundsDiagonal(prepared.pageBounds));
+    return leaderCandidates(
+      prepared.scene,
+      pageDiagonal,
+      prepared.segmentation
+    ).filter((leader) => leader.packetKind !== "leader-only" || leader.markerOps.length)
+      .map((leader) => {
+        const markerBounds = leader.markerOps.length ? leader.markerOps
+          .map((opIndex) => finiteBounds(prepared.scene.ops[opIndex].bounds))
+          .reduce((combined, bounds) => unionBounds(combined, bounds)) : null;
+        const markerEnd = markerBounds && pointToBounds(leader.endpoints[1], markerBounds)
+          < pointToBounds(leader.endpoints[0], markerBounds) ? 1 : 0;
+        const rootEnd = markerEnd === 0 ? 1 : 0;
+        return {
+          op_index: leader.opIndex,
+          packet_kind: leader.packetKind,
+          marker_kind: leader.markerKind,
+          path_ops: leader.pathOps,
+          arrow_ops: leader.arrowheadOps,
+          marker_ops: leader.markerOps,
+          marker_end: markerEnd,
+          endpoints: leader.endpoints.map((point) => pointToFrame(page, point)),
+          route: pointDistance(leader.endpoints[0], leader.endpoints[1]),
+          distances: boxes.map((box) => pointToBounds(leader.endpoints[rootEnd], box))
+        };
+      });
+  })() : void 0;
   const roiCallouts = resolutions.map((resolution, index) => {
     if (resolution.source !== "roi") return null;
     const inspection = inspectCalloutTextRoi(
@@ -6128,6 +6496,185 @@ try {
     const found = inspection?.callouts ?? [];
     return found.length > 1 ? found : null;
   });
+
+  // One automatic text cluster may contain two adjacent decoded rows even
+  // though the caller supplied a box for only one of them.  Keep a leader
+  // only when its authored root belongs to a decoded text op covered by the
+  // supplied box.  This is deliberately component-level: branches that share
+  // a root keep the same owner, while a neighbouring note such as NEW
+  // CONCRETE WALK cannot donate its independent leader to NEW CHAIN LINK
+  // FENCE merely because both rows were decoded into one cluster.
+  const scopeCalloutLeadersToBox = (callout, box) => {
+    const carrierOps = (callout.textOps ?? [])
+      .filter((opIndex) => prepared.scene.ops[opIndex]?.kind === "text");
+    // A single leader attached to a wrapped paragraph belongs to the whole
+    // paragraph even when the supplied fence box covers only its final line.
+    // Row-level splitting is meaningful only when the merged carrier itself
+    // owns multiple independent leader components.
+    if (carrierOps.length < 2 || (callout.leaders?.length ?? 0) < 2) return callout;
+    const ownedOps = carrierOps.filter((opIndex) =>
+      overlaps(prepared.scene.ops[opIndex].bounds, box));
+    if (!ownedOps.length || ownedOps.length === carrierOps.length) return callout;
+    const foreignOps = carrierOps.filter((opIndex) => !ownedOps.includes(opIndex));
+    const ownershipMargin = Math.max(
+      1e-7, boundsDiagonal(prepared.pageBounds) * 5e-4
+    );
+    const distanceToOps = (point, opIndices) => Math.min(...opIndices.map(
+      (opIndex) => pointToBounds(point, prepared.scene.ops[opIndex].bounds)
+    ));
+    const leaders = callout.leaders.filter((leader) => {
+      const root = leader.root;
+      if (!root) return true;
+      const ownedDistance = distanceToOps(root, ownedOps);
+      const foreignDistance = distanceToOps(root, foreignOps);
+      return foreignDistance + ownershipMargin >= ownedDistance;
+    });
+    return leaders.length === callout.leaders.length
+      ? callout : { ...callout, leaders };
+  };
+  const calloutsAt = resolutions.map((resolution, index) =>
+    (roiCallouts[index] ?? [resolution.callout])
+      .map((callout) => scopeCalloutLeadersToBox(callout, boxes[index])));
+
+  // Spatial marked-leader recovery.  The primary detector deliberately uses
+  // PDF paint order to keep table rules and title underlines out.  Some CAD
+  // writers batch all labels and all arrows separately, though, so a real
+  // leader can be geometrically attached to its text while being thousands of
+  // paint operations away.  Recover only candidates that already carry an
+  // explicit arrow/open-marker packet.  It is allowed only for an unresolved
+  // supplied callout, and every leader already authored to *any* automatic
+  // callout on the page is globally owned.  Thus a nearby non-fence note can
+  // block reassignment even though that note was not sent as an output anchor.
+  const spatialFallbackByIndex = (() => {
+    const scene = prepared.scene;
+    const pageDiagonal = Math.max(1, boundsDiagonal(prepared.pageBounds));
+    const regularLeadersAt = calloutsAt.map((callouts) =>
+      callouts.flatMap((callout) => callout.leaders));
+    const leaderOps = (leader) => [
+      ...(leader.pathOps ?? []),
+      ...(leader.arrowheadOps ?? []),
+      ...(leader.markerOps ?? []),
+      ...(leader.targets ?? []).flatMap((target) => target.markerOps ?? [])
+    ];
+    const claimedOps = new Set(automaticCallouts.flatMap((callout) =>
+      (callout.leaders ?? []).flatMap(leaderOps)));
+
+    // The supplied VLM/vector-union boxes are the stable ownership frame.
+    // resolveCalloutBox may deliberately fall back to a nearby decoded text
+    // cluster; using that inferred carrier here can jump across adjacent legend
+    // rows, exactly the failure this fallback must avoid.
+    const eligible = boxes.flatMap((bounds, index) => {
+      const label = String(anchorLabels[index] ?? "").toLowerCase();
+      // Vector supplements include table rows and detail titles.  They need
+      // the stricter endpoint-graph pass in Python; this sidecar-only pass is
+      // reserved for model-confirmed callouts.
+      if (label !== "callout") return [];
+      // Never append a second, merely-nearby component to a callout that the
+      // authored detector has already resolved.  Genuine multi-branch leaders
+      // are emitted together by the primary detector; recovery is for empty
+      // anchors only.
+      if (regularLeadersAt[index].length !== 0) return [];
+      // Proximity alone cannot validate an unbacked VLM-only anchor when the
+      // resolver found neither decoded text nor automatic/ROI ownership.  It
+      // would otherwise borrow a neighbouring annotation's real arrow.  Keep
+      // vec-backed outline callouts eligible; they are known positive text
+      // even when this PDF decoder cannot expose their glyphs.
+      const resolution = resolutions[index];
+      if (resolution?.source === "text-only"
+          && !(resolution.callout.textOps?.length ?? 0)
+          && anchorVecBacked[index] !== true) return [];
+      const width = boundsWidth(bounds);
+      const height = boundsHeight(bounds);
+      const scale = Math.max(1, Math.min(width, height));
+      const threshold = Math.min(
+        pageDiagonal * 0.018,
+        Math.max(scale * 4, pageDiagonal * 25e-4)
+      );
+      return [{ index, bounds, label, scale, threshold }];
+    });
+    if (!eligible.length) return new Map();
+
+    const recovered = new Map();
+    const branchCount = regularLeadersAt.map((leaders) => leaders.length);
+    const candidates = leaderCandidates(
+      scene, pageDiagonal, prepared.segmentation
+    ).filter((leader) => (leader.markerOps?.length ?? 0) > 0
+      && leader.packetKind !== "leader-only"
+      && ![...(leader.pathOps ?? []), ...(leader.markerOps ?? [])]
+        .some((opIndex) => claimedOps.has(opIndex)));
+
+    for (const leader of candidates) {
+      const markerBounds = leader.markerOps
+        .map((opIndex) => finiteBounds(scene.ops[opIndex].bounds))
+        .reduce((combined, bounds) => unionBounds(combined, bounds));
+      const firstMarkerDistance = pointToBounds(leader.endpoints[0], markerBounds);
+      const secondMarkerDistance = pointToBounds(leader.endpoints[1], markerBounds);
+      const markerEndIndex = secondMarkerDistance < firstMarkerDistance ? 1 : 0;
+      const root = leader.endpoints[markerEndIndex === 0 ? 1 : 0];
+      const markerEnd = leader.endpoints[markerEndIndex];
+      const routeLength = pointDistance(root, markerEnd);
+      const ranked = eligible.map((anchor) => {
+        const rootDistance = pointToBounds(root, anchor.bounds);
+        return { ...anchor, rootDistance,
+          score: rootDistance / anchor.threshold };
+      }).filter((anchor) => anchor.score <= 1
+        && routeLength >= pageDiagonal * 1e-3)
+        .sort((left, right) => left.score - right.score
+          || left.rootDistance - right.rootDistance || left.index - right.index);
+      if (!ranked.length) continue;
+      const best = ranked[0];
+      const second = ranked[1];
+      // A marker exactly between two labels is not safe to assign.  Callout
+      // boxes get a slightly smaller margin because multiline boxes often end
+      // short of their authored leader root; vector supplements stay strict.
+      const uniqueGap = pageDiagonal * 35e-5;
+      // An ineligible title/legend/note can still be the geometric owner of a
+      // marked leader.  It must block reassignment to a farther eligible box;
+      // otherwise a legend's sample arrow can jump to the nearest callout.
+      const globalOwner = boxes.map((bounds, index) => ({
+        index,
+        distance: pointToBounds(root, bounds)
+      })).sort((left, right) => left.distance - right.distance
+        || left.index - right.index)[0];
+      if (globalOwner && globalOwner.index !== best.index
+          && globalOwner.distance < best.rootDistance + uniqueGap) continue;
+      if (foreignDecodedTextOwnsRoot(root, best.index)) continue;
+      if (second && second.rootDistance - best.rootDistance < uniqueGap
+          && second.score < best.score * 1.15) continue;
+      if (branchCount[best.index] >= 4) continue;
+      const owned = recovered.get(best.index) ?? [];
+      owned.push({ leader, root, markerEnd, markerBounds });
+      recovered.set(best.index, owned);
+      branchCount[best.index] += 1;
+      leaderOps(leader).forEach((opIndex) => claimedOps.add(opIndex));
+    }
+    return recovered;
+  })();
+
+  const opPolylines = (opIndices) => {
+    const out = [];
+    for (const opIndex of opIndices) {
+      const op = prepared.scene.ops[opIndex];
+      if (op?.kind !== "path") continue;
+      let current = [];
+      for (const segment of op.segments) {
+        if (segment.kind === "move") {
+          if (current.length > 1) out.push(current);
+          current = [pointToFrame(page, segment)];
+        } else if (segment.kind === "line") {
+          current.push(pointToFrame(page, segment));
+        } else if (segment.kind === "curve") {
+          current.push(pointToFrame(page, { x: segment.x1, y: segment.y1 }));
+          current.push(pointToFrame(page, { x: segment.x2, y: segment.y2 }));
+          current.push(pointToFrame(page, segment));
+        } else if (segment.kind === "close" && current.length) {
+          current.push(current[0]);
+        }
+      }
+      if (current.length > 1) out.push(current);
+    }
+    return out;
+  };
   const results = resolutions.map((resolution, index) => {
     if (!gated[index]) {
       return {
@@ -6141,34 +6688,17 @@ try {
         targets: []
       };
     }
-    const callouts = roiCallouts[index] ?? [resolution.callout];
+    const callouts = calloutsAt[index];
     const leaders = callouts.flatMap((callout) => callout.leaders);
-    const opPolylines = (opIndices) => {
-      const out = [];
-      for (const opIndex of opIndices) {
-        const op = prepared.scene.ops[opIndex];
-        if (op?.kind !== "path") continue;
-        let current = [];
-        for (const segment of op.segments) {
-          if (segment.kind === "move") {
-            if (current.length > 1) out.push(current);
-            current = [pointToFrame(page, segment)];
-          } else if (segment.kind === "line") {
-            current.push(pointToFrame(page, segment));
-          } else if (segment.kind === "curve") {
-            current.push(pointToFrame(page, { x: segment.x1, y: segment.y1 }));
-            current.push(pointToFrame(page, { x: segment.x2, y: segment.y2 }));
-            current.push(pointToFrame(page, segment));
-          } else if (segment.kind === "close" && current.length) {
-            current.push(current[0]);
-          }
-        }
-        if (current.length > 1) out.push(current);
-      }
-      return out;
-    };
-    const leaderStrokes = leaders.flatMap((leader) => opPolylines(leader.pathOps));
-    const arrowStrokes = leaders.flatMap((leader) => opPolylines(leader.arrowheadOps));
+    const spatial = spatialFallbackByIndex.get(index) ?? [];
+    const leaderStrokes = [
+      ...leaders.flatMap((leader) => opPolylines(leader.pathOps)),
+      ...spatial.flatMap(({ leader }) => opPolylines(leader.pathOps))
+    ];
+    const arrowStrokes = [
+      ...leaders.flatMap((leader) => opPolylines(leader.arrowheadOps)),
+      ...spatial.flatMap(({ leader }) => opPolylines(leader.arrowheadOps))
+    ];
     const targetRegions = dropMixedBareEnds(
       buildCalloutTargetRegions(
         prepared.scene,
@@ -6176,6 +6706,17 @@ try {
         prepared.pageBounds
       ).filter((region) => regions.length === 0 || pointInRegion(region.center))
     );
+    const spatialTargets = spatial.map(({ leader, root, markerEnd, markerBounds }) => {
+      const target = resolveLeaderTarget(
+        prepared.scene, leader, root, markerEnd,
+        Math.max(1, boundsDiagonal(prepared.pageBounds))
+      );
+      return {
+        terminalKind: "arrowhead",
+        center: target,
+        bounds: markerBounds
+      };
+    }).filter((region) => regions.length === 0 || pointInRegion(region.center));
     const debug = job.debug_anchors ? (() => {
       const insp = inspectCalloutTextRoi(prepared.scene, prepared.segmentation, boxes[index], {});
       const roiCalloutCount = insp?.callouts?.length ?? 0;
@@ -6248,18 +6789,19 @@ try {
     return {
       index,
       source: resolution.source,
+      carrier_is_text: (resolution.callout.textOps?.length ?? 0) > 0,
       ...debug ? { debug } : {},
-      has_leader: targetRegions.length > 0,
+      has_leader: targetRegions.length + spatialTargets.length > 0,
       text: resolution.callout.text ?? "",
-      leader_count: leaders.length,
+      leader_count: leaders.length + spatial.length,
       callout_count: callouts.length,
       // Painted leader / arrowhead strokes in page frame, for colouring.
       leader_strokes: leaderStrokes,
       arrow_strokes: arrowStrokes,
       // Every terminal is described the same way — a callout with four leaders
       // gets four fully-populated entries, not one plus three stubs.
-      targets: targetRegions.map((region) => ({
-        ordinal: region.ordinal,
+      targets: [...targetRegions, ...spatialTargets].map((region, ordinal) => ({
+        ordinal: region.ordinal ?? ordinal,
         terminal_kind: region.terminalKind,
         tip: pointToFrame(page, region.center),
         box_2d: boundsToFrame(page, region.bounds)
@@ -6297,6 +6839,16 @@ try {
       displaced_claims: displaced
     },
     ...automatic ? { automatic } : {},
+    ...spatialCandidateDebug ? { spatial_candidates: spatialCandidateDebug } : {},
+    ...job.debug_spatial_candidates ? {
+      spatial_ownership: spatialOwnershipDebug
+    } : {},
+    ...job.debug_spatial_candidates ? {
+      spatial_recovered: [...spatialFallbackByIndex].map(([index, rows]) => ({
+        index,
+        ops: rows.map(({ leader }) => leader.opIndex)
+      }))
+    } : {},
     results
   }));
 } catch (error) {

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -194,17 +195,232 @@ class ArrowsWiringTests(unittest.TestCase):
     def test_arrows_version_was_bumped(self):
         # 发布结果集变了就必须 bump，否则盘上的旧 arrows.json 会被当作当期。
         from steps.arrows import ARROWS_VERSION
-        self.assertGreaterEqual(ARROWS_VERSION, 10)
+        self.assertGreaterEqual(ARROWS_VERSION, 17)
 
-    def test_only_placement_anchors_get_the_geometric_pass(self):
-        # 文字锚没有「外圈」这个锚点，同一条规则用在文字上会乱连 ——
-        # find_page_arrows 里的筛选必须只挑 str 键（放置锚）。
+    def test_diagnostic_early_returns_keep_the_tuple_contract(self):
+        from steps import arrows
+
+        self.assertEqual(
+            arrows.find_page_arrows(
+                "unused", 0, [], return_diagnostics=True),
+            ({}, {}),
+        )
+        item = {"text": "FENCE", "box_2d": [100, 100, 120, 160]}
+        with patch.object(arrows, "PLAN_GATE", True):
+            self.assertEqual(
+                arrows.find_page_arrows(
+                    "unused", 0, [item], plan_regions=[],
+                    return_diagnostics=True),
+                ({}, {}),
+            )
+            self.assertEqual(
+                arrows.find_page_arrows(
+                    "unused", 0, [item],
+                    plan_regions=[[700, 700, 800, 800]],
+                    return_diagnostics=True),
+                ({}, {}),
+            )
+
+        # Existing callers that do not request diagnostics keep the old shape.
+        self.assertEqual(arrows.find_page_arrows("unused", 0, []), {})
+
+    def test_arrow_signature_changes_when_label_changes(self):
+        # Spatial/bare fallback eligibility depends on label, so two otherwise
+        # identical anchors with different labels must never share a cache.
+        from steps.arrows import arrows_signature
+
+        callout = [{"text": "FENCE", "box_2d": [1, 2, 3, 4],
+                    "label": "callout"}]
+        title = [{**callout[0], "label": "view title"}]
+        self.assertNotEqual(arrows_signature(callout, "rev"),
+                            arrows_signature(title, "rev"))
+
+    def test_placement_and_text_fallbacks_keep_separate_key_spaces(self):
+        # str 键仍只走 marker 外圈兜底；int 文字键走文字框端点图。
         import inspect
 
         from steps import arrows
         src = inspect.getsource(arrows.find_page_arrows)
         self.assertIn("isinstance(key, str)", src)
         self.assertIn("marker_leaders", src)
+        self.assertIn("isinstance(key, int)", src)
+        self.assertIn("text_box_leaders", src)
+        self.assertIn("allow_bare_keys", src)
+
+    def test_supplement_merge_never_removes_old_geometry(self):
+        from steps.arrows import _merge_arrow_entry
+
+        old = {
+            "leader_strokes": [[[1, 1], [2, 2]]],
+            "arrow_strokes": [[[2, 2], [2, 3]]],
+            "targets": [{"tip": [2, 2], "box_2d": [1, 1, 3, 3],
+                         "terminal_kind": "arrowhead"}],
+            "confidence": "high", "note": "old",
+        }
+        extra = {
+            "leader_strokes": [old["leader_strokes"][0],
+                               [[2, 2], [4, 4]]],
+            "arrow_strokes": [old["arrow_strokes"][0],
+                              [[4, 4], [4, 5]]],
+            "targets": [old["targets"][0],
+                        {"tip": [4, 4], "box_2d": [3, 3, 5, 5],
+                         "terminal_kind": "arrowhead"}],
+            "confidence": "high", "note": "supplement",
+        }
+        got = _merge_arrow_entry(old, extra)
+        self.assertEqual(got["leader_strokes"][0], old["leader_strokes"][0])
+        self.assertEqual(got["arrow_strokes"][0], old["arrow_strokes"][0])
+        self.assertGreaterEqual(len(got["leader_strokes"]),
+                                len(old["leader_strokes"]))
+        self.assertGreaterEqual(len(got["arrow_strokes"]),
+                                len(old["arrow_strokes"]))
+        self.assertGreaterEqual(len(got["targets"]), len(old["targets"]))
+
+    def test_disconnected_supplement_is_not_borrowed(self):
+        from steps.arrows import _merge_arrow_entry
+
+        old = {
+            "leader_strokes": [[[0, 0], [1, 1]]],
+            "arrow_strokes": [],
+            "targets": [{"tip": [1, 1], "box_2d": [0, 0, 2, 2],
+                         "terminal_kind": "free-end"}],
+            "confidence": "medium", "note": "old",
+        }
+        unrelated = {
+            "leader_strokes": [[[10, 10], [11, 11]]],
+            "arrow_strokes": [[[11, 11], [11, 12]]],
+            "targets": [{"tip": [11, 11], "box_2d": [10, 10, 12, 12],
+                         "terminal_kind": "arrowhead"}],
+            "confidence": "high", "note": "other callout",
+        }
+        self.assertEqual(_merge_arrow_entry(old, unrelated), old)
+
+    def test_same_target_repaint_does_not_thicken_existing_highlight(self):
+        from steps.arrows import _merge_arrow_entry
+
+        old = {
+            "leader_strokes": [[[0, 0], [2, 2]]],
+            "arrow_strokes": [[[2, 2], [2, 3]]],
+            "targets": [{"tip": [2, 2], "box_2d": [1, 1, 3, 3],
+                         "terminal_kind": "arrowhead"}],
+            "confidence": "high", "note": "authored",
+        }
+        repaint = {
+            "leader_strokes": [[[0.2, 0.1], [2.1, 2.1]]],
+            "arrow_strokes": [[[2.1, 2.1], [2.2, 3.1]]],
+            "targets": [{"tip": [2.1, 2.1], "box_2d": [1, 1, 3, 3],
+                         "terminal_kind": "arrowhead"}],
+            "confidence": "high", "note": "same branch",
+        }
+        self.assertEqual(_merge_arrow_entry(old, repaint), old)
+
+    def test_bare_trace_through_existing_arrowhead_is_not_a_new_target(self):
+        from steps.arrows import _merge_arrow_entry
+
+        headed = {
+            "leader_strokes": [[[0, 0], [2, 2]]],
+            "arrow_strokes": [[[2, 2], [2, 3]]],
+            "targets": [{"tip": [2, 2], "box_2d": [1, 1, 3, 3],
+                         "terminal_kind": "arrowhead"}],
+            "confidence": "high", "note": "authored",
+        }
+        through = {
+            "leader_strokes": [[[0, 0], [2.2, 2.1], [5, 5]]],
+            "arrow_strokes": [],
+            "targets": [{"tip": [5, 5], "box_2d": [4, 4, 6, 6],
+                         "terminal_kind": "bare-end"}],
+            "confidence": "medium", "note": "continued trace",
+        }
+        self.assertEqual(_merge_arrow_entry(headed, through), headed)
+
+    def test_continued_free_end_becomes_internal_not_a_second_target(self):
+        from steps.arrows import _merge_arrow_entry
+
+        old = {
+            "leader_strokes": [[[0, 0], [1, 1]]],
+            "arrow_strokes": [],
+            "targets": [{"tip": [1, 1], "box_2d": [0, 0, 2, 2],
+                         "terminal_kind": "free-end"}],
+            "confidence": "medium", "note": "free elbow",
+        }
+        extension = {
+            "leader_strokes": [[[1.2, 1.1], [2, 2]]],
+            "arrow_strokes": [[[2, 2], [2, 2.4]]],
+            "targets": [{"tip": [2, 2], "box_2d": [1, 1, 3, 3],
+                         "terminal_kind": "arrowhead"}],
+            "confidence": "high", "note": "real head",
+        }
+        got = _merge_arrow_entry(old, extension)
+        self.assertEqual(len(got["leader_strokes"]), 2)
+        self.assertEqual(len(got["targets"]), 1)
+        self.assertEqual(got["targets"][0]["tip"], [2, 2])
+        self.assertEqual(got["targets"][0]["terminal_kind"], "arrowhead")
+
+    def test_text_endpoint_supplements_require_shared_topology(self):
+        import inspect
+
+        from steps import arrows
+        src = inspect.getsource(arrows.find_page_arrows)
+        self.assertIn("_merge_arrow_entry(out.get(key), entry)", src)
+        merge_src = inspect.getsource(arrows._merge_arrow_entry)
+        self.assertIn("_supplement_touches_current", merge_src)
+
+    def test_frontend_target_mask_is_tip_centered_and_has_minimum_side(self):
+        src = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("const targetDisplayBox=t=>", src)
+        self.assertIn("Math.min(20,Math.max(12", src)
+        self.assertIn("const box=targetDisplayBox(t)", src)
+
+    def test_sidecar_enforces_global_and_row_level_leader_ownership(self):
+        import inspect
+
+        src = (ROOT / "tools" / "arrow_sidecar" / "sidecar.mjs").read_text(
+            encoding="utf-8")
+        self.assertIn("scopeCalloutLeadersToBox", src)
+        self.assertIn("automaticCallouts.flatMap", src)
+        self.assertIn("regularLeadersAt[index].length !== 0", src)
+        self.assertIn("anchor_vec_backed", src)
+        self.assertIn("resolveWrappedParagraph", src)
+        self.assertIn("foreignDecodedTextOwnsRoot", src)
+        self.assertIn("ownerText", src)
+        self.assertIn("compactText", src)
+        self.assertIn("carrier_is_text", src)
+
+        from steps import arrows
+        py_src = inspect.getsource(arrows.find_page_arrows)
+        self.assertIn('diagnostic.get("source") == "text-only"', py_src)
+
+    def test_arrow_signature_changes_when_vector_evidence_changes(self):
+        from steps.arrows import arrows_signature
+
+        weak = [{"text": "FENCE", "box_2d": [1, 2, 3, 4],
+                 "label": "callout", "source": "vlm",
+                 "vec_backed": False}]
+        backed = [{**weak[0], "vec_backed": True}]
+        self.assertNotEqual(arrows_signature(weak, "rev"),
+                            arrows_signature(backed, "rev"))
+
+    def test_only_weak_member_of_a_verified_duplicate_is_suppressed(self):
+        from steps.arrows import suppressed_unverified_duplicates
+
+        items = [
+            {"text": "DEBRIS\nFENCE", "label": "callout",
+             "source": "vlm", "vec_backed": False},
+            {"text": "debris fence", "label": "callout",
+             "source": "vlm", "vec_backed": False},
+            {"text": "OTHER FENCE", "label": "callout",
+             "source": "vlm", "vec_backed": False},
+        ]
+        diagnostics = {
+            "0": {"source": "text-only", "carrier_is_text": False,
+                  "has_leader": False},
+            "1": {"source": "roi", "carrier_is_text": False,
+                  "has_leader": True},
+            "2": {"source": "text-only", "carrier_is_text": False,
+                  "has_leader": False},
+        }
+        self.assertEqual(
+            suppressed_unverified_duplicates(items, diagnostics), {0})
 
 
 if __name__ == "__main__":

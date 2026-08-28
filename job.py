@@ -35,7 +35,23 @@ os.environ.setdefault("JUDGE_WORKERS", "4")     # 判词分块并发（纯文本
 os.environ.setdefault("SYMBOLS_WORKERS", "8")   # 图例 group+symbol：并发页数
 os.environ.setdefault("VIEW_WORKERS", "6")      # 视图投影分类：并发页数
 # 矢量文字抽取跨*进程*并发（MuPDF 非线程安全），按核数封顶
-os.environ.setdefault("VEC_WORKERS", str(min((os.cpu_count() or 1), 6)))
+# ---- CPU 型旋钮：跟机器走，不写死 -----------------------------------------
+# 这套要能在不同配置的服务器上直接跑。硬编码的并发数在 32 线程机器上浪费、在
+# 4 核机器上会把机器压死或 OOM。两个量分开用（见 core/hw.py）：纯算的并发看
+# cpu_threads，吃内存的并发看 total_ram_gb。
+# 上面四个网络型旋钮**故意不跟 CPU 走** —— 它们受模型延迟与配额限制，弱 CPU
+# 机器上一样能开 8 路，跟着 CPU 走只会白白变慢。
+from core import hw as _hw
+
+_CPU = _hw.cpu_threads()
+_RAM = _hw.total_ram_gb()
+
+os.environ.setdefault("VEC_WORKERS", str(_hw.clamp(_CPU, 1, 6)))
+# 箭头边车是 Node 进程，heap 阶梯最高升到 6144 MB（steps/arrows.py 的
+# _HEAP_LADDER），所以它的上限由**内存**定而不是核数 —— 按核数开会在小内存机器上
+# 直接 OOM。原来默认是 1，也就是箭头阶段完全串行（实测 grand_island 37 页 274 s）。
+os.environ.setdefault("ARROWS_WORKERS", str(_hw.clamp(
+    min(_CPU // 6, int(_RAM // 6) if _RAM > 0 else 1), 1, 6)))
 
 import re
 import shutil
@@ -52,7 +68,7 @@ from core.config import (MODEL_NAME, PRICING, PROJECTS_DIR, compute_cost,
                          resolve_model, set_model_override)
 from core.gemini import RECORDER
 from core.pdfio import FITZ_LOCK
-from steps import arrows
+from steps import arrows, linetypes
 from steps.debug import DebugSink
 from steps.store import (DATA_DIR, JOBS_DIR, is_valid_slug, items_of, load_json,
                          pdf_path, pdf_revision, results_path, save_json,
@@ -66,6 +82,25 @@ VIEW_WORKERS = int(os.environ["VIEW_WORKERS"])
 # 箭头边车是独立 Node 进程，单页峰值 120-280 MB；2 vCPU / ~1 GB 可用内存
 # 下并发只会互相抢内存并触发 swap，默认串行。
 ARROWS_WORKERS = int(os.environ.get("ARROWS_WORKERS", "1"))
+# 线型：同时跑几页。每页一个边车子进程，子进程内部还有引擎自己的并行度
+# （LINETYPE_CPU_BUDGET），所以这里不是越大越好 —— 4 页 × budget 16 在
+# 16 核 / 32 线程上已经是 2 倍超订，靠的是各页的单线程阶段互相错开。
+def _linetype_page_workers():
+    """线型的页级并发。跟机器走。
+
+    为什么是 cpu/2.5：实测单页有效占用约 1.6 个核（引擎的
+    group_page_sequentially 单线程、占单页 76% 的时间），留余量给页内 worker。
+    上限 12 是**实测拐点**：本机 32 线程上 4→8 路吞吐 ×1.59、8→16 路只再 ×1.23，
+    16 路时整机 CPU 已 79.5%（峰值 100%）—— 再往上是超订不是加速。
+    下限 2 是让弱机器也有一点重叠。内存那一路按每页约 2 GB 估。
+    """
+    ram = _RAM
+    by_ram = int(ram // 2) if ram > 0 else 2
+    return _hw.clamp(min(round(_CPU / 2.5), by_ram), 2, 12)
+
+
+LINETYPE_PAGE_WORKERS = int(os.environ.get("LINETYPE_PAGE_WORKERS", "")
+                            or _linetype_page_workers())
 VEC_WORKERS = int(os.environ["VEC_WORKERS"])
 
 VEC_SCHEMA = 3   # 3 = native typographic lines (v2's homegrown clustering
@@ -284,13 +319,32 @@ def _carry_baseline(slug):
     Money is per project, not per attempt: a run that was interrupted (or
     cancelled) already paid for its VLM raw, and the next run reuses those
     caches.  Reading the published totals back as the new run's baseline keeps
-    the gallery's cost/time monotonic instead of resetting to zero."""
+    the gallery's cost/time monotonic instead of resetting to zero.
+
+    results.json only gets ``llm_summary`` from ``_persist_llm`` at _finish, so
+    a run killed before that (server restart, crash, cancel) leaves the money
+    spent but unbooked.  The job card is the other half of the ledger — it is
+    rewritten by ``_flush_running`` after every single paid call precisely so a
+    dead process cannot lose what it already spent — so fall back to it and
+    take whichever total is larger.  Without this the next re-run reports a
+    project that cost $1.05 as costing nothing.
+    """
     res = load_json(results_path(slug), None)
-    if not isinstance(res, dict):
-        return None, 0.0
-    llm = res.get("llm_summary")
-    wall = res.get("wall_seconds")
-    return (llm if isinstance(llm, dict) else None), float(wall or 0.0)
+    llm = None
+    wall = 0.0
+    if isinstance(res, dict):
+        published = res.get("llm_summary")
+        llm = published if isinstance(published, dict) else None
+        wall = float(res.get("wall_seconds") or 0.0)
+    card = load_json(_job_file(slug), None)
+    if isinstance(card, dict):
+        spent = card.get("llm")
+        if isinstance(spent, dict):
+            booked = float((llm or {}).get("cost_usd") or 0.0)
+            if float(spent.get("cost_usd") or 0.0) > booked:
+                llm = spent
+        wall = max(wall, float(card.get("wall_seconds") or 0.0))
+    return llm, wall
 
 
 # ------------------------------------------------------------ project setup --
@@ -452,7 +506,7 @@ def reset_project_cache(slug):
     if not is_valid_slug(slug):
         raise ValueError("invalid slug")
     if job_running(slug):
-        raise RuntimeError("这个项目正在跑，先取消再重置")
+        raise RuntimeError("this project is in progress — cancel it before resetting")
     root = DATA_DIR / slug
     removed = []
     if root.is_dir():
@@ -498,7 +552,11 @@ def _vec_scan_project(slug, pdf, on_progress=None, should_cancel=None):
     cached = load_json(cache_path, None)
     if cached and cached.get("pdf_mtime") == mtime \
             and cached.get("schema") == VEC_SCHEMA:
-        if not cached.get("partial"):
+        # "partial" 这个标记不足以采信：取消后的 _final() 从来不写它，
+        # 于是半份 vec.json 会永远看起来是完整的。真正的判据是页数够不够 ——
+        # 这条同时治得了已经写坏的存量缓存。
+        if not cached.get("partial") \
+                and len(cached.get("pages") or {}) == cached.get("page_count"):
             return cached
     else:
         cached = None
@@ -514,6 +572,10 @@ def _vec_scan_project(slug, pdf, on_progress=None, should_cancel=None):
     def _final():
         data = {"schema": VEC_SCHEMA, "pdf_mtime": mtime,
                 "page_count": page_count, "pages": pages}
+        # 取消是 break 出扫描后落到这里的。缺页就直说，别让短了一截的页集
+        # 冒充跑完的扫描 —— 缺的那些页下一轮会被当扫描件重新付费读图。
+        if len(pages) != page_count:
+            data["partial"] = True
         save_json(cache_path, data)
         return data
 
@@ -647,7 +709,7 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
     judge_prompt = build_judge_prompt(target)
     pdf = pdf_path(slug)
     if not pdf.exists():
-        return [f"{slug}: input.pdf 不存在"]
+        return [f"{slug}: input.pdf does not exist"]
 
     # coarse text-step progress on a 0..100 scale so the bar creeps forward
     # during the (page-less) vector scan + judge call, not just the VLM loop
@@ -674,7 +736,7 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
     flagged, judge_err = _judge_project(slug, vpages, judge_prompt=judge_prompt,
                                         use_kw_floor=is_default)
     if judge_err:
-        warnings.append(f"判词整块失败，已降级为「关键词地板 + 已缓存判词」：{judge_err}")
+        warnings.append(f"verdict pass failed as a whole; fell back to the keyword floor + plus cached verdicts: {judge_err}")
     _p(22)
     _sub["judge"] = time.perf_counter() - _t
     _t = time.perf_counter()
@@ -710,8 +772,8 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
     if n_image_only and not SCAN_NO_TEXT_PAGES:
         # 静默出空结果是最坏的失败方式，至少让它出现在作业卡片上。
         warnings.append(
-            f"{n_image_only} 页没有文字层，且 SCAN_NO_TEXT_PAGES=0 —— "
-            "这些页未读图，结果一定是空的")
+            f"{n_image_only} sheets have no text layer and SCAN_NO_TEXT_PAGES=0 - "
+            "these sheets were never read as images, so their results are certainly empty")
 
     if need and not (should_cancel and should_cancel()):
         with ThreadPoolExecutor(max_workers=TEXT_WORKERS) as ex:
@@ -723,7 +785,7 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
                 msg = f"ERROR {err}" if err and n is None else f"{n} items"
                 print(f"  [vlm {i}/{len(need)}] P{page}: {msg}", flush=True)
                 if err and n is None:
-                    warnings.append(f"P{page} 文字 VLM 失败：{err}")
+                    warnings.append(f"P{page} text VLM failed: {err}")
                 _p(22 + 68 * i / len(need))     # VLM top-ups span 22%..90%
                 if should_cancel and should_cancel():
                     for fu in futs:
@@ -758,7 +820,7 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
                 msg = f"ERROR {err}" if err and n is None else f"{n} items"
                 print(f"  [flash {i}/{len(fneed)}] P{page}: {msg}", flush=True)
                 if err and n is None:
-                    warnings.append(f"P{page} 第二模型(Flash)并集失败：{err}")
+                    warnings.append(f"P{page} second model (Flash) union failed: {err}")
                 if should_cancel and should_cancel():
                     for fu in futs:
                         fu.cancel()
@@ -832,7 +894,7 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
                 if not is_current_primary_record(vlm.get(str(p)),
                                                  primary_identity)]
     if residual:
-        warnings.append(f"文字 VLM 仍有 {len(residual)} 页不当期："
+        warnings.append(f"text VLM still has {len(residual)} stale sheets: "
                         f"{residual[:12]}")
     return warnings
 
@@ -964,7 +1026,7 @@ def _stage_symbols(slug, on_progress=None, should_cancel=None):
                 n_sweep, sweep_errs = 0, []
                 err = f"{type(exc).__name__}: {exc}"
             if err is not None or count is None:
-                warnings.append(f"P{page} 图例符号检测失败：{err or 'unknown failure'}")
+                warnings.append(f"P{page} legend symbol detection failed: {err or 'unknown failure'}")
                 message = f"ERROR {err or 'unknown failure'}"
             else:
                 fresh_calls += int(fresh)
@@ -973,11 +1035,11 @@ def _stage_symbols(slug, on_progress=None, should_cancel=None):
                 sweep_calls += len(sweep_errs)
                 message = (f"{count} symbols"
                            f"{'' if fresh else ' (VLM reused)'}"
-                           f"{f' +{n_sweep} 补扫' if n_sweep else ''}")
+                           f"{f' +{n_sweep} top-up scan' if n_sweep else ''}")
             for row in sweep_errs:
                 warnings.append(
-                    f"P{page} 图例块补扫失败"
-                    f"（group {row.get('group_index')}）：{row.get('error')}")
+                    f"P{page} legend block top-up scan failed"
+                    f"（group {row.get('group_index')}): {row.get('error')}")
             print(f"[{done}/{len(jobs)}] {slug} P{page}: {message}", flush=True)
 
     cost = compute_cost(resolve_model(None), usage_tot)
@@ -987,7 +1049,7 @@ def _stage_symbols(slug, on_progress=None, should_cancel=None):
     # non-empty page satisfies the shared detection predicate.
     remaining = _symbol_jobs(slug)
     if remaining:
-        warnings.append(f"图例符号仍有 {len(remaining)} 页不当期："
+        warnings.append(f"legend symbols still have {len(remaining)} stale sheets: "
                         f"{[p for p, _i, _s in remaining][:12]}")
     return warnings
 
@@ -1017,7 +1079,7 @@ def _view_jobs(slug):
             continue
         entry = symbols.get(pstr)
         if not has_current_symbols(entry, sig_of(items, revision)):
-            warnings.append(f"P{pstr} 跳过视图分类：图例符号检测不当期")
+            warnings.append(f"P{pstr} skipped view classification: legend symbol detection is stale")
             continue
         result = entry.get("result") or {}
         if not any(s.get("category") == "shape"
@@ -1084,7 +1146,7 @@ def _stage_views(slug, on_progress=None, should_cancel=None):
                 page, summary = submitted_page, None
                 error = f"{type(exc).__name__}: {exc}"
             if error:
-                warnings.append(f"P{page} 视图分类失败：{error}")
+                warnings.append(f"P{page} view classification failed: {error}")
                 print(f"[{number}/{len(jobs)}] {slug} P{page}: ERROR {error}",
                       flush=True)
             else:
@@ -1092,7 +1154,7 @@ def _stage_views(slug, on_progress=None, should_cancel=None):
                       flush=True)
     remaining, _ = _view_jobs(slug)
     if remaining:
-        warnings.append(f"视图分类仍有 {len(remaining)} 页不当期："
+        warnings.append(f"view classification still has {len(remaining)} stale sheets: "
                         f"{[p for p, _pdf, _g, _r in remaining][:12]}")
     return warnings
 
@@ -1155,7 +1217,7 @@ def _stage_placements(slug, on_progress=None, should_cancel=None):
         if has_shape and groups_need_classification(groups):
             ventry = views.get(pstr)
             if not has_current_view_types(ventry, groups, revision):
-                warnings.append(f"P{pstr} 跳过放置匹配：视图分类不当期")
+                warnings.append(f"P{pstr} skipped placement matching: view classification is stale")
                 if on_progress:
                     on_progress(number, total)
                 continue
@@ -1195,14 +1257,14 @@ def _stage_placements(slug, on_progress=None, should_cancel=None):
                 result.pop("text_trim", None)
         except Exception as exc:                                # noqa: BLE001
             result["snap_error"] = f"{type(exc).__name__}: {exc}"
-            print(f"  [snap] P{pstr} 跳过样例框校准：{result['snap_error']}",
+            print(f"  [snap] P{pstr} skipped sample-box calibration: {result['snap_error']}",
                   flush=True)
         try:
             summary = dict(snap_summary)
             summary.update(match_placements(pdf, int(pstr) - 1, symbols_now,
                                             typed_groups, dbg=dbg))
         except Exception as exc:                            # noqa: BLE001
-            warnings.append(f"P{pstr} 放置匹配失败："
+            warnings.append(f"P{pstr} placement matching failed: "
                             f"{type(exc).__name__}: {exc}")
             if on_progress:
                 on_progress(number, total)
@@ -1260,7 +1322,7 @@ def _arrow_jobs(slug):
         # 取景开启时没有 plan 框就 fail-closed；关闭时任何有锚的页都要跑，
         # 这样被取景挡掉的锚也能暴露出问题来。
         if arrows.PLAN_GATE and not regions:
-            warnings.append(f"P{pstr} 跳过箭头：没有 plan 取景框")
+            warnings.append(f"P{pstr} skipped arrows: no plan view box")
             continue
         if not items and not extra:
             continue
@@ -1281,13 +1343,27 @@ def _placement_anchors(result):
 def _arrow_one(slug, page, items, sig, regions, extra_anchors):
     """一页的箭头检测，结果原子写回 arrows.json。"""
     cache_path = slug_dir(slug) / "arrows.json"
+    geometry = arrows.page_geometry_status(pdf_path(slug), page - 1)
+    if geometry.get("state") == "image-only":
+        # The user explicitly wants raster-only sheets identified, not guessed
+        # at with pixel tracing.  Keep an empty, current cache entry so reruns do
+        # not repeatedly launch the vector sidecar for the same scan.
+        with _IO_LOCK:
+            cache = load_json(cache_path, {})
+            cache[str(page)] = {
+                "sig": sig, "v": arrows.ARROWS_VERSION, "items": {},
+                "page_kind": "image-only",
+                "geometry": geometry,
+            }
+            save_json(cache_path, cache)
+        return page, 0, None
     found = None
     error = None
     for attempt in range(RETRIES + 1):
         try:
-            found = arrows.find_page_arrows(
+            found, anchor_diagnostics = arrows.find_page_arrows(
                 pdf_path(slug), page - 1, items, plan_regions=regions,
-                extra_anchors=extra_anchors)
+                extra_anchors=extra_anchors, return_diagnostics=True)
             break
         except Exception as exc:                            # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"
@@ -1307,7 +1383,9 @@ def _arrow_one(slug, page, items, sig, regions, extra_anchors):
         cache = load_json(cache_path, {})
         # 键必须是 str，与 items_of 的 union index 对应关系写在 steps/arrows.py。
         cache[str(page)] = {"sig": sig, "v": arrows.ARROWS_VERSION,
-                            "items": {str(k): v for k, v in found.items()}}
+                            "items": {str(k): v for k, v in found.items()},
+                            "anchors": {str(k): v for k, v
+                                        in anchor_diagnostics.items()}}
         save_json(cache_path, cache)
     return page, len(found), None
 
@@ -1338,7 +1416,7 @@ def _stage_arrows(slug, on_progress=None, should_cancel=None):
                 page, count = submitted_page, None
                 error = f"{type(exc).__name__}: {exc}"
             if error:
-                warnings.append(f"P{page} 箭头检测失败：{error}")
+                warnings.append(f"P{page} arrow detection failed: {error}")
                 print(f"[{number}/{len(jobs)}] {slug} P{page}: ERROR {error}",
                       flush=True)
             else:
@@ -1346,6 +1424,118 @@ def _stage_arrows(slug, on_progress=None, should_cancel=None):
                 print(f"[{number}/{len(jobs)}] {slug} P{page}: {count} arrows",
                       flush=True)
     print(f"arrows total: {total}", flush=True)
+    return warnings
+
+
+# ------------------------------------------- stage 6: line types (sidecar) --
+def _linetype_jobs(slug):
+    """给「箭头结果当期 且 这页有末端」的页排活.
+
+    **不看 plan** —— plan 只是显示闸（见 steps/linetypes 的 docstring）。
+    也不看 arrows 的取景开关：末端在哪算在哪，可见性留给 webapp 决定。
+    """
+    res = load_json(results_path(slug), None)
+    pdf = pdf_path(slug)
+    if not res or not pdf.exists():
+        return [], []
+    revision = pdf_revision(pdf)
+    symbols = load_json(slug_dir(slug) / "symbols.json", {})
+    arrow_cache = load_json(slug_dir(slug) / "arrows.json", {})
+    jobs, warnings = [], []
+    for pstr, rec in sorted(res.get("pages", {}).items(),
+                            key=lambda pair: int(pair[0])):
+        items = items_of(rec)
+        if not items:
+            continue
+        result = (symbols.get(pstr) or {}).get("result") or {}
+        extra = _placement_anchors(result)
+        arrows_sig = arrows.arrows_signature(items, revision, extra)
+        arrow_entry = arrow_cache.get(pstr)
+        if not arrows.has_current_arrows(arrow_entry, arrows_sig):
+            # 箭头层不当期 —— 这页的末端还没定下来，算线型没有意义。不报错：
+            # 上一阶段自己会把失败页记进 warnings。
+            continue
+        anchors = linetypes.anchors_of(arrow_entry)
+        if not anchors:
+            continue
+        sig = linetypes.linetypes_signature(arrows_sig)
+        if linetypes.has_current_linetypes(
+                linetypes.load_page(slug, int(pstr)), sig):
+            continue
+        jobs.append((int(pstr), items, arrow_entry, sig))
+    return jobs, warnings
+
+
+def _linetype_one(slug, page, items, arrow_entry, sig):
+    """一页的线型聚类 + 绑定，结果原子写回 linetypes.json。
+
+    page 是 1-based（与 results.json 的页键、引擎 API 一致）。
+    """
+    entry = None
+    error = None
+    for attempt in range(RETRIES + 1):
+        try:
+            entry = linetypes.compute_page_linetypes(
+                pdf_path(slug), page, items, arrow_entry, sig=sig)
+            break
+        except Exception as exc:                            # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+            if attempt < RETRIES:
+                time.sleep(5 * (attempt + 1))
+    # 一页一个文件，所以不需要 _IO_LOCK：没有读-改-写，也没有跨页共享的文件。
+    # 失败同样必须落盘，且形状要被当期判据拒绝：不写 bindings，于是
+    # has_current_linetypes 判假、下次自动重试。写成空 bindings 就是用
+    # 「这页没有线型」冒充「这页没算过」。
+    linetypes.save_page(slug, page, entry if entry is not None else {
+        "sig": sig, "v": linetypes.LINETYPE_VERSION, "error": error})
+    if entry is None:
+        return page, None, error
+    return page, len(entry.get("used_all") or ()), None
+
+
+def _stage_linetypes(slug, on_progress=None, should_cancel=None):
+    """箭头末端框里那一种线，在全页高亮出来（本地矢量 + 独立 venv 边车）。
+
+    单线程：边车自己会按 cpu_budget 开进程池吃满核，外面再并发只会互相抢核，
+    而且一页峰值内存不小（实测 3595 op 的页 80 s）。
+    """
+    jobs, warnings = _linetype_jobs(slug)
+    print(f"linetype jobs: {len(jobs)}  page_workers={LINETYPE_PAGE_WORKERS}",
+          flush=True)
+    if on_progress:
+        on_progress(0, len(jobs))
+    total = 0
+    done = 0
+    # 页级并行。每个线程只是等一个边车子进程，GIL 不碍事；真正吃 CPU 的是
+    # 子进程。串行时实测整机 CPU 只有 13~16%（16 核 / 32 线程），因为单页内部
+    # 有大段单线程阶段（PageIR 抽取、序列化、进程启停），并行跑多页正好把这些
+    # 空档填上。一页一个缓存文件，所以并发写盘不会互相等。
+    with ThreadPoolExecutor(max_workers=max(1, LINETYPE_PAGE_WORKERS)) as pool:
+        futures = {pool.submit(_linetype_one, slug, *job): job[0]
+                   for job in jobs}
+        for future in as_completed(futures):
+            submitted = futures[future]
+            if should_cancel and should_cancel():
+                for pending in futures:
+                    pending.cancel()
+                break
+            try:
+                page, count, error = future.result()
+            except Exception as exc:                        # noqa: BLE001
+                page, count = submitted, None
+                error = f"{type(exc).__name__}: {exc}"
+            done += 1
+            if on_progress:
+                on_progress(done, len(jobs))
+            if error:
+                warnings.append(f"P{page} line-type clustering failed: {error}")
+                print(f"[{done}/{len(jobs)}] {slug} P{page}: ERROR {error}",
+                      flush=True)
+            else:
+                total += count or 0
+                print(f"[{done}/{len(jobs)}] {slug} P{page}: {count} line types",
+                      flush=True)
+    print(f"linetypes total: {total}", flush=True)
     return warnings
 
 
@@ -1509,13 +1699,26 @@ def _run_pipeline(slug, target, should_cancel=None):
     guard()
 
     if arrows.ENABLED:
+        # 线型层吊在箭头结果上（它绑的就是箭头末端），所以只有 arrows 开着时
+        # 才有它的位置；开着时把尾段再一分为二。
+        arw_hi = 0.98 if linetypes.ENABLED else 1.0
         _set(slug, stage="arrows", detail="Arrow / leader detection…",
              progress=plc_hi, stage_done=0, stage_total=0)
         _warn(slug, timed("arrows", lambda: _stage_arrows(
-            slug, on_progress=_stage_progress(slug, plc_hi, 1.0),
+            slug, on_progress=_stage_progress(slug, plc_hi, arw_hi),
             should_cancel=sc)))
         guard()
         _snapshot(slug)
+
+        if linetypes.ENABLED:
+            _set(slug, stage="linetypes",
+                 detail="Line-type clustering (local sidecar, no model)…",
+                 progress=arw_hi, stage_done=0, stage_total=0)
+            _warn(slug, timed("linetypes", lambda: _stage_linetypes(
+                slug, on_progress=_stage_progress(slug, arw_hi, 1.0),
+                should_cancel=sc)))
+            guard()
+            _snapshot(slug)
 
     _set(slug, stage="done", detail="Done", progress=1.0,
          stage_done=0, stage_total=0)

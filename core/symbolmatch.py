@@ -56,9 +56,9 @@ def match_template(prims, by_class, grid, sel, seltext, prim_allow=None,
     else:
         tmpl0 = [idx for idx, p in enumerate(prims) if in_tmpl(p)]
     if not tmpl0:
-        return {"error": "框内无可识别图元"}
+        return {"error": "no recognizable primitive inside the box"}
     if len(tmpl0) > 1500:
-        return {"error": "框选范围过大"}
+        return {"error": "selection box too large"}
 
     # Tolerances (adaptive to template size further below).
     VTOL = 4.0
@@ -107,9 +107,9 @@ def match_template(prims, by_class, grid, sel, seltext, prim_allow=None,
 
     m = len(tmpl)
     if m == 0:
-        return {"error": "框内未发现重复单元"}
+        return {"error": "no repeating unit found inside the box"}
     if m > 24:
-        return {"error": f"模板含 {m} 个图元过多（框选可能不够紧）"}
+        return {"error": f"template holds {m} primitives, too many (the selection may not be tight enough)"}
 
     txt_anchors = [t for t in tmpl if prims[t].get("tid") is not None]
     txt_rep = [t for t in txt_anchors if len(cand_of(t)) >= 2]
@@ -136,7 +136,7 @@ def match_template(prims, by_class, grid, sel, seltext, prim_allow=None,
     candA = cand_of(A)
     candB = cand_of(B)
     if len(candA) > 4000:
-        return {"error": "锚点图元过于常见，模板辨识度不足"}
+        return {"error": "the anchor primitive is too common; the template is not distinctive enough"}
 
     cellB = max(ABlen * scale, 1.0)
     bgrid = defaultdict(list)
@@ -218,7 +218,7 @@ def find_symbol_placements(pdf_path, page_index, box_norm):
     """
     data = _extract_page(pdf_path, page_index)
     if not data["units"] and not data["texts"]:
-        return {"error": "该页没有矢量图形（可能是扫描件），矢量匹配不可用"}
+        return {"error": "this sheet has no vector graphics (likely a scan); vector matching is unavailable"}
     w, h = data["w"], data["h"]
 
     by0, bx0, by1, bx1 = [float(v) for v in box_norm]
@@ -252,13 +252,13 @@ def find_symbol_placements(pdf_path, page_index, box_norm):
             if allow:
                 break
     if not allow:
-        return {"error": "符号框内没有矢量图元（框可能偏移，或该符号是位图）"}
+        return {"error": "no vector primitive inside the symbol box (the box may be offset, or the symbol is a raster)"}
     if not has_marker_content:
         # Segments-only content is a LINE-STYLE SAMPLE, not a marker: its
         # "placements" are the fence line itself (fenceline flow), and
         # stamping lookalike dash/X patches page-wide as symbol placements
         # litters the plan (rapid P7: manholes and tree marks boxed).
-        return {"error": "框内只有线段（线型样本）——不适用符号匹配，线的定位走 fenceline 流程"}
+        return {"error": "the box holds only line segments (a line-type sample) - symbol matching does not apply; lines are located by the fenceline flow"}
 
     sel = {prims[i]["src"] for i in allow if prims[i].get("src") is not None}
     seltext = {prims[i]["tid"] for i in allow if prims[i].get("tid") is not None}

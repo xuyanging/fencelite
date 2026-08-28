@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>fence_lite · 围栏文字与图例符号</title>
+<title>fence_lite · Fence text and legend symbols</title>
 <style>
 :root{
   --bg:#f4f5f7; --pn:#fff; --bd:#dcdfe4; --fg:#1f2328; --mut:#6b7280;
@@ -12,6 +12,7 @@
   --c-add:#dc2626;        /* debug: 矢量补检 */
   --c-cov:#16a34a;        /* debug: 被覆盖的矢量文字 */
   --c-drop:#7f1d1d;       /* debug: 被硬闸剥掉的 symbol */
+  --c-lt:#0d9488;         /* 线型高亮（图例色标；每个线型实际用自己的颜色） */
 }
 *{box-sizing:border-box}
 html,body{height:100%;margin:0}
@@ -36,7 +37,8 @@ code{font:12px/1.3 ui-monospace,Consolas,monospace;background:#f1f2f4;
       border-radius:999px;padding:2px 9px;background:#fff;font-size:12px;color:var(--mut)}
 .pill b{color:var(--fg);font-size:13px}
 .lay{display:inline-flex;align-items:center;gap:5px;font-size:12px;border:1px solid var(--bd);
-     border-radius:6px;padding:3px 8px;background:#fff;cursor:pointer;user-select:none}
+     border-radius:6px;padding:3px 8px;background:#fff;cursor:pointer;user-select:none;
+     white-space:nowrap;flex:none}
 .lay.off{opacity:.45}
 .lay i{width:16px;height:0;border-top-width:2.5px;border-top-style:solid;display:inline-block}
 .lay.dash i{border-top-style:dashed}
@@ -65,6 +67,14 @@ h2:first-child{margin-top:0}
 .row .m{margin-top:4px;display:flex;flex-wrap:wrap;gap:4px}
 .tag{font-size:11px;border-radius:4px;padding:1px 6px;background:#eef0f3;color:#475569}
 .tag.mode{background:#e0e7ff;color:#3730a3}
+/* 原生 file input 的按钮和「未选择文件」文案由**浏览器界面语言**渲染，
+   HTML 改不到它 —— 这台机器的浏览器是中文，于是英文界面上冒出两个中文。
+   所以把它 hidden 掉，用自己的按钮触发、自己显示文件名。 */
+.fname{font-size:12px;color:var(--mut);overflow:hidden;text-overflow:ellipsis;
+       white-space:nowrap;min-width:0;flex:1}
+.fname.has{color:var(--fg)}
+.tag.time{background:rgba(59,130,246,.12);color:#1d4ed8;border-color:rgba(59,130,246,.28)}
+.tag.time.dim{background:rgba(100,116,139,.10);color:#475569;border-color:rgba(100,116,139,.22)}
 .tag.cost{background:#fef3c7;color:#92400e}
 .tag.warn{background:#fee2e2;color:#991b1b}
 .tag.txt{background:rgba(37,99,235,.12);color:#1d4ed8}
@@ -144,8 +154,8 @@ rect.bx.bx-mark:hover,rect.bx.bx-mark.pick{fill:rgba(148,163,184,.34)}
 .arw-mask{fill-opacity:.28;stroke-width:1.2;stroke-opacity:.9}
 .arw-leader{fill:none;stroke-opacity:.95;stroke-linecap:round;stroke-linejoin:round}
 .arw-head{fill:none;stroke-opacity:1;stroke-linecap:round;stroke-linejoin:round}
-.steps{display:inline-flex;gap:5px;margin-left:10px;vertical-align:middle}
-.steps .st{display:inline-flex;align-items:center;gap:4px;padding:3px 7px;border:1px solid #2b3b36;border-radius:6px;font:600 10px/1 monospace;color:#9fb3ac;background:#121b18;cursor:help}
+.steps{display:inline-flex;gap:5px;margin-left:10px;vertical-align:middle;flex:none}
+.steps .st{display:inline-flex;align-items:center;gap:4px;padding:3px 7px;border:1px solid #2b3b36;border-radius:6px;font:600 10px/1 monospace;color:#9fb3ac;background:#121b18;cursor:help;white-space:nowrap;flex:none}
 .steps .st i{font-style:normal;font-weight:800}
 .steps .st.good{border-color:#3a7f6a;color:#8fe3c6}
 .steps .st.warn{border-color:#8b6230;color:#f3c77b}
@@ -159,6 +169,53 @@ rect.bx.bx-plc:hover,rect.bx.bx-plc.pick{fill:rgba(124,58,237,.62);
 .bx-grp{stroke:var(--c-grp);stroke-width:1.6;stroke-dasharray:12 6}
 .bx-grp:hover,.bx-grp.pick{fill:rgba(100,116,139,.10)}
 .bx-drop{stroke:var(--c-drop);stroke-width:2;stroke-dasharray:3 3}
+/* 线型高亮：画的是真实绘制的折线本身，所以不能用虚线（会和被高亮的虚线线型
+   互相干扰），用半透明加粗描边压在原线上。 */
+/* 默认态也必须一眼看得见：密图（rapid_city P8 有 74,652 条 path op）上
+   0.42 不透明度的描边基本被底图吃掉，会让人以为"没找到线"。 */
+.lt-line{fill:none;stroke-width:3.2;stroke-opacity:.7;stroke-linecap:round;
+         stroke-linejoin:round;pointer-events:none;vector-effect:non-scaling-stroke;
+         transition:stroke-opacity .12s ease,stroke-width .12s ease}
+/* 从 FENCELINE 那一节选中某个 callout 时：它对应的线型显著一点，其余线型压暗。
+   颜色跟 callout 同一套（fence 蓝 / gate 红），所以不需要另一套调色板。 */
+.lt-line.lt-focus{stroke-width:5;stroke-opacity:1;
+                  filter:drop-shadow(0 0 3px rgba(15,23,42,.45))}
+.lt-line.lt-dim{stroke-opacity:0}
+/* 判据可视化：末端 → 它最近的那条线，标出实际用来判断的距离。
+   开 Debug 才显示 —— 平时不该挡住图。 */
+/* 全部线型（调试层）。这是**旁路视图**，不参与产品口径：正常视图只画被指到
+   的线型（一个线型能有 725 op / 4350 段，全发是 1 MB+ 的 SVG），代价是分不出
+   「没聚出来」和「聚出来了没被选中」。这一层把全部线型摆出来，各用自己的颜色。 */
+.al-line{fill:none;stroke-width:2.1;stroke-opacity:.85;stroke-linecap:round;
+         stroke-linejoin:round;pointer-events:none}
+.al-line.al-focus{stroke-width:4.4;stroke-opacity:1;
+                  filter:drop-shadow(0 0 2px rgba(0,0,0,.35))}
+.al-line.al-dim{stroke-opacity:0}
+/* residual = 有 ink 但不属于任何线型。灰色、细、压在下面 —— 它是「这里确实
+   没有线型」的直接证据，不是结果。 */
+.al-resid{fill:none;stroke:#64748b;stroke-width:1;stroke-opacity:.5;
+          pointer-events:none}
+.al-resid.al-dim{stroke-opacity:0}
+.al-head{display:flex;gap:6px;align-items:center;padding:4px 10px 6px;
+         font:11px/1.45 ui-monospace,Consolas,monospace;color:var(--muted)}
+.al-head input{flex:1;min-width:0;font:inherit;padding:3px 6px;
+               border:1px solid var(--line);border-radius:5px;
+               background:var(--bg);color:var(--fg)}
+.al-sw{width:10px;height:10px;border-radius:2px;flex:none;
+       box-shadow:0 0 0 1px rgba(0,0,0,.25) inset}
+.al-item.on{outline:2px solid var(--accent);outline-offset:-2px}
+.al-badge{font:600 9px ui-monospace,Consolas,monospace;padding:1px 4px;
+          border-radius:3px;background:rgba(13,148,136,.16);color:#0d9488}
+.lt-probe{stroke:#ef4444;stroke-width:1.6;stroke-dasharray:3 2;fill:none;
+          vector-effect:non-scaling-stroke;pointer-events:none}
+.lt-probe-dot{fill:#ef4444;stroke:#fff;stroke-width:.6;pointer-events:none}
+.lt-probe-txt{fill:#b91c1c;font:600 9px ui-monospace,Consolas,monospace;
+              paint-order:stroke;stroke:#fff;stroke-width:2.4px;
+              pointer-events:none}
+/* Fenceline 列表行：和上面的 scope 行同一套外观，只多一个线型编号在右侧。
+   lt-orphan 是「后端绑到了线型、但文字没进 scope 列表」的行，点不动。 */
+.lt-row .scope-n{font-variant-numeric:tabular-nums}
+.lt-orphan{cursor:default;opacity:.75}
 .bx-drop:hover,.bx-drop.pick{fill:rgba(127,29,29,.18)}
 rect.bx.flash{fill:rgba(37,99,235,.35)}
 
@@ -190,74 +247,261 @@ rect.bx.flash{fill:rgba(37,99,235,.35)}
       font-size:12px;color:#92400e;margin:8px 0}
 .err{color:#b91c1c;font-size:12px;min-height:16px}
 .frow{display:flex;align-items:center;gap:8px;margin:8px 0}
+
+/* ---------------- document workspace (scope UI) ---------------- */
+:root{
+  --c-fence:#1976d2;
+  --c-fence-soft:rgba(25,118,210,.14);
+  --c-gate:#e53935;
+  --c-gate-soft:rgba(229,57,53,.14);
+  --c-tag:#e91e63;
+  --side-w:258px;
+}
+body{background:#eef1f4;overflow:hidden}
+#top{height:58px;padding:7px 12px;gap:9px;flex-wrap:nowrap;box-shadow:0 1px 8px rgba(15,23,42,.06);z-index:20}
+.iconbtn{width:34px;height:34px;padding:0;display:inline-grid;place-items:center;border-radius:8px;font-size:17px}
+/* 揭开图层控制条的入口。刻意做得不显眼：平时几乎看不见，鼠标移过去才浮现。
+   不做成常规按钮是因为这排开关是内部调试用的，客户看到只会困惑。 */
+.tuckbtn{width:26px;height:26px;padding:0;display:inline-grid;place-items:center;
+  border:none;background:none;color:var(--mut);opacity:.22;font-size:15px;
+  line-height:1;border-radius:6px;cursor:pointer;transition:opacity .12s ease}
+.tuckbtn:hover{opacity:.75;background:var(--card)}
+.tuckbtn[aria-pressed="true"]{opacity:.8;color:var(--accent);background:var(--card)}
+#jobStatus{display:none;align-items:center;gap:7px;min-width:170px;max-width:310px;padding:6px 9px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:8px;color:#1d4ed8;font-size:11px}
+#jobStatus.on{display:flex}
+#jobStatus .mini-progress{height:4px;min-width:52px;flex:1;background:#dbeafe;border-radius:3px;overflow:hidden}
+#jobStatus .mini-progress i{display:block;height:100%;background:var(--c-fence)}
+#bar{height:42px;padding:5px 12px;flex-wrap:nowrap;overflow-x:auto;gap:7px;scrollbar-width:thin}
+/* 一行到底，窄屏横向滚动，绝不折行。
+   容器早就是 flex-wrap:nowrap 了，但**项目自己会折**：.lay 默认 flex-shrink:1，
+   窄屏时被压到比内容还窄，于是标签内部的文字换行、整行变高 —— 看起来就是
+   "分行"。所以真正要给的是 flex:none + white-space:nowrap。 */
+#bar>*{flex:none}
+#bar .lay,#bar .steps .st,#bar .sp{white-space:nowrap}
+#bar::-webkit-scrollbar{height:5px}
+#bar::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+#bar::-webkit-scrollbar-track{background:transparent}
+/* 图层控制条不是给客户看的，默认收起。用 class 控制而不是改 #bar 的 display —— 
+   那条 display:flex 是和 #top 共用的（见 :31），动它会连顶栏一起改。 */
+#bar.tucked{display:none}
+#bar .scope-legend{display:flex;align-items:center;gap:10px;margin-right:3px;white-space:nowrap;color:#475569;font-size:11.5px}
+.scope-dot{width:9px;height:9px;border-radius:3px;display:inline-block;flex:none}
+.scope-dot.fence{background:var(--c-fence)}
+.scope-dot.gate{background:var(--c-gate)}
+#main{position:relative;background:#eef1f4}
+#side{position:relative;width:var(--side-w);padding:0;overflow:hidden;display:flex;flex-direction:column;z-index:10;box-shadow:2px 0 10px rgba(15,23,42,.06);transition:width .18s ease}
+#sideHead{height:51px;display:flex;align-items:center;gap:7px;padding:7px 9px;border-bottom:1px solid var(--bd);background:#fff;flex:none}
+#sideHead .sidetitle{min-width:0;flex:1;display:flex;flex-direction:column;line-height:1.2}
+/* 下拉要看起来就是标题本身，不是一个塞进标题的控件：无边框、继承字色，
+   只在 hover / focus 时给一点可点的暗示。宽度必须能被压缩（min-width:0），
+   否则长 slug 会把整个 sideHead 撑开、把右边的折叠按钮挤出去。 */
+#projectSelect{font:750 13.5px/1.2 inherit;color:var(--fg);background:#fff;
+  border:1.5px solid var(--bd);border-radius:8px;padding:6px 24px 6px 10px;
+  min-width:190px;max-width:min(34vw,420px);cursor:pointer;
+  appearance:none;-webkit-appearance:none;text-overflow:ellipsis;
+  background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),
+    linear-gradient(135deg,var(--mut) 50%,transparent 50%);
+  background-position:calc(100% - 11px) calc(50% + 1px),calc(100% - 7px) calc(50% + 1px);
+  background-size:4px 4px,4px 4px;background-repeat:no-repeat}
+#projectSelect:hover{border-color:var(--accent)}
+#projectSelect:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#projectSelect option{font-weight:400;color:var(--fg);background:var(--bg)}
+/* 这一行显示「当前页 / 总页数」。PDF 名字已经在顶栏下拉里，这里再来一遍是重复；
+   而顶栏那排翻页控件删掉之后，页码位置没有别的地方可看了。 */
+#sideSheetLabel{font-size:14px;font-weight:750;white-space:nowrap;
+                font-variant-numeric:tabular-nums;letter-spacing:.01em}
+#sideSheetLabel .lbl{font-size:11px;font-weight:600;color:var(--mut);
+                     letter-spacing:.04em}
+/* Page preview 这一行本身就是展开/收起 sheets 预览的入口：点一下展开，选完
+   某一页自动收起，再点又能展开。做成按钮而不是纯文本，是因为「收起之后怎么
+   回去」必须有一个看得见的入口 —— 上一轮靠 projectSelect 的 mousedown 顶着，
+   那是权宜做法（重选同一个 PDF 不触发 onchange）。 */
+/* 整行（PDF 名字 + 三角）就是展开/收起 sheets 预览的入口。三角放在**名字**
+   右边而不是说明文字右边：名字是这一行的主体，收起状态下用户找的就是它。 */
+#bSheets{display:flex;align-items:center;gap:7px;width:100%;min-width:0;
+  padding:0;background:none;border:none;color:var(--fg);font:inherit;
+  cursor:pointer;text-align:left}
+#bSheets #sideSheetLabel{flex:1;min-width:0}
+#bSheets:hover #sideSheetLabel{color:var(--accent)}
+#bSheets .caret{flex:none;width:0;height:0;border-left:6px solid transparent;
+  border-right:6px solid transparent;border-top:7px solid var(--mut);
+  transition:transform .14s ease}
+#bSheets:hover .caret{border-top-color:var(--accent)}
+#side.pages-mode #bSheets .caret{transform:rotate(180deg)}
+/* 说明文字退到第二行，不再是可点的那部分 */
+#sideHead .sidetitle #sideViewName{margin-top:2px}
+#sideViewName{font-size:10.5px;color:var(--mut);margin-top:3px}
+#projectDrawer{display:none;position:absolute;inset:51px 0 0 0;background:#fff;z-index:12;overflow:auto;padding:10px;box-shadow:5px 0 18px rgba(15,23,42,.14)}
+#side.project-open #projectDrawer{display:block}
+#pagesPane,#scopePane{min-height:0;flex:1;background:#f8fafc}
+#pagesPane{display:flex;flex-direction:column}
+#scopePane{display:none;flex-direction:column;background:#f8fafc}
+#side.scope-mode #pagesPane{display:none}
+#side.scope-mode #scopePane{display:flex}
+.panehead{height:38px;display:flex;align-items:center;gap:8px;padding:7px 11px;border-bottom:1px solid var(--bd);background:#fff;flex:none;font-size:11px;color:var(--mut)}
+/* 标题行现在是三格：标题 / 计数 / 筛选器。筛选器是 sheets 预览的筛选器，
+   原来放在顶栏那堆翻页缩放里，跟它该在的地方不搭。 */
+.panehead #tgOnly{font-size:10px;padding:2px 6px;margin-left:auto;flex:none}
+
+.panehead b{font-size:12px;color:var(--fg);flex:1}
+#thumbs{overflow:auto;padding:10px 11px 24px;scroll-behavior:smooth}
+.thumb{display:block;width:100%;border:0;background:transparent;border-radius:9px;padding:0 0 10px;margin:0 0 8px;text-align:left;color:inherit}
+.thumb:hover{background:#eef2f7}
+.thumb .preview{position:relative;margin:0 7px;border:1px solid #cfd5dd;background:#fff;border-radius:4px;overflow:hidden;aspect-ratio:1.32;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(15,23,42,.08)}
+.thumb .preview img{display:block;max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain;background:#fff}
+.thumb .cap{display:flex;align-items:center;gap:6px;padding:7px 8px 0;font-size:11.5px;color:#596273}
+.thumb .cap b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:550;flex:1}
+.thumb .hitcount{font-size:10px;color:#64748b;background:#e2e8f0;border-radius:999px;padding:1px 6px}
+.thumb.on .preview{border:2px solid var(--c-fence);box-shadow:0 0 0 3px rgba(25,118,210,.16)}
+.thumb.on .cap{color:var(--c-fence)}
+.fenceTag{position:absolute;top:6px;right:6px;background:var(--c-tag);color:#fff;border-radius:5px;padding:3px 7px;font-size:10px;font-weight:700;line-height:1;box-shadow:0 1px 4px rgba(0,0,0,.18);z-index:2}
+.imageTag{position:absolute;top:6px;left:6px;background:#64748b;color:#fff;border-radius:5px;padding:3px 7px;font-size:10px;font-weight:700;line-height:1;box-shadow:0 1px 4px rgba(0,0,0,.18);z-index:2}
+.thumb-placeholder{position:absolute;inset:0;display:grid;place-items:center;font-size:11px;color:#94a3b8}
+.thumb:focus-visible,.scope-item:focus-visible,.iconbtn:focus-visible{outline:3px solid rgba(25,118,210,.32);outline-offset:2px}
+#scopePane .scope-title{height:50px;display:flex;align-items:center;gap:8px;padding:9px 12px;background:#fff;border-bottom:1px solid var(--bd)}
+#scopePane .scope-title b{font-size:14px;flex:1}
+#scopeCount{min-width:24px;height:24px;display:grid;place-items:center;border-radius:999px;background:#eef2f7;color:#475569;font-size:11px;font-weight:650}
+#panel{width:auto;border:0;padding:0;min-height:0;overflow:auto;background:#f8fafc;flex:1}
+#list{padding:6px 9px 14px}
+/* 分节标题要一眼看出分界：加粗、加大、上下留白拉开，颜色也压深一档。
+   原来 9.5px / #9aa2ae 太轻，FENCE TEXT & GATES 和 FENCELINE 两节看起来是连着的。 */
+.scope-section{margin:18px 4px 8px;font-size:11px;font-weight:800;
+  letter-spacing:.10em;text-transform:uppercase;color:#475569;
+  display:flex;align-items:center;gap:8px}
+.scope-section:first-child{margin-top:6px}
+/* 居中：两侧各一条等分的横线把标题夹在中间。只写 :after 的话线只在右边，
+   文字被顶到最左；两边都写才是真的居中，而且不用测量文字宽度。 */
+.scope-section:before,.scope-section:after{content:"";height:2px;
+  border-radius:1px;background:#cbd5e1;flex:1}
+.scope-item{width:100%;display:grid;grid-template-columns:12px minmax(0,1fr) auto;gap:8px;align-items:start;border:1px solid transparent;background:transparent;border-radius:8px;padding:8px 7px;margin:2px 0;text-align:left}
+.scope-item:hover{background:#eef2f7}
+.scope-item.on{background:#e8f1ff;border-color:#cfe2ff}
+.scope-item.gate.on{background:#fff0ef;border-color:#ffd4d1}
+.scope-item .scope-dot{margin-top:4px}
+.scope-item .scope-copy{min-width:0}
+.scope-item .scope-text{display:block;font-size:12.5px;font-weight:600;line-height:1.35;word-break:break-word}
+.scope-item .scope-meta{display:block;font-size:10px;color:#8a94a3;margin-top:3px}
+.scope-item .scope-n{font-size:10px;color:#64748b;background:#e5e7eb;border-radius:999px;min-width:22px;height:20px;display:grid;place-items:center;padding:0 5px}
+#sel{display:none;margin:0 9px 10px}
+#sel.has{display:block}
+.scope-detail{border:1px solid #dbe4ef;border-left:3px solid var(--c-fence);border-radius:8px;background:#fff;padding:9px 10px}
+.scope-detail.gate{border-left-color:var(--c-gate)}
+.scope-detail>div{display:flex;align-items:center;gap:6px;font-size:11px;color:#64748b;margin-bottom:5px}
+.scope-detail strong{display:block;font-size:11.5px;line-height:1.4;word-break:break-word}
+.scope-detail p{margin:5px 0 0;color:#7b8491;font-size:10px;line-height:1.4}
+#stage{background:#e7ebef}
+#viewport{background:#e7ebef}
+#viewport svg{margin:18px;box-shadow:0 2px 14px rgba(15,23,42,.13);background:#fff}
+#hint{background:linear-gradient(135deg,#f8fafc,#edf2f7)}
+.viewer-badge{position:absolute;left:14px;bottom:14px;z-index:5;display:flex;gap:6px;pointer-events:none}
+
+/* Scope classification and linked-callout emphasis. Gate always wins. */
+rect.bx.scope-fence{stroke:var(--c-fence);fill:rgba(25,118,210,.07)}
+rect.bx.scope-gate{stroke:var(--c-gate);fill:rgba(229,57,53,.07)}
+rect.bx.bx-plc.scope-fence,.arw-mask.scope-fence{stroke:var(--c-fence);fill:rgba(25,118,210,.22)}
+rect.bx.bx-plc.scope-gate,.arw-mask.scope-gate{stroke:var(--c-gate);fill:rgba(229,57,53,.22)}
+.scope-fence.arw-leader,.scope-fence.arw-head{stroke:var(--c-fence)}
+.scope-gate.arw-leader,.scope-gate.arw-head{stroke:var(--c-gate)}
+svg [data-scope]{transition:opacity .12s ease,fill-opacity .12s ease,stroke-width .12s ease;vector-effect:non-scaling-stroke}
+svg polyline[data-scope],svg rect[data-scope]{cursor:pointer}
+/* 二值语义：**选中的显示，没选中的完全不显示**，没有「压暗」这个中间态。
+   class 名沿用 -dim 只是历史包袱，值必须是 0；任何 >0 的残影都会让图上仍然
+   一片蓝，那正是要避开的。
+   pointer-events 必须一起关：opacity:0 的元素仍然接收点击，不关就会点到看不见
+   的框上，还会走 pick() 把选中态清掉。 */
+svg .scope-dim{opacity:0;pointer-events:none}
+svg rect.scope-focus{stroke-width:3.4;fill-opacity:.42;filter:drop-shadow(0 0 3px rgba(15,23,42,.32))}
+svg polyline.scope-focus{stroke-width:3.2;opacity:1;filter:drop-shadow(0 0 2px rgba(15,23,42,.35))}
+
+@media (max-width:920px){
+  :root{--side-w:220px}
+  #bar .lay{font-size:0;padding:4px 6px}
+  #bar .lay input,#bar .lay i{font-size:initial}
+}
+@media (max-width:700px){
+  #side{position:absolute;inset:0 auto 0 0;width:min(82vw,300px)}
+  #side.mobile-hidden{width:44px}
+  #side.mobile-hidden #pagesPane,#side.mobile-hidden #scopePane,#side.mobile-hidden .sidetitle{display:none}
+  #stage{margin-left:44px}
+}
 </style>
 
 <div id="top">
-  <h1>fence_lite</h1>
-  <button class="primary" id="bUp">上传 PDF</button>
+  <button class="iconbtn" id="bProjectMenu" title="Projects and jobs" aria-label="Open project list">☰</button>
+  <select id="projectSelect" title="Select PDF" aria-label="Select PDF"><option value="">No PDF</option></select>
+  <button class="primary" id="bUp">Upload PDF</button>
+  <div id="jobStatus"></div>
+  <span id="mdlSwitch" class="mdlsw"></span>
   <span class="sp"></span>
-  <span class="pill">页 <b id="pgNow">–</b> / <b id="pgAll">–</b></span>
-  <button id="bPrev">上一页</button>
-  <input id="pgIn" type="number" min="1" style="width:62px;padding:3px 5px;border:1px solid var(--bd);border-radius:6px">
-  <button id="bNext">下一页</button>
-  <label class="lay off" id="tgOnly"><input type="checkbox"> 只看有结果的页</label>
-  <span class="sp"></span>
-  <button id="zOut">−</button><span class="pill"><b id="zPct">–</b></span><button id="zIn">+</button>
-  <button id="zFit">适应</button>
+  <button id="bLayers" class="tuckbtn" title="Layer controls" aria-label="Layer controls" aria-pressed="false">⋯</button>
 </div>
 
-<div id="bar">
-  <label class="lay" id="tgTxt"><input type="checkbox" checked><i style="border-top-color:var(--c-uni)"></i>文字并集</label>
-  <label class="lay" id="tgSym"><input type="checkbox" checked><i style="border-top-color:var(--c-sym)"></i>图例样例符号</label>
-  <label class="lay mask" id="tgArw"><input type="checkbox" checked>箭头引线</label><span id="stepStrip" class="steps"></span><label class="lay mask" id="tgPlc"><input type="checkbox" checked><i></i>plan 内放置</label>
-  <label class="lay dash" id="tgPlan"><input type="checkbox" checked><i style="border-top-color:var(--c-plan)"></i>plan 视图框</label>
-  <label class="lay dash off" id="tgGrp"><input type="checkbox"><i style="border-top-color:var(--c-grp)"></i>页面分区</label>
+<div id="bar" class="tucked">
+  <div class="scope-legend"><span><i class="scope-dot gate"></i> Gate</span><span><i class="scope-dot fence"></i> Fence</span></div>
+  <label class="lay" id="tgTxt"><input type="checkbox" checked><i style="border-top-color:var(--c-uni)"></i>Text union</label>
+  <label class="lay" id="tgSym"><input type="checkbox" checked><i style="border-top-color:var(--c-sym)"></i>Legend sample symbols</label>
+  <label class="lay mask" id="tgArw"><input type="checkbox" checked>Arrows & leaders</label><label class="lay" id="tgLt"><input type="checkbox" checked><i style="border-top-color:var(--c-lt)"></i>Line types</label><label class="lay" id="tgAll"><input type="checkbox"><i style="border-top-color:#7c3aed"></i>All line types</label><label class="lay" id="tgResid"><input type="checkbox" checked><i style="border-top-color:#64748b"></i>residual</label><span id="stepStrip" class="steps"></span><label class="lay mask" id="tgPlc"><input type="checkbox" checked><i></i>In-plan placements</label>
+  <label class="lay dash" id="tgPlan"><input type="checkbox" checked><i style="border-top-color:var(--c-plan)"></i>plan view boxes</label>
+  <label class="lay dash off" id="tgGrp"><input type="checkbox"><i style="border-top-color:var(--c-grp)"></i>Sheet regions</label>
   <span class="sp"></span>
-  <span id="mdlSwitch" class="mdlsw"></span>
-  <label class="lay off" id="tgDbg"><input type="checkbox">Debug（拆分来源 + 被剥离符号）</label>
+  <label class="lay off" id="tgDbg"><input type="checkbox">Debug (split source + stripped symbols)</label>
 </div>
 
 <div id="main">
-  <div id="side">
-    <h2>处理中</h2>
-    <div id="jobs"><div class="empty">暂无任务</div></div>
-    <h2>项目</h2>
-    <div id="gallery"><div class="empty">还没有项目，先上传一个 PDF</div></div>
-  </div>
-  <div id="stage">
-    <div id="viewport"><div id="hint">左侧选一个项目</div></div>
-  </div>
-  <div id="panel">
-    <h2>本页数字</h2>
-    <div class="num">
-      <div><b id="nTxt">0</b><span>文字</span></div>
-      <div><b id="nSym">0</b><span>符号</span></div>
-      <div><b id="nPlc">0</b><span>放置</span></div>
-      <div><b id="nPlan">0</b><span>plan 组</span></div>
+  <aside id="side" class="pages-mode">
+    <div id="sideHead">
+      <div class="sidetitle">
+        <button type="button" id="bSheets" aria-expanded="false"
+                title="Show the sheet previews of this PDF">
+          <strong id="sideSheetLabel"><span class="lbl">Page</span> – / –</strong><i class="caret"></i>
+        </button>
+        <span id="sideViewName">PDF sheets</span>
+      </div>
     </div>
-    <div id="sel"><div class="empty">点图上任意框查看详情</div></div>
-    <h2>本页条目</h2>
-    <div id="list"></div>
+    <div id="projectDrawer">
+      <h2>Processing</h2>
+      <div id="jobs"><div class="empty">No jobs</div></div>
+      <h2>Projects</h2>
+      <div id="gallery"><div class="empty">No projects yet — upload a PDF</div></div>
+    </div>
+    <div id="pagesPane">
+      <div class="panehead"><b>PDF sheets</b><span id="pageHitSummary">0  sheets</span>
+        <label class="lay off" id="tgOnly"><input type="checkbox"> Only with results</label>
+      </div>
+      <div id="thumbs"><div class="empty">Select or upload a PDF</div></div>
+    </div>
+    <div id="scopePane">
+      <div class="scope-title"><b>Fence scope</b><span id="scopeCount">0</span></div>
+      <div id="panel">
+        <div id="list"><div class="empty">No fence results on this sheet</div></div>
+        <div id="sel"></div>
+      </div>
+    </div>
+  </aside>
+  <div id="stage">
+    <div id="viewport"><div id="hint">Pick a project on the left</div></div>
   </div>
 </div>
 
 <div id="modal">
   <div class="box">
-    <h3>上传 PDF</h3>
+    <h3>Upload PDF</h3>
     <div class="frow">
-      <input id="upFile" type="file" accept="application/pdf">
+      <input id="upFile" type="file" accept="application/pdf" hidden>
+      <button type="button" id="upPick">Choose PDF…</button>
+      <span id="upName" class="fname">No file selected</span>
     </div>
-    <div>检测目标（找什么）：可以改成找门 / 树 / 消火栓等</div>
+    <div>Detection target (what to find) — change it to doors / trees / hydrants, etc.</div>
     <textarea id="upTarget" spellcheck="false"></textarea>
     <div class="note">
-      默认目标 = 找 fence 相关文字，会跑完整四步：文字 → 图例样例符号 → 视图分类 →
-      plan 视图内符号匹配。<b>一旦把目标改成别的东西，就只跑文字步</b> ——
-      图例符号与 plan 放置是 fence 专属逻辑，对任意目标不成立，会自动跳过。
+      default target = Find fence-related text — runs all four steps: text → Legend sample symbols → View classification →
+      in-plan symbol matching.<b>Change the target to anything else and only the text step runs</b> —
+      Legend symbols and in-plan placement are fence-specific logic; they do not apply to an arbitrary target and are skipped automatically.
     </div>
     <div class="err" id="upErr"></div>
     <div class="frow" style="justify-content:flex-end">
-      <button id="upCancel">取消</button>
-      <button class="primary" id="upRun">开始处理</button>
+      <button id="upCancel">Cancel</button>
+      <button class="primary" id="upRun">Start processing</button>
     </div>
   </div>
 </div>
@@ -266,10 +510,10 @@ rect.bx.flash{fill:rgba(37,99,235,.35)}
 const NS='http://www.w3.org/2000/svg';
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const STAGE_CN={queued:'排队中',text:'第 1 步 · 找文字',symbols:'第 2 步 · 图例样例符号',
-  views:'第 3 步 · 视图分类',placements:'第 4 步 · plan 内符号匹配',
-  arrows:'附加 · 箭头引线',done:'完成',error:'出错',cancelled:'已取消',
-  interrupted:'被中断（服务重启）'};
+const STAGE_CN={queued:'Queued',text:'Step 1 · Find text',symbols:'Step 2 · Legend sample symbols',
+  views:'Step 3 · View classification',placements:'Step 4 · in-plan symbol matching',
+  arrows:'Extra · Arrows & leaders',done:'Done',error:'failed',cancelled:'Cancelled',
+  interrupted:'Interrupted (service restart)'};
 
 let PRESET='';                 // 预置检测目标
 let OV=[];                     // /api/overview
@@ -280,6 +524,356 @@ let PAGE=null;                 // /api/page payload
 let LOOK={};                   // key -> {kind,label,text,box,idx,rect,note}
 let picked=null;
 let svg=null, scale=1, fitS=1, epoch=0;
+let SCOPE_GROUPS=[];           // 本页去重后的文字 scope
+let SCOPE_BY_INDEX=new Map();  // union index -> scope
+let SCOPE_BY_SYMBOL=new Map(); // symbol index -> scope
+let selectedScope=null;
+/* 当前高亮的**那一行**。不能只记 selectedScope —— 同一个 callout 只要绑到了
+   线型，就会同时出现在 FENCE TEXT & GATES 和 FENCELINE 两个分节里（scopeId
+   相同），按 scope 匹配会把两行一起点亮。rowKey = 分节 + scopeId。 */
+let selectedRow=null;
+/* 上一次鼠标手势有没有拖动过。浏览器在拖拽结束时**照样派发一次 click**，
+   而 svg 的点击处理器会把 scope 选中态清掉 —— 表现就是「拖一下图，原先
+   单选的 callout 高亮没了、所有线型又全冒出来」。拖拽那段本来就算了 moved，
+   只是从没拿它拦过 click。 */
+let PANNED=false;
+let THUMB_KEY='';
+let THUMB_OBSERVER=null;
+
+/* 侧栏只合并「内容完全相同」的文字：统一 Unicode、大小写和空白，但保留
+   标点、尺寸与 detail 编号，避免 4'/5' 或不同 keynote 被误并。 */
+const scopeKey=s=>String(s==null?'':s).normalize('NFKC')
+  .replace(/\s+/g,' ').trim().toLocaleUpperCase();
+const isGateText=s=>/\bGATES?\b/i.test(String(s||''));
+const scopeClass=g=>g&&g.gate?'gate':'fence';
+const scopeColor=g=>g&&g.gate?'#e53935':'#1976d2';
+
+function makeScopeModel(){
+  SCOPE_GROUPS=[]; SCOPE_BY_INDEX=new Map(); SCOPE_BY_SYMBOL=new Map();
+  // LT_LINES_ON 必须跟着一起清：换页后 SCOPE_GROUPS 全新，残留的 true 会让
+  // 「在新页上随手点一个 scope 框」莫名连带打开线型层并压暗其余线型。
+  selectedScope=null; selectedRow=null; LT_LINES_ON=false;
+  if($('sel')){$('sel').classList.remove('has');$('sel').innerHTML=''}
+  if(!PAGE)return;
+  const byKey=new Map(), markers=new Set(PAGE.marker_codes||[]),
+        suppressed=new Set(PAGE.suppressed_items||[]);
+  for(const [idx,it] of (PAGE.items||[]).entries()){
+    if(markers.has(idx)||suppressed.has(idx))continue;
+    const key=scopeKey(it.text);
+    if(!key)continue;
+    let g=byKey.get(key);
+    if(!g){
+      g={id:'scope'+SCOPE_GROUPS.length,key:key,text:String(it.text||'').replace(/\s+/g,' ').trim(),
+         gate:false,members:[],symbols:[],placements:[],arrowKeys:[],targets:[],
+         arrowTargets:0,bareTargets:0,kind:'direct'};
+      byKey.set(key,g); SCOPE_GROUPS.push(g);
+    }
+    g.gate=g.gate||isGateText(it.text);
+    g.members.push(idx); SCOPE_BY_INDEX.set(idx,g);
+  }
+  ((PAGE.symbols||{}).symbols||[]).forEach((s,si)=>{
+    const g=SCOPE_BY_INDEX.get(Number(s.text_index));
+    if(!g)return;
+    g.kind='legend'; g.symbols.push(si); SCOPE_BY_SYMBOL.set(si,g);
+    (s.placements||[]).forEach((box,pi)=>g.placements.push({si,pi,box}));
+  });
+  for(const [key,ent] of Object.entries(((PAGE.record||{}).arrows)||{})){
+    let g=null;
+    if(/^\d+$/.test(key))g=SCOPE_BY_INDEX.get(Number(key));
+    else{
+      const m=key.match(/^s(\d+):(\d+)$/);
+      if(m)g=SCOPE_BY_SYMBOL.get(Number(m[1]));
+    }
+    if(!g)continue;
+    g.arrowKeys.push(key);
+    for(const t of (ent.targets||[]))if(Array.isArray(t.box_2d)){
+      g.targets.push(t.box_2d);
+      if(t.terminal_kind==='arrowhead')g.arrowTargets++;
+      else g.bareTargets++;
+    }
+  }
+  for(const g of SCOPE_GROUPS){
+    g.calloutCount=Math.max(g.placements.length,g.targets.length,g.members.length);
+  }
+}
+
+/* Fenceline：把后端算好的「scope → 线型」接到前端的 scope 模型上.
+
+   两边的分组键是同一个东西 —— 后端 steps/linetypes/bind.py 的 group 是
+   ``t:<Normalized text>``，归一化口径（NFKC + 折空白 + 大写）与这里的 scopeKey()
+   逐字一致；放置锚那种没有文字的组是 ``k:<arrowKey>``，走 scopeForArrowKey。
+   所以这里只做连接，不重新判断谁该有线：gate 不找线、plan 显示闸、residual
+   全部是后端的结论。 */
+let LT_NODES=new Map();        // 线型编号 -> [polyline 节点]
+// 当前选中是否要连带高亮线型。只有从 FENCELINE 那一节点进来才是 true；
+// 图层开关变化后会 re-select 一次，靠它把状态原样恢复。
+let LT_LINES_ON=false;
+let LT_INDEX={types:[],rows:[],orphans:[],orphanNumbers:new Set(),
+              scopesByNumber:new Map(),numberByScope:new Map()};
+
+function buildLinetypeIndex(){
+  LT_NODES=new Map();
+  LT_INDEX={types:[],rows:[],orphans:[],orphanNumbers:new Set(),
+            scopesByNumber:new Map(),numberByScope:new Map()};
+  const lt=(PAGE&&PAGE.record&&PAGE.record.linetypes)||null;
+  if(!lt)return;
+  const visible=new Set(lt.visible||[]);
+  const scopeOf=g=>{
+    const key=String(g.group||'');
+    if(key.startsWith('t:')){
+      const token=key.slice(2);
+      return SCOPE_GROUPS.find(s=>s.key===token)||null;
+    }
+    if(key.startsWith('k:'))return scopeForArrowKey(key.slice(2));
+    return null;
+  };
+  const byNumber=new Map((lt.line_types||[]).map(t=>[t.line_type_number,t]));
+  for(const g of (lt.groups||[])){
+    const number=g.visible_line_type_number;
+    if(number==null||!visible.has(number))continue;
+    const meta0=byNumber.get(number)||{};
+    const scope=scopeOf(g);
+    if(!scope){
+      // 后端绑到了线型，但这一组在本页的 scope 模型里没有对应项（文字被当成
+      // marker code 或弱重复项过滤掉了）。**照样画、照样列**，只是点不动 ——
+      // 静默丢一个已经算出来的结果比列一条点不了的行更糟。
+      LT_INDEX.orphans.push({
+        scopeId:null, text:String(g.text||'(No text)'), number:number,
+        family:meta0.signature_family||'', segments:meta0.segment_count||0,
+        terminals:(g.in_plan_count||0),
+      });
+      LT_INDEX.orphanNumbers.add(number);
+      continue;
+    }
+    LT_INDEX.numberByScope.set(scope.id,number);
+    const list=LT_INDEX.scopesByNumber.get(number)||[];
+    if(!list.includes(scope.id))list.push(scope.id);
+    LT_INDEX.scopesByNumber.set(number,list);
+    const meta=byNumber.get(number)||{};
+    const dropped=(meta.dropped_runs||[]);
+    LT_INDEX.rows.push({
+      scopeId:scope.id, text:scope.text, gate:!!scope.gate, number:number,
+      family:meta.signature_family||'', segments:meta.segment_count||0,
+      recovered:!!meta.recovered_from_fusion,
+      terminals:(g.in_plan_count||0), votes:g.votes_in_plan||{},
+      // 同型但没接上的走线，没被任何末端指到（不画，但要说出来）。
+      droppedRuns:dropped.length,
+      droppedSegments:dropped.reduce((n,d)=>n+(d.segment_count||0),0),
+    });
+  }
+  LT_INDEX.types=[...new Set([...LT_INDEX.scopesByNumber.keys(),
+                              ...LT_INDEX.orphanNumbers])]
+    .map(n=>byNumber.get(n))
+    .filter(t=>t&&Array.isArray(t.polylines)&&t.polylines.length);
+  const bySort=(a,b)=>a.number-b.number||a.text.localeCompare(b.text);
+  LT_INDEX.rows.sort(bySort); LT_INDEX.orphans.sort(bySort);
+}
+
+function scopeForArrowKey(key){
+  if(/^\d+$/.test(String(key)))return SCOPE_BY_INDEX.get(Number(key))||null;
+  const m=String(key).match(/^s(\d+):(\d+)$/);
+  return m?(SCOPE_BY_SYMBOL.get(Number(m[1]))||null):null;
+}
+
+/* =============== 工作区左栏 =============== */
+function setSideMode(mode){
+  const scope=mode==='scope';
+  $('side').classList.toggle('scope-mode',scope);
+  $('side').classList.toggle('pages-mode',!scope);
+  $('sideViewName').textContent=scope?'PDF sheets':'PDF sheets';
+  const sheets=$('bSheets');
+  if(sheets){
+    sheets.setAttribute('aria-expanded',String(!scope));
+    sheets.title=scope?'Show the sheet previews of this PDF'
+                      :'Hide the sheet previews';
+  }
+  if(scope&&PAGE)renderList();
+}
+function toggleProjectDrawer(force){
+  const side=$('side');
+  const on=force===undefined?!side.classList.contains('project-open'):!!force;
+  side.classList.toggle('project-open',on);
+  $('bProjectMenu').setAttribute('aria-expanded',String(on));
+}
+/* sheets 预览的展开/收起入口。选完某一页会自动收起（renderThumbs 的
+   onclick 里 setSideMode('scope')），这里负责再把它展开。 */
+/* 图层控制条的显隐。**不持久化**：每次打开页面都是收起的 —— 客户看到那排
+   开关只会困惑，而"平时都不显示"正是它的产品口径。 */
+$('bLayers').onclick=()=>{
+  const bar=$('bar');
+  const on=bar.classList.toggle('tucked')===false;
+  $('bLayers').setAttribute('aria-pressed',String(on));
+  /* 模型相关的东西是按 DEV() 渲染的，开关一变必须重渲染，否则要等下一次
+     轮询才跟着出现/消失。 */
+  renderModelSwitch(); renderJobs();
+  if(typeof OV!=='undefined'&&OV.length)loadOverview();
+};
+
+$('bSheets').onclick=()=>{
+  if(!PAGE)return;
+  setSideMode($('side').classList.contains('pages-mode')?'scope':'pages');
+};
+$('bProjectMenu').onclick=()=>toggleProjectDrawer();
+
+/* 打开一个项目的**唯一**入口：下拉、画廊行、模型 chip 都走这里。
+   口径是「选完 PDF 就进页面预览」—— 让它只有一处实现，三个入口才不会各自漂移。 */
+function openProject(slug,page){
+  const row=ovRow(slug);
+  if(!row)return;
+  const pick=page||(((row.pages)||[]).find(x=>(x.vlm+x.added)>0)||{page:1}).page;
+  toggleProjectDrawer(false);
+  setSideMode('pages');
+  show(slug,pick);
+}
+
+/* 下拉里一个 PDF 一项。对比运行（<slug>__<model>）不单独占一项 —— 与画廊
+   同口径，它们折叠进原项目那一行的模型 chip 里。 */
+function renderProjectSelect(){
+  const sel=$('projectSelect');
+  if(!sel)return;
+  const rows=OV.filter(p=>!p.variant_of)
+    .slice().sort((a,b)=>a.slug.localeCompare(b.slug));
+  const current=CUR?CUR.slug:'';
+  const parentOf=slug=>{
+    const row=ovRow(slug);
+    return row&&row.variant_of?row.variant_of:slug;
+  };
+  const want=current?parentOf(current):'';
+  const sig=rows.map(p=>p.slug+':'+(p.page_count||0)
+                       +(p.processing?':run':'')).join('|')+'#'+want;
+  if(sel.dataset.sig===sig)return;      // 别在每次 overview 轮询时重建下拉
+  sel.dataset.sig=sig;
+  sel.innerHTML='';
+  const head=document.createElement('option');
+  head.value=''; head.textContent=rows.length?'Select PDF…':'No projects yet — upload a PDF';
+  sel.appendChild(head);
+  for(const p of rows){
+    const o=document.createElement('option');
+    o.value=p.slug;
+    o.textContent=p.slug+'  ('+(p.page_count||0)+'  sheets'
+      +(p.processing?' · Processing':'')+')';
+    if(p.processing)o.disabled=true;    // 还在跑的打不开，别给个点了没反应的项
+    sel.appendChild(o);
+  }
+  sel.value=want||'';
+}
+$('projectSelect').onchange=e=>{
+  const slug=e.target.value;
+  if(!slug)return;
+  openProject(slug);
+};
+
+/* 只负责两件事：同步顶栏下拉的选中值、同步 Fence scope 上方的 PDF 名字。
+   顶栏原来那块 PDF 名 + "N sheets · Fence detection results · 模型" 已经去掉 ——
+   名字在下拉里、也在侧栏标题上，顶栏再来一遍是重复；页数和模型在画廊卡片上。 */
+/* 「当前页 / 总页数」。优先用已加载的 PAGE（它带 page_count），PAGE 还没到位时
+   退回 CUR.page + overview 里的页数 —— 这样切页的瞬间就能更新，不用等取数回来。 */
+function renderSheetLabel(){
+  const el=$('sideSheetLabel');
+  if(!el)return;
+  /* "Page" 用较淡的字重/颜色，让数字保持是这一行的主体。用 innerHTML 而不是
+     textContent 是为了给前缀单独套样式；两个值都来自数字，没有注入面。 */
+  const prefix='<span class="lbl">Page</span> ';
+  if(!CUR){el.innerHTML=prefix+'– / –';return}
+  const row=ovRow(CUR.slug);
+  const total=(PAGE&&Number(PAGE.page_count))||(row&&Number(row.page_count))||0;
+  const now=(PAGE&&Number(PAGE.page))||Number(CUR.page)||0;
+  el.innerHTML=prefix+(now||'–')+' / '+(total||'–');
+}
+
+function updateWorkspaceHeader(){
+  const title=CUR?baseSlug(CUR.slug):'fence_lite';
+  renderSheetLabel();
+  const sel=$('projectSelect');
+  if(sel){
+    const row=CUR?ovRow(CUR.slug):null;
+    const own=CUR?((row&&row.variant_of)||CUR.slug):'';
+    /* sel.options 只有真正的 <select> 才有；测试桩和极老的浏览器没有，
+       缺了就直接重建下拉，别让整个 updateWorkspaceHeader 抛出去 —— 它在
+       show() 的关键路径上，一抛整页停在「载入中…」。 */
+    const opts=sel.options?[...sel.options]:[];
+    if(own&&!opts.some(o=>o.value===own))renderProjectSelect();
+    sel.value=own||'';
+  }
+}
+
+function syncThumbSelection(scroll){
+  let active=null;
+  document.querySelectorAll('#thumbs .thumb').forEach(n=>{
+    const on=!!CUR&&Number(n.dataset.page)===Number(CUR.page);
+    n.classList.toggle('on',on);
+    n.setAttribute('aria-current',on?'page':'false');
+    if(on)active=n;
+  });
+  if(scroll&&active)active.scrollIntoView({block:'nearest'});
+}
+function renderThumbs(force){
+  const box=$('thumbs'), row=CUR?ovRow(CUR.slug):null;
+  if(!CUR||!row){
+    THUMB_KEY=''; box.innerHTML='<div class="empty">Select or upload a PDF</div>';
+    $('pageHitSummary').textContent='0  sheets';
+    return;
+  }
+  const pageBy=new Map((row.pages||[]).map(x=>[Number(x.page),x]));
+  const only=$('tgOnly').querySelector('input').checked;
+  const sig=Array.from({length:Number(row.page_count)||0},(_,i)=>{
+    const x=pageBy.get(i+1)||{}; return ((Number(x.vlm)||0)+(Number(x.added)||0))+':' +(x.image_only?'img':'vec');
+  }).join(',');
+  const key=CUR.slug+'|'+row.page_count+'|'+sig+'|'+only;
+  if(!force&&key===THUMB_KEY){syncThumbSelection(false);return}
+  if(THUMB_OBSERVER){THUMB_OBSERVER.disconnect();THUMB_OBSERVER=null}
+  THUMB_KEY=key; box.innerHTML='';
+  const allPages=Array.from({length:Number(row.page_count)||0},(_,i)=>i+1);
+  const hitPages=allPages.filter(p=>{
+    const x=pageBy.get(p)||{}; return (Number(x.vlm)||0)+(Number(x.added)||0)>0;
+  });
+  const shown=only&&hitPages.length?hitPages:allPages;
+  const thumbSlug=CUR.slug;
+  for(const p of shown){
+    const meta=pageBy.get(p)||{}, hits=(Number(meta.vlm)||0)+(Number(meta.added)||0);
+    const b=document.createElement('button');
+    b.type='button'; b.className='thumb'; b.dataset.page=p;
+    b.title='Open sheet  '+p+'  sheets';
+    b.innerHTML='<span class="preview"><span class="thumb-placeholder">Sheet  '+p+'  sheets</span>'
+      +'<img loading="lazy" decoding="async" alt="Sheet  '+p+'  preview" data-src="'
+      +esc(U('/img/'+encodeURIComponent(thumbSlug)+'/'+p))+'">'
+      +(hits?'<span class="fenceTag">'+(row.mode==='custom'?'Tag: Result':'Tag: Fence')+'</span>':'')
+      +(meta.image_only?'<span class="imageTag">Image sheet</span>':'')+'</span>'
+      +'<span class="cap"><b>'+esc(baseSlug(thumbSlug)+' - '+p)+'</b>'
+      +(hits?'<span class="hitcount">'+hits+'  items</span>':'')+'</span>';
+    /* 点某一页 → 页面预览收起，直接看这一页的 Fence scope。
+       setSideMode 放在 show 之前：show 里有 await，先切模式界面才不会
+       在网络往返期间停在旧视图上；scope 面板本身不折叠。 */
+    b.onclick=()=>{setSideMode('scope');show(thumbSlug,p);};
+    box.appendChild(b);
+  }
+  const loadImg=img=>{if(img&&img.dataset.src){img.src=img.dataset.src;delete img.dataset.src}};
+  if('IntersectionObserver' in window){
+    THUMB_OBSERVER=new IntersectionObserver(entries=>{
+      for(const e of entries)if(e.isIntersecting){loadImg(e.target);THUMB_OBSERVER.unobserve(e.target)}
+    },{root:box,rootMargin:'260px 0px'});
+    box.querySelectorAll('img[data-src]').forEach(img=>{
+      if(Number(img.closest('.thumb').dataset.page)===Number(CUR.page))loadImg(img);
+      else THUMB_OBSERVER.observe(img);
+    });
+  }else box.querySelectorAll('img[data-src]').forEach(loadImg);
+  $('pageHitSummary').textContent=hitPages.length+' / '+row.page_count+'  sheets with results';
+  syncThumbSelection(true);
+}
+
+function renderTopJobStatus(list){
+  const box=$('jobStatus');
+  const j=(list||[])[0];
+  if(!j){box.className='';box.innerHTML='';return}
+  const pct=Math.max(0,Math.min(100,Math.round((j.progress||0)*100)));
+  const failed=j.done&&!j.ok;
+  const pagey=!j.done&&Number(j.stage_total)>0;
+  const detail=failed?'Processing failed':(STAGE_CN[j.stage]||j.stage||'Processing')
+    +(pagey?' '+(j.stage_done||0)+'/'+j.stage_total:'');
+  box.className='on';
+  box.innerHTML='<span title="'+esc(baseSlug(j.slug))+'">'+esc(detail)+'</span>'
+    +'<span class="mini-progress"><i style="width:'+pct+'%"></i></span><b>'+pct+'%</b>';
+}
 
 /* =============== 通用 =============== */
 /* 挂在反代子路径下也要能跑：Caddy 的 handle_path 会把 /fencelite 前缀剥掉，
@@ -304,26 +898,36 @@ $('bUp').onclick=async()=>{
   }
   $('upTarget').value=PRESET;
   $('upFile').value=''; $('upErr').textContent='';
+  $('upName').textContent='No file selected'; $('upName').classList.remove('has');
   $('modal').style.display='flex';
+};
+/* 自己的按钮代替原生 file input：点它转发给隐藏的 input，选完把文件名写出来。
+   原生控件的 "选择文件 / 未选择文件" 由浏览器界面语言渲染，页面改不到。 */
+$('upPick').onclick=()=>$('upFile').click();
+$('upFile').onchange=()=>{
+  const f=$('upFile').files[0];
+  $('upName').textContent=f?f.name:'No file selected';
+  $('upName').classList.toggle('has',!!f);
 };
 $('upCancel').onclick=()=>{$('modal').style.display='none'};
 $('modal').onclick=e=>{if(e.target===$('modal'))$('modal').style.display='none'};
 $('upRun').onclick=async()=>{
   const f=$('upFile').files[0];
-  if(!f){ $('upErr').textContent='先选一个 PDF 文件'; return; }
+  if(!f){ $('upErr').textContent='Pick a PDF file first'; return; }
   const fd=new FormData();
   fd.append('pdf',f);
   // 没动过就发空串 → 后端用默认 fence 目标（完整四步）
   const t=$('upTarget').value||'';
   fd.append('target', t.trim()===PRESET.trim()?'':t);
-  $('upRun').disabled=true; $('upErr').textContent='上传中…';
+  $('upRun').disabled=true; $('upErr').textContent='Uploading…';
   const r=await api('/api/upload',{method:'POST',body:fd});
   $('upRun').disabled=false;
   if(!r.ok||!r.body||r.body.error){
-    $('upErr').textContent='失败：'+((r.body&&r.body.error)||('HTTP '+r.status));
+    $('upErr').textContent='failed: '+((r.body&&r.body.error)||('HTTP '+r.status));
     return;
   }
   $('modal').style.display='none';
+  toggleProjectDrawer(false);
   JOBS[r.body.slug]=r.body.job||{slug:r.body.slug,stage:'queued'};
   renderJobs(); await loadOverview();
   startPoll(r.body.slug);
@@ -335,8 +939,9 @@ function renderJobs(){
   const box=$('jobs'), list=Object.values(JOBS).filter(j=>j&&j.slug)
     .filter(j=>!(j.done&&j.ok))
     .sort((a,b)=>(b.started||0)-(a.started||0));
+  renderTopJobStatus(list);
   box.innerHTML='';
-  if(!list.length){ box.innerHTML='<div class="empty">暂无任务</div>'; return; }
+  if(!list.length){ box.innerHTML='<div class="empty">No jobs</div>'; return; }
   for(const j of list){
     const llm=j.llm||{}, by=llm.by_model||{};
     const failed=j.done&&!j.ok;
@@ -348,32 +953,33 @@ function renderJobs(){
        后缀是存储实现，不该出现在界面上。 */
     const jbase=baseSlug(j.slug), jmodel=j.model||slugModel(j.slug);
     let h='<div class="jt"><b title="'+esc(j.slug)+'">'+esc(jbase)+'</b>'
-      +(jmodel?'<span class="tag mdl'+(isAltProvider(jmodel)?' alt':'')
+      +((DEV()&&jmodel)?'<span class="tag mdl'+(isAltProvider(jmodel)?' alt':'')
         +'" style="cursor:default">'+esc(modelShort(jmodel))+'</span>':'')
-      +'<span class="tag mode">'+(j.mode==='custom'?'自定义目标':'fence')+'</span></div>';
+      +'<span class="tag mode">'+(j.mode==='custom'?'custom target':'fence')+'</span></div>';
     if(failed){
-      h+='<div class="js e">'+(j.cancelled?'已取消':'出错：'+esc(j.error||'未知错误'))+'</div>';
+      h+='<div class="js e">'+(j.cancelled?'Cancelled':'failed: '+esc(j.error||'Unknown error'))+'</div>';
     }else{
-      h+='<div class="js">'+esc(STAGE_CN[j.stage]||j.stage||'处理中')
-        +(pagey?' · '+(j.stage_done||0)+'/'+j.stage_total+' 页':'')+'</div>';
+      h+='<div class="js">'+esc(STAGE_CN[j.stage]||j.stage||'Processing')
+        +(pagey?' · '+(j.stage_done||0)+'/'+j.stage_total+'  sheets':'')+'</div>';
     }
     for(const w of (j.warnings||[]))h+='<div class="js e">⚠ '+esc(w)+'</div>';
     h+='<div class="kv">'
-      +'<span>模型调用</span><b>'+(llm.calls||0)+' 次</b>'
-      +'<span>累计模型耗时</span><b>'+fmtSec(llm.model_seconds)+'</b>'
-      +'<span>墙钟耗时</span><b>'+fmtSec(j.wall_seconds)+'</b>'
-      +'<span>总费用</span><b>'+fmtUsd(llm.cost_usd)+'</b>';
-    for(const [m,v] of Object.entries(by))
+      +'<span>Model calls</span><b>'+(llm.calls||0)+'  calls</b>'
+      +'<span>Model time</span><b>'+fmtSec(llm.model_seconds)+'</b>'
+      +'<span>Wall time</span><b>'+fmtSec(j.wall_seconds)+'</b>'
+      +'<span>Total cost</span><b>'+fmtUsd(llm.cost_usd)+'</b>';
+    /* 分模型的计费明细带模型 id，只在内部视图给。总账（上面四行）照常显示。 */
+    if(DEV())for(const [m,v] of Object.entries(by))
       h+='<span style="padding-left:8px">· '+esc(m)+'</span><b>'+fmtUsd(v.cost_usd)
-        +' / '+(v.calls||0)+' 次</b>';
+        +' / '+(v.calls||0)+'  calls</b>';
     h+='</div>';
     if(!j.done){
       h+='<div class="bar"><i style="width:'+pct+'%"></i></div>'
         +'<div class="jfoot"><span class="pct">'+pct+'%</span>'
         +'<button class="jc"'+(j.cancel_requested?' disabled':'')+'>'
-        +(j.cancel_requested?'正在取消…':'取消')+'</button></div>';
+        +(j.cancel_requested?'Cancelling…':'Cancel')+'</button></div>';
     }else if(failed){
-      h+='<div class="jfoot"><span class="pct"></span><button class="jd">删除项目</button></div>';
+      h+='<div class="jfoot"><span class="pct"></span><button class="jd">Delete project</button></div>';
     }
     d.innerHTML=h;
     const c=d.querySelector('.jc'); if(c)c.onclick=()=>cancelJob(j.slug);
@@ -415,16 +1021,16 @@ async function delProject(slug){
   const row=ovRow(slug);
   const sibs=row?siblingsOf(row):[];
   const extra=sibs.length
-    ? '\n\n连同 '+sibs.length+' 个对比运行一起删：\n  · '
-      +sibs.map(x=>modelShort(x.model)+'（'+x.slug+'）').join('\n  · ')
+    ? '\n\nPlus  '+sibs.length+'  comparison runs will be deleted too:\n  · '
+      +sibs.map(x=>(DEV()?modelShort(x.model)+' · ':'')+x.slug).join('\n  · ')
     : '';
-  if(!confirm('删除项目 "'+slug+'"？会连同 PDF 和全部结果一起删掉，不可恢复。'+extra))return;
+  if(!confirm('Delete project "'+slug+'"? The PDF and all of its results are deleted for good.'+extra))return;
   const r=await api('/api/project/'+encodeURIComponent(slug),{method:'DELETE'});
-  if(!r.ok||!r.body||r.body.error){alert('删除失败：'+((r.body&&r.body.error)||r.status));return}
+  if(!r.ok||!r.body||r.body.error){alert('Delete failed: '+((r.body&&r.body.error)||r.status));return}
   for(const s of [slug,...sibs.map(x=>x.slug)]){
     if(POLL[s]){clearInterval(POLL[s]);delete POLL[s]}
     delete JOBS[s];
-    if(CUR&&CUR.slug===s){CUR=null;PAGE=null;clearViewer('左侧选一个项目')}
+    if(CUR&&CUR.slug===s){CUR=null;PAGE=null;clearViewer('Pick a project on the left')}
   }
   renderJobs();
   await loadOverview();
@@ -450,6 +1056,10 @@ const slugModel=s=>{
   const t=String(s).slice(i+VSEP.length);
   return modelMeta(t)?t:null;
 };
+/* 「内部视图」判据 —— 与图层控制条共用顶栏那个 ⋯ 开关。
+   模型名、模型切换、分模型计费、⇄ 对比按钮都只在它为真时出现：默认的客户
+   视图里一个模型字样都没有。 */
+const DEV=()=>{const b=$('bar');return !!b&&!b.classList.contains('tucked')};
 const modelShort=id=>{const m=modelMeta(id);return m?m.display:(id||'—')};
 const isAltProvider=id=>{const m=modelMeta(id);return !!m&&m.provider!=='gemini'};
 /* 同一个 PDF 的其他模型运行（兄弟项目） */
@@ -462,32 +1072,32 @@ const siblingsOf=p=>{
    原来的结果留在自己的项目目录里，一个字节都不改；对比运行是个兄弟项目，
    两份结果同时在画廊里，可以来回切着看。 */
 async function compareProject(p){
-  if(p.variant_of){alert('这已经是一个对比运行了。请从原项目发起新的对比。');return}
+  if(p.variant_of){alert('This is already a comparison run. Start a new comparison from the original project.');return}
   if(!MODELS.length)await loadModels();
   const cands=MODELS.filter(m=>m.id!==p.model);
-  if(!cands.length){alert('没有可对比的模型');return}
+  if(!cands.length){alert('No other model to compare with');return}
   const have=new Set(siblingsOf(p).map(x=>x.model));
   let def=cands.findIndex(m=>m.id==='claude-sonnet-5'&&!have.has(m.id));
   if(def<0)def=cands.findIndex(m=>m.provider!=='gemini'&&!have.has(m.id));
   if(def<0)def=cands.findIndex(m=>!have.has(m.id));
   if(def<0)def=0;
   const lines=cands.map((m,i)=>'  '+(i+1)+'. '+m.display
-    +'   $'+m.in_low+' 进 / $'+m.out_low+' 出 每百万 token'
-    +(have.has(m.id)?'   ← 已跑过，选它会清空重跑':''));
-  const pick=prompt('用另一个模型跑「'+p.slug+'」做对比\n\n'
-    +'当前这份结果的模型：'+modelShort(p.model)+'\n\n'
-    +'会新建一个兄弟项目（同一份 PDF，独立缓存目录），'
-    +'原项目的结果完全不动，跑完两份可以在画廊里对着看。\n'
-    +'检测目标沿用原项目，保证是同条件对比。\n\n'
-    +lines.join('\n')+'\n\n输入序号：', String(def+1));
+    +'   $'+m.in_low+'  in / $ / $'+m.out_low+'  out per 1M token'
+    +(have.has(m.id)?'   ← already run — picking it clears and re-runs':''));
+  const pick=prompt('Run ['+p.slug+'] for comparison\n\n'
+    +'Model behind these results: '+modelShort(p.model)+'\n\n'
+    +'Creates a sibling project (same PDF, its own cache directory);'
+    +'The original results are untouched — compare both side by side in the gallery when it finishes.\n'
+    +'The detection target is inherited from the original project so the comparison is apples to apples.\n\n'
+    +lines.join('\n')+'\n\nSheet number: ', String(def+1));
   if(pick===null)return;
   const m=cands[parseInt(pick,10)-1];
-  if(!m){alert('序号无效');return}
+  if(!m){alert('Invalid sheet number');return}
   const r=await api('/api/variant/'+encodeURIComponent(p.slug),
     {method:'POST',headers:{'Content-Type':'application/json'},
      body:JSON.stringify({model:m.id})});
   if(!r.ok||!r.body||r.body.error){
-    alert('对比运行启动失败：'+((r.body&&r.body.error)||r.status));return;
+    alert('Failed to start comparison run: '+((r.body&&r.body.error)||r.status));return;
   }
   startPoll(r.body.slug);
   await loadOverview();
@@ -499,38 +1109,40 @@ async function compareProject(p){
 function renderModelSwitch(){
   const box=$('mdlSwitch'); if(!box)return;
   box.innerHTML='';
+  if(!DEV()){return}                 // 客户视图里不出现任何模型字样
   if(!CUR){return}
   const row=ovRow(CUR.slug); if(!row)return;
   const family=[row,...siblingsOf(row)]
     .filter(x=>!x.processing)          // 还没跑完的没结果可看
     .sort((a,b)=>(a.slug.length-b.slug.length)||a.slug.localeCompare(b.slug));
   if(family.length<2){return}          // 没有可对比的运行
-  box.appendChild(Object.assign(document.createElement('b'),{textContent:'模型'}));
+  box.appendChild(Object.assign(document.createElement('b'),{textContent:'Model'}));
   for(const x of family){
     const b=document.createElement('button');
     const cur=x.slug===CUR.slug;
     b.textContent=modelShort(x.model);
     b.className=(cur?'on':'')+(isAltProvider(x.model)?' alt':'');
-    b.title=cur?('当前：'+x.slug):('切到 '+x.slug+' 的第 '+CUR.page+' 页');
+    b.title=cur?('Current: '+x.slug):('Switch to  '+x.slug+'  at sheet  '+CUR.page+'  sheets');
     if(!cur)b.onclick=()=>show(x.slug,CUR.page);
     box.appendChild(b);
   }
 }
 
 async function rerunProject(p){
-  const label=baseSlug(p.slug)+(slugModel(p.slug)?'（'+modelShort(slugModel(p.slug))+'）':'');
-  const t=prompt('重新跑「'+label+'」\n\n'
-    +'会先清空这个项目的全部缓存（只保留 PDF），然后从头跑一遍：\n'
-    +'  · 结果保证由当前算法产出，不受任何旧缓存影响\n'
-    +'  · 模型调用全部重新计费\n\n'
-    +'下面是检测目标，可以改（改成非默认目标就只跑文字步）：',
+  const label=baseSlug(p.slug)
+    +((DEV()&&slugModel(p.slug))?' · '+modelShort(slugModel(p.slug)):'');
+  const t=prompt('Re-run ['+label+']\n\n'
+    +'This clears every cached artifact for the project (the PDF is kept) and runs the whole pipeline again:\n'
+    +'  · guarantees the results come from the current algorithm, with no influence from any old cache\n'
+    +'  · every model call is billed again\n\n'
+    +'Detection target below — editable (a non-default target runs only the text step):',
     p.target||PRESET||'');
   if(t===null)return;
   const r=await api('/api/rerun/'+encodeURIComponent(p.slug),
     {method:'POST',headers:{'Content-Type':'application/json'},
      body:JSON.stringify({target:t,reset:true})});
   if(!r.ok||!r.body||r.body.error){
-    alert('重新跑失败：'+((r.body&&r.body.error)||r.status));return;
+    alert('Re-run failed: '+((r.body&&r.body.error)||r.status));return;
   }
   startPoll(p.slug);
   await loadOverview();
@@ -541,7 +1153,12 @@ async function loadOverview(){
   const r=await api('/api/overview');
   OV=Array.isArray(r.body)?r.body:[];
   const box=$('gallery'); box.innerHTML='';
-  if(!OV.length){box.innerHTML='<div class="empty">还没有项目，先上传一个 PDF</div>';return}
+  if(!OV.length){
+    box.innerHTML='<div class="empty">No projects yet - upload a PDF</div>';
+    renderProjectSelect();
+    updateWorkspaceHeader(); renderThumbs(true); renderModelSwitch();
+    return;
+  }
   /* 一个 PDF 一行。对比运行（<slug>__<model>）不单独占一行 —— 它们折叠进
      原项目那一行的模型 chip 里，所以画廊里看不到带后缀的条目。
      显示哪一份的数字：正在看的那一份（如果它属于这一行），否则原项目。 */
@@ -554,48 +1171,59 @@ async function loadOverview(){
     const d=document.createElement('div');
     d.className='row'+(family.some(x=>CUR&&CUR.slug===x.slug)?' on':'');
     let h='<div class="t"><b title="'+esc(p.slug)+'">'+esc(p.slug)+'</b>'
-      +'<button class="cmp" title="用另一个模型跑同一份 PDF 做对比（原结果不动）">⇄</button>'
-      +'<button class="rerun" title="重新跑这一行当前选中的那份结果（先清空它的缓存）">↻</button>'
-      +'<button class="del" title="删除这个 PDF（连同它的所有对比运行）">✕</button>'
+      +(DEV()?'<button class="cmp" title="Run the same PDF with another model for comparison (original results untouched)">⇄</button>':'')
+      +'<button class="rerun" title="Re-run the result selected on this row (its cache is cleared first)">↻</button>'
+      +'<button class="del" title="Delete this PDF (and all of its comparison runs)">✕</button>'
       +'</div><div class="m">';
-    /* 模型 chip：这份 PDF 跑过的每个模型一个，当前打开的那个高亮。
-       只有一个模型时也显示 —— 那是「这份结果是谁跑的」的唯一出处。 */
-    for(const x of family){
+    /* 模型 chip 只在内部视图出现（⋯ 打开时）。客户视图里这份 PDF 就是一行，
+       没有「谁跑的」这个维度。 */
+    for(const x of (DEV()?family:[])){
       const on=x.slug===active.slug;
       h+='<span class="tag mdl'+(isAltProvider(x.model)?' alt':'')+(on?' on':'')
         +'" data-go="'+esc(x.slug)+'" title="'
-        +esc((on?'当前显示：':'点击切到：')+modelShort(x.model)
-             +(x.processing?'（还在跑）':'')+'　'+x.slug)+'">'
+        +esc((on?'Showing: ':'Click to switch to: ')+modelShort(x.model)
+             +(x.processing?' (still running)':'')+' · '+x.slug)+'">'
         +(on?'● ':'○ ')+esc(modelShort(x.model))+'</span>';
     }
-    h+='<span class="tag mode">'+(active.mode==='custom'?'自定义目标':'fence')+'</span>'
-      +'<span class="tag">'+(active.page_count||p.page_count||0)+' 页</span>';
+    h+='<span class="tag mode">'+(active.mode==='custom'?'custom target':'fence')+'</span>'
+      +'<span class="tag">'+(active.page_count||p.page_count||0)+'  sheets</span>';
     const busy=family.filter(x=>x.processing);
     if(active.processing){
-      h+='<span class="tag warn">处理中…</span>';
+      h+='<span class="tag warn">Processing…</span>';
     }else if(busy.length){
       /* 变体没有自己的行了，跑起来必须在 parent 行上可见 */
-      h+='<span class="tag warn">'+esc(modelShort(busy[0].model))+' 跑中…</span>';
+      h+='<span class="tag warn">'+(DEV()?esc(modelShort(busy[0].model))+' ':'')
+        +'running…</span>';
     }
     if(!active.processing){
-      h+='<span class="tag txt">文字 '+((active.vlm||0)+(active.added||0))+'</span>'
-        +'<span class="tag sym">符号 '+(active.symbols||0)+'</span>'
-        +'<span class="tag sym">放置 '+(active.placements||0)+'</span>';
+      h+='<span class="tag txt">Text  '+((active.vlm||0)+(active.added||0))+'</span>'
+        +'<span class="tag sym">Symbols  '+(active.symbols||0)+'</span>'
+        +'<span class="tag sym">Placements  '+(active.placements||0)+'</span>';
       if(llm.cost_usd!=null)h+='<span class="tag cost">'+fmtUsd(llm.cost_usd)+'</span>';
-      if(active.no_text_layer)h+='<span class="tag warn">无文字层</span>';
-      if(active.stale_symbols)h+='<span class="tag warn" title="算法版本已更新，这个项目的符号结果是旧版本算的，点 ↻ 重新跑（步骤2 的付费结果会复用，只补跑差异）">符号待重跑 '+active.stale_symbols+'</span>';
+      /* 时间和花费放在一起：估一份新图纸要多久、要多少钱，看的是同一行。
+         wall = 整条管线的墙钟（含本地边车，不只是模型）；model = 模型累计占用，
+         并发下会大于墙钟。只给一个都会估偏，所以两个都给。 */
+      if(active.wall_seconds)h+='<span class="tag time" title="Wall-clock time for the whole pipeline (including the local sidecars, not just model calls)">'
+        +fmtSec(active.wall_seconds)+'</span>';
+      if(llm.model_seconds)h+='<span class="tag time dim" title="Total model time across all calls — exceeds wall time when calls run concurrently">'
+        +fmtSec(llm.model_seconds)+' model</span>';
+      if(active.page_count&&active.wall_seconds)h+='<span class="tag time dim" title="Average wall time per sheet — the number to use when sizing a new PDF">'
+        +fmtSec(active.wall_seconds/active.page_count)+'/page</span>';
+      if(active.no_text_layer)h+='<span class="tag warn">No text layer</span>';
+      if(active.stale_symbols)h+='<span class="tag warn" title="The algorithm version moved on; the symbol results for this project came from the older version. Click  ↻ to re-run (paid results from step 2 are reused; only the difference is recomputed)">Symbols need rerun  '+active.stale_symbols+'</span>';
       if(active.imported)h+='<span class="tag old" title="'
-        +esc((active.imported.note||'')+'　导入自 '+(active.imported.from||'')
-             +'　'+(active.imported.at||''))+'">旧缓存</span>';
+        +esc((active.imported.note||'')+'  imported from  '+(active.imported.from||'')
+             +' · '+(active.imported.at||''))+'">Imported cache</span>';
     }
-    if(active.job_error)h+='<span class="tag warn">失败</span>';
+    if(active.job_error)h+='<span class="tag warn">Failed</span>';
     h+='</div>';
     d.innerHTML=h;
     /* ✕ 删整个 PDF（后端级联删掉对比运行，否则它们会变成看不见的孤儿）；
        ↻ / ⇄ 作用在当前选中的那一份上。 */
     d.querySelector('.del').onclick=e=>{e.stopPropagation();delProject(p.slug)};
     d.querySelector('.rerun').onclick=e=>{e.stopPropagation();rerunProject(active)};
-    d.querySelector('.cmp').onclick=e=>{e.stopPropagation();compareProject(p)};
+    const cmp=d.querySelector('.cmp');
+    if(cmp)cmp.onclick=e=>{e.stopPropagation();compareProject(p)};
     d.querySelectorAll('.tag.mdl').forEach(n=>{
       n.onclick=e=>{
         e.stopPropagation();
@@ -605,18 +1233,24 @@ async function loadOverview(){
         /* 已经在看这一行的某一页 → 保持页码，A/B 才是同一张图 */
         const keep=(CUR&&family.some(x=>x.slug===CUR.slug))?CUR.page:null;
         const pg=keep||(((row.pages)||[]).find(x=>(x.vlm+x.added)>0)||{page:1}).page;
+        /* 模型 chip 是在**同一张图**上换模型，不是换 PDF —— 保持当前视图，
+           不要把用户从 Fence scope 拽回页面预览。 */
+        toggleProjectDrawer(false);
         show(go,pg);
       };
     });
     d.onclick=()=>{
       const pg=(active.pages||[]).find(x=>(x.vlm+x.added)>0)||{page:1};
-      show(active.slug,pg.page);
+      openProject(active.slug,pg.page);   // 换 PDF -> 回到页面预览
     };
     box.appendChild(d);
   }
   // OV is fresh here, so the top-bar switch can resolve the current project's
   // siblings. show() calls loadOverview(), so this covers both entry points.
   renderModelSwitch();
+  renderProjectSelect();
+  updateWorkspaceHeader();
+  renderThumbs();
 }
 const ovRow=slug=>OV.find(x=>x.slug===slug)||null;
 function pageList(slug){
@@ -631,48 +1265,51 @@ function pageList(slug){
 function clearViewer(msg){
   const vp=$('viewport');
   vp.querySelectorAll('svg').forEach(s=>s.remove());
-  svg=null; LOOK={}; picked=null;
+  svg=null; LOOK={}; picked=null; selectedScope=null; selectedRow=null;
+  SCOPE_GROUPS=[]; SCOPE_BY_INDEX=new Map(); SCOPE_BY_SYMBOL=new Map();
   $('hint').style.display=''; $('hint').textContent=msg;
-  ['nTxt','nSym','nPlc','nPlan'].forEach(id=>$(id).textContent='0');
-  $('sel').innerHTML='<div class="empty">点图上任意框查看详情</div>';
+  $('scopeCount').textContent='0';
+  $('sel').innerHTML='<div class="empty">Click any box on the sheet for details</div>';
+  $('sel').classList.remove('has');
   $('list').innerHTML='';
-  $('pgNow').textContent='–'; $('pgAll').textContent='–'; $('zPct').textContent='–';
+  $('stepStrip').innerHTML='';
+
+  updateWorkspaceHeader(); syncThumbSelection(false);
 }
 async function show(slug,page){
+  const prevSlug=CUR&&CUR.slug;
   CUR={slug,page:Number(page)||1};
   const my=++epoch;
-  loadOverview();
-  $('hint').style.display=''; $('hint').textContent='载入中…';
+  if(!ovRow(slug))await loadOverview();
+  else if(prevSlug!==slug)loadOverview();
+  if(my!==epoch)return;
+  updateWorkspaceHeader(); renderThumbs(); syncThumbSelection(true);
+  $('hint').style.display=''; $('hint').textContent='Loading…';
   const r=await api('/api/page/'+encodeURIComponent(slug)+'/'+CUR.page);
   if(my!==epoch)return;
   if(r.status===409){
-    PAGE=null; clearViewer('结果已过期（'+esc((r.body&&r.body.reason)||'stale')
-      +'），需要重新跑一次上传作业');
+    PAGE=null; clearViewer('Results are stale ('+esc((r.body&&r.body.reason)||'stale')
+      +'); the upload job needs to be run again');
     return;
   }
   if(!r.ok||!r.body||r.body.error){
-    PAGE=null; clearViewer('打不开这一页：'+((r.body&&r.body.error)||('HTTP '+r.status)));
+    PAGE=null; clearViewer('Cannot open this sheet: '+((r.body&&r.body.error)||('HTTP '+r.status)));
     return;
   }
   PAGE=r.body;
-  $('pgNow').textContent=PAGE.page; $('pgAll').textContent=PAGE.page_count;
-  $('pgIn').value=PAGE.page; $('pgIn').max=PAGE.page_count;
-  const c=PAGE.counts||{};
-  $('nTxt').textContent=c.text||0; $('nSym').textContent=c.symbols||0;
-  $('nPlc').textContent=c.placements||0; $('nPlan').textContent=c.plan_groups||0;
-  /* 这一页的符号被版本戳扣着没发 → 在符号计数上直接标出来，别显示成 0 */
-  if(PAGE.symbols_stale){
-    $('nSym').textContent='待重跑';
-    $('nSym').parentElement.title='盘上有 '+(PAGE.stale_symbols||0)
-      +' 个符号，但它们是旧版本算法算的，点画廊里的 ↻ 重新跑';
-  }else{
-    $('nSym').parentElement.title='';
-  }
+  CUR.page=Number(PAGE.page)||CUR.page;
+  renderSheetLabel();
+
+  /* Fence scope 上方那个四格统计框（Text / Symbols / callout / plan）已按产品
+     口径去掉。这些数字并没有失去唯一出处：文字/符号/放置在画廊卡片上有，
+     步骤条（⋯ 打开时）也逐步骤给数，而 symbols_stale 在画廊卡片上另有一个
+     「Symbols need rerun N」标签。 */
+  makeScopeModel();
   build();
   renderList();
+  updateWorkspaceHeader(); syncThumbSelection(true);
 }
-$('bPrev').onclick=()=>step(-1);
-$('bNext').onclick=()=>step(1);
+/* 翻页按钮去掉了 —— 换页走 sheets 预览。step() 留着：键盘左右方向键还在用。 */
 function step(dir){
   if(!CUR)return;
   const list=pageList(CUR.slug);
@@ -687,13 +1324,10 @@ function step(dir){
   if(i<0||i>=list.length)return;
   show(CUR.slug,list[i]);
 }
-$('pgIn').onchange=()=>{
-  if(!CUR)return;
-  const p=Math.max(1,Math.min(Number($('pgIn').value)||1,(PAGE&&PAGE.page_count)||1));
-  show(CUR.slug,p);
-};
+
 $('tgOnly').querySelector('input').onchange=e=>{
   $('tgOnly').classList.toggle('off',!e.target.checked);
+  renderThumbs(true);
 };
 
 /* =============== 画图层 =============== */
@@ -701,15 +1335,34 @@ const DBG=()=>$('tgDbg').querySelector('input').checked;
 // 分层状态带。一个空结果可能来自任何一层：分类没跑、没有 plan 取景、锚全在
 // plan 外、边车算失败、结果不当期。把每一层单独摆出来，才不用靠猜。
 const ARW_STATE={
-  disabled:['关','箭头接缝未启用（ARROWS=1 未设）','off'],
-  'views-pending':['待分类','步骤3 还没给这页做视图分类，没有分类就 fail-closed','warn'],
-  'no-plan':['无 plan','这页分类过了，但没有 plan 视图；引线只在俯视图里找','off'],
-  'no-anchor-in-plan':['锚在 plan 外','有 plan 取景框，但没有任何锚完整落在框内','off'],
-  'not-run':['未运行','该跑但没有结果，作业可能没跑到这页','warn'],
-  failed:['失败','边车计算失败，见提示','bad'],
-  stale:['不当期','盘上有结果但签名/版本对不上，页面不显示它','warn'],
-  ok:['完成','','good'],
+  disabled:['off','arrow seam not enabled (ARROWS=1  not set)','off'],
+  'views-pending':['Unclassified','Step 3 has not classified views on this sheet yet; without a classification it is  fail-closed','warn'],
+  'no-plan':['No  plan','this sheet was classified but has no plan view; leaders are only traced in plan views','off'],
+  'no-anchors':['No anchors','this sheet has no text or symbol-placement anchor for leader tracing','off'],
+  'no-anchor-in-plan':['Anchors outside plan','plan view boxes exist, but no anchor falls entirely inside one','off'],
+  'not-run':['not run','it should have run but has no result — the job may not have reached this sheet','warn'],
+  failed:['failed','the sidecar failed — see the note','bad'],
+  stale:['stale','results exist on disk but the signature/version does not match, so the page does not show them','warn'],
+  'image-only':['Image sheet','this sheet has only an embedded image and no vector paths; flagged and arrow tracing skipped','off'],
+  ok:['Done','','good'],
 };
+// 线型层的分层状态。plan 在这一层只是**显示闸**：hidden-* 表示算过了、数据在盘上，
+// 只是这次不显示 —— 和「没算过」必须能分开。
+const LT_STATE={
+  disabled:['off','line-type seam not enabled (LINETYPES=1  not set)','off'],
+  'no-arrows':['No terminals','the arrow layer is stale or this sheet has no terminals — nothing to bind to','off'],
+  'not-run':['not run','it should have run but has no result — the job may not have reached this sheet','warn'],
+  failed:['failed','the line-type sidecar failed — see the note','bad'],
+  stale:['stale','results exist on disk but the signature/version does not match, so the page does not show them','warn'],
+  'hidden-no-plan':['No  plan','computed, but this sheet has no plan view box, so the display gate hides everything','off'],
+  'hidden-outside-plan':['Terminals outside plan','computed, but no terminal falls inside a plan (normal for detail sheets)','off'],
+  'all-gate':['all  gate','every callout on this sheet is a gate; gates do not get a line type — this is not a failure','off'],
+  'no-line-type':['No line type','the terminal is inside the plan, but the ink it points at belongs to no line type (residual)','warn'],
+  'needs-recompute':['needs recompute','the cache was trimmed under the old grouping rule and lacks geometry — re-run this sheet','warn'],
+  ok:['Done','','good'],
+};
+// 线型编号 → 高亮颜色，build() 里填，侧栏/提示复用同一套颜色。
+let LT_COLOR_BY_NUMBER={};
 function renderSteps(){
   const el=$('stepStrip'); if(!el)return;
   const rec=(PAGE&&PAGE.record)||{};
@@ -719,26 +1372,38 @@ function renderSteps(){
       +esc(label)+'<i>'+esc(txt)+'</i></b>';
   // ① 文字 ② 符号 ③ 视图分类 ④ 放置 ⑤ 箭头
   const nText=(PAGE.items||[]).length;
-  parts.push(chip('①文字', nText?String(nText):'0', nText?'good':'off','步骤1 融合出的文字锚数'));
+  parts.push(chip('①Text', nText?String(nText):'0', nText?'good':'off','Step 1: fused text anchors'));
   const nSym=((PAGE.symbols&&PAGE.symbols.symbols)||[]).length;
-  parts.push(chip('②符号', String(nSym), nSym?'good':'off','步骤2 图例样例符号数'));
+  parts.push(chip('②Symbols', String(nSym), nSym?'good':'off','Step 2: legend sample symbols'));
   const nPlan=(PAGE.plan_boxes||[]).length;
+  const viewsPending=!!(PAGE.symbols&&PAGE.symbols.view_types_pending);
   parts.push(chip('③plan', String(nPlan),
-      nPlan?'good':(PAGE.view_types_pending?'warn':'off'),
-      PAGE.view_types_pending?'步骤3 视图分类不当期':'步骤3 判定出的 plan 视图框数'));
+      nPlan?'good':(viewsPending?'warn':'off'),
+      viewsPending?'Step 3 view classification is stale':'Step 3: plan view boxes found'));
   const nPlc=(PAGE.counts&&PAGE.counts.placements)||0;
-  parts.push(chip('④放置', String(nPlc), nPlc?'good':'off','步骤4 矢量模板匹配出的放置数'));
+  parts.push(chip('④Placements', String(nPlc), nPlc?'good':'off','Step 4: placements from vector template matching'));
   const meta=ARW_STATE[st.state]||['?',st.state,'warn'];
   const txt = st.state==='ok' ? (st.count+'/'+(st.anchors!==undefined?st.anchors:'?')) : meta[0];
-  parts.push(chip('⑤箭头', txt, st.state==='ok'&&st.count===0?'off':meta[2],
-      st.state==='ok' ? (st.count+' 个锚找到箭头，共 '+st.anchors+' 个锚')
+  parts.push(chip('⑤Arrows', txt, st.state==='ok'&&st.count===0?'off':meta[2],
+      st.state==='ok' ? (st.count+'  anchors resolved to arrows,  '+st.anchors+'  anchors')
                       : (meta[1]+(st.detail?(' — '+st.detail):''))));
+  const lst=rec.linetypes_status||{state:'disabled'};
+  const lmeta=LT_STATE[lst.state]||['?',lst.state,'warn'];
+  const lTxt = lst.state==='ok'
+      ? ((lst.visible||[]).length+'/'+(lst.clusters!==undefined?lst.clusters:'?'))
+      : lmeta[0];
+  parts.push(chip('⑥Line types', lTxt, lmeta[2],
+      lst.state==='ok'
+        ? ((lst.visible||[]).length+'  line types are pointed at, out of  '+lst.clusters
+           +'  (residual '+lst.residual_ops+'  commands are not line types); '
+           +lst.targets+'  terminals, clustering  '+lst.seconds+'s')
+        : (lmeta[1]+(lst.detail?(' — '+lst.detail):''))));
   el.innerHTML=parts.join('');
 }
 function build(){
   const vp=$('viewport');
   vp.querySelectorAll('svg').forEach(s=>s.remove());
-  LOOK={}; picked=null;
+  LOOK={}; picked=null; LT_COLOR_BY_NUMBER={};
   const rec=PAGE.record||{}, W=PAGE.w, H=PAGE.h;
   svg=document.createElementNS(NS,'svg');
   svg.setAttribute('viewBox','0 0 '+W+' '+H);
@@ -748,43 +1413,136 @@ function build(){
   const mk=id=>{const g=document.createElementNS(NS,'g');g.id=id;svg.appendChild(g);return g};
   const gPlan=mk('gPlan'), gGrp=mk('gGrp'), gUni=mk('gUni'), gVlm=mk('gVlm'),
         gAdd=mk('gAdd'), gCov=mk('gCov'), gPlc=mk('gPlc'), gSym=mk('gSym'),
-        gDrop=mk('gDrop'), gMark=mk('gMark'), gArw=mk('gArw');
+        gDrop=mk('gDrop'), gMark=mk('gMark'),
+        // 线型层在箭头层**下面**：箭头是指针、线型是答案，指针不能被答案盖住。
+        // 调试层在最下面：residual 是底噪，全部线型是背景证据，
+        // 正常线型高亮 / 箭头 / 判据探针依次压在它们之上。
+        gResid=mk('gResid'), gAll=mk('gAll'),
+        gLt=mk('gLt'), gArw=mk('gArw'), gProbe=mk('gProbe');
   const pad=Math.max(4,2.5/1000*W);   // 矢量框贴着字形，放一点气
-  // 箭头 / 引线层：给真实绘制的引线和箭头笔画上色，每个 callout 一种颜色；
+  // 箭头 / 引线层：颜色由所属 scope 决定；Gate 优先为红，其余结果为蓝。
   // 末端只用半透明遮罩标出区域，不画额外的点或合成虚线。
   const ARW_COLORS=['#ff9d3c','#4fc3f7','#a78bfa','#4ade80','#f472b6',
                     '#facc15','#fb7185','#38bdf8','#c084fc','#34d399'];
   const px=v=>v[1]/1000*W, py=v=>v[0]/1000*H;
+  // PDF marker bounds vary from sub-pixel dots to large open heads.  Preserve
+  // the raw geometry in the API, but draw a stable square centred on the
+  // semantic tip so the highlight never grows from a marker's top-left corner
+  // or appears to sit halfway along its leader.
+  const targetDisplayBox=t=>{
+    const raw=t&&t.box_2d, tip=t&&t.tip;
+    if(!Array.isArray(raw)||raw.length!==4)return null;
+    if(!Array.isArray(tip)||tip.length!==2)return raw;
+    const y=Number(tip[0]),x=Number(tip[1]);
+    if(!Number.isFinite(y)||!Number.isFinite(x))return raw;
+    const radius=Math.max(...raw.map((v,i)=>Math.abs(Number(v)-(i%2?x:y)))
+      .filter(Number.isFinite),0);
+    const side=Math.min(20,Math.max(12,2*(radius+1))),half=side/2;
+    let y0=y-half,y1=y+half,x0=x-half,x1=x+half;
+    if(y0<0){y1-=y0;y0=0} if(y1>1000){y0-=y1-1000;y1=1000}
+    if(x0<0){x1-=x0;x0=0} if(x1>1000){x0-=x1-1000;x1=1000}
+    return [y0,x0,y1,x1];
+  };
   const drawArrow=(key,ent,idx)=>{
-    const color=ARW_COLORS[idx%ARW_COLORS.length];
+    const sg=scopeForArrowKey(key);
+    const color=sg?scopeColor(sg):ARW_COLORS[idx%ARW_COLORS.length];
+    const scls=sg?(' scope-'+scopeClass(sg)):'';
     const stroke=(pts,cls,w)=>{
       if(!Array.isArray(pts)||pts.length<2)return;
       const ln=document.createElementNS(NS,'polyline');
       ln.setAttribute('points',pts.filter(q=>Array.isArray(q)&&q.length===2)
         .map(q=>px(q).toFixed(1)+','+py(q).toFixed(1)).join(' '));
-      ln.setAttribute('class',cls); ln.setAttribute('stroke',color);
+      ln.setAttribute('class',cls+scls); ln.setAttribute('stroke',color);
       ln.setAttribute('stroke-width',w); ln.dataset.k='arw:'+key;
+      if(sg)ln.dataset.scope=sg.id;
       gArw.appendChild(ln);
     };
     for(const pts of (ent.leader_strokes||[]))stroke(pts,'arw-leader',1.6);
     for(const pts of (ent.arrow_strokes||[]))stroke(pts,'arw-head',2.4);
     for(const t of (ent.targets||[])){
-      const box=t.box_2d;
+      const box=targetDisplayBox(t);
       if(!Array.isArray(box)||box.length!==4)continue;
       const rc=document.createElementNS(NS,'rect');
       rc.setAttribute('x',px([box[0],box[1]])); rc.setAttribute('y',py([box[0],box[1]]));
       rc.setAttribute('width',Math.max((box[3]-box[1])/1000*W,3));
       rc.setAttribute('height',Math.max((box[2]-box[0])/1000*H,3));
-      rc.setAttribute('class','arw-mask'); rc.setAttribute('fill',color);
+      rc.setAttribute('class','arw-mask'+scls); rc.setAttribute('fill',color);
       rc.setAttribute('stroke',color); rc.dataset.k='arw:'+key;
+      if(Array.isArray(t.tip)&&t.tip.length===2){
+        rc.dataset.tipY=t.tip[0]; rc.dataset.tipX=t.tip[1];
+      }
+      if(sg)rc.dataset.scope=sg.id;
       const ti=document.createElementNS(NS,'title');
-      ti.textContent='箭头末端 · '+(t.terminal_kind||'')+' · '+(ent.note||'');
+      ti.textContent='Arrow terminals · '+(t.terminal_kind||'')+' · '+(ent.note||'');
       rc.appendChild(ti);
       gArw.appendChild(rc);
     }
   };
   Object.entries(((PAGE.record&&PAGE.record.arrows)||{}))
         .forEach(([key,ent],i)=>drawArrow(key,ent,i));
+  // ---- Fenceline 层：只画「被某个 fence callout 指到」的线型。
+  // gate 类别不找线（后端 steps/linetypes/bind.py 的读盘期判定），plan 显示闸
+  // 也在后端做完了，这里拿到的 visible 就是该画的。颜色跟 callout 同一套：
+  // 一条线属于哪个 scope，就用那个 scope 的颜色，选中时再加重。
+  buildLinetypeIndex();
+  for(const t of (LT_INDEX.types||[])){
+    const scopes=LT_INDEX.scopesByNumber.get(t.line_type_number)||[];
+    const group=scopes.length?SCOPE_GROUPS.find(g=>g.id===scopes[0]):null;
+    const color=group?scopeColor(group):'var(--c-fence)';
+    LT_COLOR_BY_NUMBER[t.line_type_number]=color;
+    const nodes=[];
+    for(const line of t.polylines){
+      if(!Array.isArray(line)||line.length<2)continue;
+      const ln=document.createElementNS(NS,'polyline');
+      ln.setAttribute('points',line.filter(q=>Array.isArray(q)&&q.length===2)
+        .map(q=>px(q).toFixed(1)+','+py(q).toFixed(1)).join(' '));
+      ln.setAttribute('class','lt-line'); ln.setAttribute('stroke',color);
+      ln.dataset.lt=t.line_type_number;
+      gLt.appendChild(ln);
+      nodes.push(ln);
+    }
+    const ti=document.createElementNS(NS,'title');
+    ti.textContent='Line types #'+t.line_type_number+' · '+(t.signature_family||'')
+      +' · '+(t.segment_count||0)+'  segments'
+      +(t.recovered_from_fusion?' · method1 recovered (collateral of fusion)':'');
+    gLt.appendChild(ti);
+    LT_NODES.set(t.line_type_number,nodes);
+  }
+  // ---- 判据可视化（Debug 层）：每个末端 → 它最近的那条线，标出实际距离。
+  // 这就是绑定用的那个数：距离在 MAX_BIND_DISTANCE(36pt) 内、且那条 op 有主，
+  // 才会给线型。画出来就能直接核对判断对不对，而不用信我念的数字。
+  // 注意：lt 是 buildLinetypeIndex() 里的局部变量，这里要自己取。
+  const ltp=(PAGE&&PAGE.record&&PAGE.record.linetypes)||null;
+  if(ltp){
+    for(const b of (ltp.bindings||[])){
+      const near=b.nearest_op||{}, tip=b.tip;
+      const q=near.nearest_point;
+      if(!Array.isArray(tip)||!Array.isArray(q))continue;
+      const ln=document.createElementNS(NS,'line');
+      ln.setAttribute('x1',px(tip)); ln.setAttribute('y1',py(tip));
+      ln.setAttribute('x2',px(q));   ln.setAttribute('y2',py(q));
+      ln.setAttribute('class','lt-probe');
+      gProbe.appendChild(ln);
+      const dot=document.createElementNS(NS,'circle');
+      dot.setAttribute('cx',px(q)); dot.setAttribute('cy',py(q));
+      dot.setAttribute('r',Math.max(1.4,2.2/1000*W)); dot.setAttribute('class','lt-probe-dot');
+      gProbe.appendChild(dot);
+      const tx=document.createElementNS(NS,'text');
+      tx.setAttribute('x',(px(tip)+px(q))/2+3); tx.setAttribute('y',(py(tip)+py(q))/2-3);
+      tx.setAttribute('class','lt-probe-txt');
+      const owner=near.owner==null?'residual':('#'+near.owner);
+      tx.textContent=(near.distance==null?'?':near.distance)+'pt→'+owner
+        +(b.state&&b.state!=='bound'?(' ['+b.state+']'):'');
+      gProbe.appendChild(tx);
+      const ti2=document.createElementNS(NS,'title');
+      ti2.textContent='Terminals '+b.key+'/'+b.ti+'  nearest  op='+near.op_index
+        +'  distance='+near.distance+'pt  owner='+owner
+        +'  run='+(near.run_id==null?'-':near.run_id)
+        +'  group='+(near.group_id==null?'-':near.group_id)
+        +'  verdict='+b.state;
+      gProbe.appendChild(ti2);
+    }
+  }
   renderSteps();
   const put=(g,box,cls,key,ent,padded)=>{
     if(!Array.isArray(box)||box.length!==4)return null;
@@ -794,17 +1552,19 @@ function build(){
     const rc=document.createElementNS(NS,'rect');
     rc.setAttribute('x',x); rc.setAttribute('y',y);
     rc.setAttribute('width',Math.max(w,2)); rc.setAttribute('height',Math.max(h,2));
-    rc.setAttribute('class','bx '+cls); rc.dataset.k=key;
+    const sg=ent&&ent.scope;
+    rc.setAttribute('class','bx '+cls+(sg?(' scope-'+scopeClass(sg)):'')); rc.dataset.k=key;
+    if(sg)rc.dataset.scope=sg.id;
     const tip=document.createElementNS(NS,'title');
     tip.textContent=(ent.label?ent.label+' · ':'')+(ent.text||'')+(ent.note?' · '+ent.note:'');
     rc.appendChild(tip);
     g.appendChild(rc);
-    LOOK[key]=Object.assign({rect:rc,box:box},ent);
+    LOOK[key]=Object.assign({rect:rc,box:box,scopeId:sg?sg.id:null},ent);
     return {x,y};
   };
   // plan 视图框（解释 shape 放置的搜索范围）
   (PAGE.plan_boxes||[]).forEach((b,i)=>put(gPlan,b,'bx-plan','pl'+i,
-    {kind:'plan',label:'plan 视图',text:'shape 放置只在这个框里匹配'}));
+    {kind:'plan',label:'plan views',text:'shape placements are matched only inside this box'}));
   // 页面分区
   ((PAGE.symbols||{}).groups||[]).forEach((g,i)=>put(gGrp,g.box_2d,'bx-grp','gp'+i,
     {kind:'group',label:g.kind||'group',
@@ -812,49 +1572,65 @@ function build(){
   // 文字层：默认只画并集；Debug 打开后拆成 vlm / vec_added / vec_covered
   // 图例编码标记（平面图上每处印的 "4CL" 那种）不是独立的 fence 文字 —— 画进
   // 文字层就成了"symbol 被框成文字"。默认不画，Debug 里单独一层解释它是什么。
-  const MARK=new Set(PAGE.marker_codes||[]);
+  const MARK=new Set(PAGE.marker_codes||[]), SUPP=new Set(PAGE.suppressed_items||[]);
   const nv=(rec.vlm_items||[]).length;
   (PAGE.items||[]).forEach((it,i)=>{
     const fromVec=i>=nv;
+    const sg=SCOPE_BY_INDEX.get(i)||null;
     const ent={kind:'text',label:it.label||'',text:it.text||'',idx:i,
-               note:fromVec?'矢量补检':'纯模型',tbl:it.tbl};
+               note:fromVec?'Vector top-up':'model-only',tbl:it.tbl,scope:sg};
+    if(SUPP.has(i)){
+      if(DBG())put(gDrop,it.box_2d,'bx-drop','su'+i,
+        {kind:'suppressed',label:'unverified duplicate model box',text:it.text||'',idx:i,
+         note:'no vector text backing, no trusted text carrier, no owning leader; the same text is already verified on this sheet callout'},true);
+      return;
+    }
     if(MARK.has(i)){
       if(DBG())put(gMark,it.box_2d,'bx-mark','t'+i,
-        {kind:'marker',label:'图例编码标记',text:it.text||'',idx:i,
-         note:'与图例某一行的编码相同 → 是那一行的实例，不是独立的 fence 文字；已从文字层隐藏'},true);
+        {kind:'marker',label:'Legend code marker',text:it.text||'',idx:i,
+         note:'same code as a legend row → is an instance of that row, not standalone fence text; hidden from the text layer'},true);
       return;
     }
     if(DBG())put(fromVec?gAdd:gVlm,it.box_2d,fromVec?'bx-add':'bx-vlm','t'+i,ent,fromVec);
     else put(gUni,it.box_2d,'bx-uni','t'+i,ent,fromVec);
   });
   if(DBG())(rec.vec_covered||[]).forEach((it,i)=>put(gCov,it.box_2d,'bx-cov','c'+i,
-    {kind:'covered',label:it.label||'',text:it.text||'',note:'矢量文字已被模型框覆盖'},true));
+    {kind:'covered',label:it.label||'',text:it.text||'',note:'vector text is already covered by a model box'},true));
   // 图例样例 symbol + 它在 plan 里的放置
   ((PAGE.symbols||{}).symbols||[]).forEach((s,i)=>{
     const cat=s.category||'symbol';
     const lab=cat+(s.value?' '+s.value:'');
     const owner=(PAGE.items||[])[s.text_index];
+    const sg=SCOPE_BY_SYMBOL.get(i)||SCOPE_BY_INDEX.get(Number(s.text_index))||null;
     const note=[s.placement_note,s.placement_error,
-                s.dropped_outside_plan?('plan 外丢弃 '+s.dropped_outside_plan):'']
+                s.dropped_outside_plan?('plan  dropped outside  '+s.dropped_outside_plan):'']
                .filter(Boolean).join(' · ');
     // 不在图上写 "shape 4.6" 这种角标：图例行挨得很近，几个角标必然叠在一起，
     // 反而盖住底图。类别与编号点框后在右栏看。
     put(gSym,s.box_2d,'bx-sym'+(cat==='line'?' line':''),'sy'+i,
-      {kind:'symbol',label:lab,text:owner?('归属文字：'+(owner.text||'')):'',
-       idx:s.text_index,note:note});
+      {kind:'symbol',label:lab,text:owner?('Owner text: '+(owner.text||'')):'',
+       idx:s.text_index,note:note,scope:sg});
     (s.placements||[]).forEach((b,j)=>put(gPlc,b,'bx-plc','sp'+i+'_'+j,
       {kind:'placement',label:lab,
-       text:'第 '+(j+1)+'/'+s.placements.length+' 个同款放置（本地矢量匹配）',
-       idx:s.text_index}));
+       text:'Sheet  '+(j+1)+'/'+s.placements.length+'  same-shape placements (local vector match)',
+       idx:s.text_index,scope:sg}));
   });
   // Debug：被硬闸剥掉的 symbol
   if(DBG())(PAGE.dropped_symbols||[]).forEach((s,i)=>put(gDrop,s.box_2d,'bx-drop','dr'+i,
     {kind:'dropped',label:(s.category||'symbol')+(s.value?' '+s.value:''),
-     text:s.reason||'',idx:s.text_index,note:'已被发布过滤剥离'}));
+     text:s.reason||'',idx:s.text_index,note:'stripped by the publish filter'}));
   vp.appendChild(svg);
   svg.addEventListener('click',e=>{
+    // 拖拽结束时浏览器会补发一次 click —— 那不是选择动作，吃掉它。
+    if(PANNED){PANNED=false;return}
+    const sid=e.target&&e.target.dataset?e.target.dataset.scope:null;
+    // 点另一个 callout 才允许换，并且**沿用当前的 withLines** —— 不传的话
+    // LT_LINES_ON 会被置回 false，从 FENCELINE 选出来的线型高亮一点就没。
+    if(sid){selectScope(sid,false,LT_LINES_ON);return}
     const k=e.target&&e.target.dataset?e.target.dataset.k:null;
-    if(k)pick(k,false);
+    // 已经选中某个 callout 时，点图上别的东西一律不动它 —— pick() 会
+    // clearScopeSelection()，那就违反了「不切换 callout 就保持不变」。
+    if(k&&!selectedScope)pick(k,false);
   });
   syncLayers();
   const fw=(vp.clientWidth-48)/W, fh=(vp.clientHeight-48)/H;
@@ -862,10 +1638,17 @@ function build(){
   setScale(fitS);
   vp.scrollLeft=0; vp.scrollTop=0;
   $('hint').style.display='none';
+  // 调试层的几何在 ALL_LT 里缓存着，build() 会清空 svg，所以要重画一遍。
+  // 翻页后 key 不同 —— 那时作废，绝不能把上一页的几何画到这一页上。
+  if(ALL_LT&&ALL_LT_KEY!==allKey()){ALL_LT=null;ALL_LT_STATE='idle';ALL_FOCUS=null}
+  drawAllLinetypes();
+  if(selectedScope)selectScope(selectedScope,false,LT_LINES_ON);
 }
 const LAYERS=[['tgTxt',['gUni','gVlm','gAdd','gCov']],['tgSym',['gSym']],
               ['tgPlc',['gPlc']],['tgPlan',['gPlan']],['tgGrp',['gGrp']],
-              ['tgDbg',['gDrop','gMark']],['tgArw',['gArw']]];
+              ['tgDbg',['gDrop','gMark','gProbe']],['tgArw',['gArw']],
+              ['tgLt',['gLt']],
+              ['tgAll',['gAll']],['tgResid',['gResid']]];
 function syncLayers(){
   for(const [tg,ids] of LAYERS){
     const on=$(tg).querySelector('input').checked;
@@ -873,26 +1656,132 @@ function syncLayers(){
     for(const id of ids){
       const g=document.getElementById(id);
       if(!g)continue;
-      if(id==='gDrop')g.style.display=(on&&DBG())?'':'none';
+      if(id==='gDrop'||id==='gProbe')g.style.display=(on&&DBG())?'':'none';
       else g.style.display=on?'':'none';
     }
   }
 }
 for(const [tg] of LAYERS){
   $(tg).querySelector('input').addEventListener('change',()=>{
-    if(tg==='tgDbg'){ if(PAGE)build(); return; }   // 重画：拆分/合并文字层
+    if(tg==='tgDbg'){ if(PAGE){build();renderList()} return; }   // 重画：拆分/合并文字层
+    // 全部线型是**按需拉**的（rapid_city_2 P11 实测 5.8 MB），不能挂进
+    // /api/page —— 那是给所有人付调试的代价。打开时才去取。
+    if(tg==='tgAll'&&$('tgAll').querySelector('input').checked){
+      ensureAllLinetypes(); return;
+    }
     syncLayers();
   });
 }
 
 /* =============== 选中 / 详情 =============== */
+function selectScope(id,fly,withLines,rowKey){
+  // withLines 只由 FENCELINE 那一节的行传 true；图上点框传当前的 LT_LINES_ON。
+  //
+  // **必须先折成真布尔**：classList.toggle 的第二参传 undefined 等同「没传」，
+  // 语义会从「置位」退化成「翻转」。FENCE TEXT & GATES 的行调用时不传第三参，
+  // 于是下面那圈 lt-focus/lt-dim 会把全部线型原地反转 —— 上一个选中的那条
+  // 隐身、其余全部加粗亮起，看起来就是「两个 callout 的高亮并存」。
+  withLines=!!withLines;
+  const g=SCOPE_GROUPS.find(x=>x.id===id);
+  if(!g||!svg)return;
+  selectedScope=id;
+  /* 没传 rowKey（从图上点框进来）时退回"第一个匹配这个 scope 的行"，保证图上
+     点选也总有且只有一行亮，而不是一行都不亮。 */
+  selectedRow=rowKey||_firstRowKeyFor(id);
+  // 选 scope 就保证其关联图层可见，避免列表点下去却因图层开关而看不到反馈。
+  const need=['tgTxt','tgArw'];
+  if(g.symbols.length)need.push('tgSym');
+  if(g.placements.length)need.push('tgPlc');
+  const ltNumber=LT_INDEX.numberByScope.get(id);
+  LT_LINES_ON=!!withLines;
+  if(withLines&&ltNumber!=null)need.push('tgLt');
+  for(const tg of need){
+    const input=$(tg).querySelector('input'); input.checked=true; $(tg).classList.remove('off');
+  }
+  syncLayers();
+  if(picked&&LOOK[picked])LOOK[picked].rect.classList.remove('pick');
+  picked=null;
+  const nodes=[...svg.querySelectorAll('[data-scope]')];
+  const focused=[];
+  for(const n of nodes){
+    const on=n.dataset.scope===id;
+    n.classList.toggle('scope-focus',on);
+    n.classList.toggle('scope-dim',!on);
+    if(on)focused.push(n);
+  }
+  document.querySelectorAll('#list .scope-item').forEach(n=>{
+    const on=n.dataset.row===selectedRow;
+    n.classList.toggle('on',on); n.setAttribute('aria-pressed',String(on));
+  });
+  // 这个 callout 对应的线型加重，其余线型压暗。颜色本来就是 scope 的颜色，
+  // 所以「引线 / 箭头 / 线」三样在选中时是同一个色。
+  // 压暗的判据是「**有没有选中 scope**」，不是「这次选中带不带线」。
+  // 写成 withLines&&!on 的话，点 FENCE TEXT & GATES 的行（不传 withLines）
+  // 会把 lt-dim 一并移除，所有线型回到默认的正常显示 —— 上一个 FENCELINE
+  // 选中的那条线还在图上，看起来就是两个 callout 的高亮并存。
+  // selectScope 一被调用就必然有选中项，所以这里恒该压暗非目标线型。
+  for(const [number,nodes] of LT_NODES){
+    const on=withLines&&(number===ltNumber);
+    for(const n of nodes){
+      n.classList.toggle('lt-focus',on);
+      n.classList.toggle('lt-dim',!on);
+    }
+  }
+  // 调试层跟着一起走：选中的 callout 有线型就聚焦它，没有（gate / residual）
+  // 就把调试层的聚焦**清掉** —— 否则上一个 callout 的聚焦会留在那儿。
+  if(ALL_LT){
+    if(withLines&&ltNumber!=null&&ALL_NODES.has(ltNumber)){
+      ALL_FOCUS=null; focusAllType(ltNumber,false);   // focusAllType 是 toggle 语义，先清再设
+    }else{
+      clearAllFocus();
+    }
+  }
+  /* 点 callout 后最下方那条状态栏（"8' CHAINLINK · 12 identical text boxes ·
+     10 leader groups · Line types #26 / compound_path_periodic"）按产品口径去掉。
+     #sel 这个容器保留 —— 调试层「全部线型」的类型详情还在用它，那是另一件事；
+     所以这里改成**清空并隐藏**，而不是留着上一次的内容。 */
+  $('sel').classList.remove('has');
+  $('sel').innerHTML='';
+  for(const n of focused){
+    if(n.tagName.toLowerCase()!=='rect')continue;
+    n.classList.remove('flash'); void n.getBoundingClientRect(); n.classList.add('flash');
+    setTimeout(()=>n.classList.remove('flash'),1200);
+  }
+  if(fly&&focused.length){
+    const first=svg.querySelector('rect[data-scope="'+id+'"][data-k^="t"]')
+      ||svg.querySelector('rect[data-scope="'+id+'"]')||focused[0];
+    try{
+      const b=first.getBBox(), vp=$('viewport');
+      vp.scrollLeft=(b.x+b.width/2)*scale-vp.clientWidth/2;
+      vp.scrollTop=(b.y+b.height/2)*scale-vp.clientHeight/2;
+    }catch(e){}
+  }
+}
+function clearScopeSelection(){
+  selectedScope=null; selectedRow=null; LT_LINES_ON=false;
+  if(svg)svg.querySelectorAll('[data-scope]').forEach(n=>{
+    n.classList.remove('scope-focus','scope-dim');
+  });
+  for(const nodes of LT_NODES.values())
+    for(const n of nodes)n.classList.remove('lt-focus','lt-dim');
+  clearAllFocus();
+  document.querySelectorAll('#list .scope-item').forEach(n=>{
+    n.classList.remove('on'); n.setAttribute('aria-pressed','false');
+  });
+  $('sel').classList.remove('has'); $('sel').innerHTML='';
+}
 function pick(key,fly){
   const e=LOOK[key]; if(!e)return;
+  if(e.scopeId){selectScope(e.scopeId,fly,LT_LINES_ON);return}
+  clearScopeSelection();
   if(picked&&LOOK[picked])LOOK[picked].rect.classList.remove('pick');
   picked=key; e.rect.classList.add('pick');
-  const rows=[['类型',e.kind],['label',e.label],['text',e.text],
+  // #sel 默认 display:none，只有 .has 才显示。以前这里靠上一行的
+  // clearScopeSelection() 顺手摘 has，于是这张框详情卡一直写了却看不见。
+  $('sel').classList.add('has');
+  const rows=[['Type',e.kind],['label',e.label],['text',e.text],
               ['box_2d','['+e.box.map(v=>Math.round(v*10)/10).join(', ')+']'],
-              ['union idx',e.idx==null?'—':e.idx],['备注',e.note]];
+              ['union idx',e.idx==null?'—':e.idx],['Note',e.note]];
   $('sel').innerHTML='<div class="item on"><div class="meta">'
     +rows.filter(r=>r[1]!==''&&r[1]!=null)
          .map(r=>'<div><b>'+esc(r[0])+'</b>: '+esc(r[1])+'</div>').join('')
@@ -909,24 +1798,336 @@ function pick(key,fly){
     setTimeout(()=>b.classList.remove('flash'),1200);
   }
 }
+/* =============== 全部线型（调试）===============
+   为什么单独一层、单独一个接口：正常视图只发被指到的那几个线型，这是它能上
+   前端的前提。但只有这些的时候，一个 callout 没绑上线型时图上分不出两种完全
+   不同的原因 —— (a) 那条线根本没被聚成线型，(b) 聚出来了、只是离末端更远
+   没被选中。实测 rapid_city_2 P11 的 callout ② 属于 (b)：方块 pattern 线是
+   #48（518 op / 1895 段），但末端落在 hatch 带里，最近的 ink 是 hatch 短划
+   （0.26 pt），#48 在 3.4 pt 之外。
+   所以这一层除了全部线型，还画 residual（不属于任何线型的 path ink）。
+   两者一起看，"never clustered"  and  "clustered but not selected" 才分得开。 */
+let ALL_LT=null;               // /api/linetypes_all 的响应
+let ALL_LT_KEY='';             // slug|page —— 翻页后不许拿上一页的几何
+let ALL_LT_STATE='idle';       // idle|loading|ok|not-run|stale|disabled|no-arrows|error
+let ALL_LT_DETAIL='';
+let ALL_NODES=new Map();       // 线型编号 -> [节点]
+let ALL_FOCUS=null;            // 当前聚焦的线型编号
+let ALL_FILTER='';
+
+function allKey(){
+  return (CUR&&CUR.slug?CUR.slug:'')+'|'+((PAGE&&PAGE.page)||'');
+}
+// 编号 -> 稳定颜色。黄金角散布，相邻编号不会撞色；同一页刷新颜色不变。
+function alColor(n){
+  const h=((Number(n)||0)*137.508)%360;
+  return 'hsl('+h.toFixed(1)+' 78% 42%)';
+}
+
+// 把页面帧的框 [ymin,xmin,ymax,xmax] 居中。调试层没有 data-scope 节点，
+// selectScope 里那套 getBBox 的路子用不上。
+function flyToBox(box){
+  if(!PAGE||!svg||!Array.isArray(box)||box.length!==4)return;
+  const vp=$('viewport');
+  const cx=(box[1]+box[3])/2/1000*PAGE.w, cy=(box[0]+box[2])/2/1000*PAGE.h;
+  vp.scrollLeft=cx*scale-vp.clientWidth/2;
+  vp.scrollTop=cy*scale-vp.clientHeight/2;
+}
+
+async function ensureAllLinetypes(){
+  if(!PAGE||!CUR){syncLayers();return}
+  const key=allKey();
+  if(ALL_LT&&ALL_LT_KEY===key){drawAllLinetypes();renderList();return}
+  ALL_LT=null; ALL_LT_KEY=key; ALL_LT_STATE='loading'; ALL_LT_DETAIL='';
+  renderList(); syncLayers();
+  const r=await api('/api/linetypes_all/'+encodeURIComponent(CUR.slug)
+                    +'/'+PAGE.page);
+  if(allKey()!==key)return;              // 请求飞行期间翻页了，丢弃
+  if(!r.ok||!r.body){
+    ALL_LT_STATE='error';
+    ALL_LT_DETAIL=(r.body&&r.body.error)||('HTTP '+r.status);
+  }else if(r.body.state!=='ok'){
+    ALL_LT_STATE=r.body.state||'error';
+    ALL_LT_DETAIL=r.body.detail||'';
+  }else{
+    ALL_LT=r.body; ALL_LT_STATE='ok';
+  }
+  drawAllLinetypes(); renderList(); syncLayers();
+}
+
+function drawAllLinetypes(){
+  ALL_NODES=new Map();
+  const gAll=document.getElementById('gAll');
+  const gResid=document.getElementById('gResid');
+  if(!gAll||!gResid||!PAGE)return;
+  gAll.innerHTML=''; gResid.innerHTML='';
+  if(!ALL_LT||ALL_LT_KEY!==allKey())return;
+  const W=PAGE.w, H=PAGE.h;
+  const px=v=>v[1]/1000*W, py=v=>v[0]/1000*H;
+  const poly=(parent,line,cls,stroke)=>{
+    if(!Array.isArray(line)||line.length<2)return null;
+    const pts=line.filter(q=>Array.isArray(q)&&q.length===2)
+      .map(q=>px(q).toFixed(1)+','+py(q).toFixed(1)).join(' ');
+    if(!pts)return null;
+    const ln=document.createElementNS(NS,'polyline');
+    ln.setAttribute('points',pts); ln.setAttribute('class',cls);
+    if(stroke)ln.setAttribute('stroke',stroke);
+    parent.appendChild(ln);
+    return ln;
+  };
+  const resid=ALL_LT.residual||null;
+  if(resid)for(const line of (resid.polylines||[]))poly(gResid,line,'al-resid');
+  // 大的先画、小的后画 —— 否则整页 hatch（P11 的 #17 是 17088 个单段 op）
+  // 会把真正的围栏线盖住。
+  const types=[...(ALL_LT.types||[])]
+    .sort((a,b)=>(b.op_count||0)-(a.op_count||0));
+  for(const t of types){
+    const color=alColor(t.line_type_number);
+    const nodes=[];
+    for(const line of (t.polylines||[])){
+      const ln=poly(gAll,line,'al-line',color);
+      if(ln){ln.dataset.al=t.line_type_number;nodes.push(ln)}
+    }
+    ALL_NODES.set(t.line_type_number,nodes);
+  }
+  applyAllFocus();
+}
+
+function applyAllFocus(){
+  const gResid=document.getElementById('gResid');
+  for(const [number,nodes] of ALL_NODES){
+    const on=ALL_FOCUS!=null&&number===ALL_FOCUS;
+    for(const n of nodes){
+      n.classList.toggle('al-focus',on);
+      n.classList.toggle('al-dim',ALL_FOCUS!=null&&!on);
+    }
+  }
+  if(gResid)for(const n of gResid.children)
+    n.classList.toggle('al-dim',ALL_FOCUS!=null);
+}
+
+/* 把调试层的聚焦绝对清掉。不能用 focusAllType(n) —— 它是 toggle 语义，
+   传当前值才清、传别的值反而会换一个聚焦。 */
+function clearAllFocus(){
+  if(ALL_FOCUS==null)return;
+  ALL_FOCUS=null;
+  applyAllFocus();
+  document.querySelectorAll('#list .al-item').forEach(n=>{
+    n.classList.remove('on'); n.setAttribute('aria-pressed','false');
+  });
+}
+
+function allTypeOf(number){
+  return ((ALL_LT&&ALL_LT.types)||[]).find(
+    t=>t.line_type_number===number)||null;
+}
+
+/* 聚焦某个线型：其余压暗、可选飞过去。这一层和 FENCELINE 的高亮是两套 ——
+   那一套只画被指到的线型，这一套画全部，所以两边都要能各自聚焦。 */
+function focusAllType(number,fly){
+  if(!ALL_LT)return;
+  const input=$('tgAll').querySelector('input');
+  if(!input.checked){input.checked=true;$('tgAll').classList.remove('off')}
+  ALL_FOCUS=(ALL_FOCUS===number)?null:number;
+  syncLayers(); applyAllFocus();
+  document.querySelectorAll('#list .al-item').forEach(n=>{
+    const on=ALL_FOCUS!=null&&Number(n.dataset.al)===ALL_FOCUS;
+    n.classList.toggle('on',on); n.setAttribute('aria-pressed',String(on));
+  });
+  const t=ALL_FOCUS==null?null:allTypeOf(ALL_FOCUS);
+  if(t)showAllTypeDetail(t);
+  if(fly&&t&&Array.isArray(t.bbox)&&t.bbox.length===4)flyToBox(t.bbox);
+}
+
+function showAllTypeDetail(t){
+  const bound=(t.bound_by||[]);
+  const bits=[(t.signature_family||'?'),
+              'source '+(t.recognition_source||'?')
+              +(t.recovered_from_fusion?' (recovered after fusion dropped it)':''),
+              (t.op_count||0)+' op',(t.segment_count||0)+'  segments',
+              (t.runs||[]).length+'  runs',
+              'members '+(t.member_count||0),
+              'min_sim '+(t.minimum_pair_similarity==null?'?'
+                          :Number(t.minimum_pair_similarity).toFixed(4))];
+  if(t.clipped_ops)bits.push(t.clipped_ops+' op  clipped');
+  if((t.groups||[]).length)bits.push((t.groups||[]).length+'  engine groups');
+  const who=bound.length
+    ? bound.map(b=>esc(String(b.key))+'/'+b.ti
+                +(b.distance==null?'':(' @'+b.distance+'pt'))).join(', ')
+    : 'no terminal is bound to it';
+  $('sel').classList.add('has');
+  $('sel').innerHTML='<div class="scope-detail fence">'
+    +'<div><i class="scope-dot" style="background:'+alColor(t.line_type_number)
+    +'"></i><b>Line type  #'+t.line_type_number+'</b></div>'
+    +'<strong>'+esc(t.type_uid||t.line_type_id||'')+'</strong>'
+    +'<p>'+esc(bits.join(' · '))+'</p>'
+    +'<p>Bound by: '+who+'</p></div>';
+}
+
+const AL_STATE_TEXT={
+  loading:'Loading all line types…',
+  'not-run':'no debug geometry generated for this sheet yet (run tools/linetype_sidecar/'
+            +'verify_all_geometry.py <project> <sheet>)',
+  stale:'the debug geometry is not from the current results (signature mismatch), so it is not shown — using it would '
+        +'draw conclusions about a different clustering run',
+  disabled:'line-type seam is off (LINETYPES=1  not set)',
+  'no-arrows':'the main line-type result for this sheet was never computed',
+  error:'Fetch failed',
+};
+
+function renderAllSection(box){
+  const on=$('tgAll').querySelector('input').checked;
+  if(!on||ALL_LT_STATE==='idle')return;
+  const empty=box.querySelector('.empty');
+  const h=document.createElement('div');
+  h.className='scope-section';
+  h.textContent='ALL LINE TYPES (DEBUG)';
+  box.appendChild(h);
+  if(ALL_LT_STATE!=='ok'){
+    const d=document.createElement('div');
+    d.className='empty';
+    d.textContent=(AL_STATE_TEXT[ALL_LT_STATE]||ALL_LT_STATE)
+      +(ALL_LT_DETAIL?(': '+ALL_LT_DETAIL):'');
+    box.appendChild(d);
+    return;
+  }
+  if(empty)empty.remove();
+  const page=ALL_LT.page||{}, resid=ALL_LT.residual||{};
+  const head=document.createElement('div');
+  head.className='al-head';
+  const filter=document.createElement('input');
+  filter.type='search'; filter.placeholder='Filter  #number / family';
+  filter.value=ALL_FILTER;
+  filter.oninput=()=>{ALL_FILTER=filter.value;renderList();
+                      const n=document.querySelector('#list .al-head input');
+                      if(n){n.focus();n.setSelectionRange(n.value.length,n.value.length)}};
+  head.appendChild(filter);
+  const note=document.createElement('span');
+  note.textContent=(ALL_LT.types||[]).length+'  types · '
+    +(page.owned_path_ops||0)+'/'+(page.path_ops||0)+' op owned · residual '
+    +(resid.op_count||0)+' op';
+  head.appendChild(note);
+  box.appendChild(head);
+
+  const needle=ALL_FILTER.trim().toLowerCase().replace(/^#/,'');
+  // op 多的排前面：整页 hatch 被当成线型这种问题（P11 的 #17：17088 个单段
+  // op、成员遍布全页）一眼就看得见，不用翻。
+  const rows=[...(ALL_LT.types||[])]
+    .sort((a,b)=>(b.op_count||0)-(a.op_count||0))
+    .filter(t=>!needle
+      ||String(t.line_type_number)===needle
+      ||String(t.line_type_number).includes(needle)
+      ||String(t.signature_family||'').toLowerCase().includes(needle)
+      ||String(t.recognition_source||'').toLowerCase().includes(needle));
+  for(const t of rows){
+    const b=document.createElement('button');
+    b.type='button'; b.className='scope-item fence al-item';
+    b.dataset.al=t.line_type_number;
+    const on2=ALL_FOCUS===t.line_type_number;
+    b.classList.toggle('on',on2);
+    b.setAttribute('aria-pressed',String(on2));
+    const meta=[t.signature_family||'?',(t.op_count||0)+' op',
+                (t.segment_count||0)+'  segments'];
+    if((t.runs||[]).length>1)meta.push((t.runs||[]).length+'  runs');
+    if(t.recovered_from_fusion)meta.push('method1 recovered');
+    else meta.push(t.recognition_source||'');
+    const bound=(t.bound_by||[]).length;
+    b.innerHTML='<i class="al-sw" style="background:'
+      +alColor(t.line_type_number)+'"></i><span class="scope-copy">'
+      +'<span class="scope-text">#'+t.line_type_number
+      +(bound?(' <span class="al-badge">bound  '+bound+'</span>'):'')
+      +'</span><span class="scope-meta">'+esc(meta.filter(Boolean).join(' · '))
+      +'</span></span><span class="scope-n">'+(t.op_count||0)+'</span>';
+    b.onclick=()=>focusAllType(t.line_type_number,true);
+    box.appendChild(b);
+  }
+  if(!rows.length){
+    const d=document.createElement('div');
+    d.className='empty'; d.textContent='No matching line type';
+    box.appendChild(d);
+  }
+}
+
+/* 一行的唯一标识 = 分节 + scopeId。同一个 scope 在两个分节里各有一行，
+   只有加上分节才能区分"点的是哪一行"。 */
+const rowKey=(section,scopeId)=>String(section)+'|'+String(scopeId);
+
+/* 从图上点框进来时没有 rowKey，取第一个匹配该 scope 的行。 */
+function _firstRowKeyFor(id){
+  const node=document.querySelector('#list .scope-item[data-scope="'+id+'"]');
+  return node?node.dataset.row:null;
+}
+
 function renderList(){
   const box=$('list'); box.innerHTML='';
-  const add=(key,head,sub)=>{
-    const d=document.createElement('div');
-    d.className='item'; d.dataset.k=key;
-    d.innerHTML='<div class="h"><b>'+esc(head)+'</b><span>'+esc(sub)+'</span></div>';
-    d.onclick=()=>pick(key,true);
-    box.appendChild(d);
+  $('scopeCount').textContent=SCOPE_GROUPS.length;
+  const addSection=(title,groups)=>{
+    const section=title;
+    if(!groups.length)return;
+    const h=document.createElement('div'); h.className='scope-section'; h.textContent=title;
+    box.appendChild(h);
+    for(const g of groups){
+      const b=document.createElement('button');
+      b.type='button'; b.className='scope-item '+scopeClass(g); b.dataset.scope=g.id;
+      b.dataset.row=rowKey(section,g.id);
+      b.setAttribute('aria-pressed',String(selectedRow===b.dataset.row));
+      const meta=[g.kind==='legend'?'Legend / symbol linked':'In-drawing callout'];
+      if(g.members.length>1)meta.push(g.members.length+'  identical text boxes');
+      meta.push(g.calloutCount+' callout');
+      b.innerHTML='<i class="scope-dot '+scopeClass(g)+'"></i><span class="scope-copy">'
+        +'<span class="scope-text">'+esc(g.text)+'</span><span class="scope-meta">'
+        +esc(meta.join(' · '))+'</span></span><span class="scope-n">'+g.calloutCount+'</span>';
+      b.classList.toggle('on',selectedRow===b.dataset.row);
+      b.onclick=()=>selectScope(g.id,true,false,b.dataset.row);
+      box.appendChild(b);
+    }
   };
-  (PAGE.items||[]).forEach((it,i)=>add('t'+i,'#'+i,it.text||'(无文字)'));
-  ((PAGE.symbols||{}).symbols||[]).forEach((s,i)=>{
-    const n=(s.placements||[]).length;
-    add('sy'+i,(s.category||'symbol')+(s.value?' '+s.value:''),
-        n?('放置 '+n+' 处'):(s.placement_error||s.placement_note||'无放置'));
-  });
-  if(DBG())(PAGE.dropped_symbols||[]).forEach((s,i)=>
-    add('dr'+i,'剥离 '+(s.category||'symbol'),s.reason||''));
-  if(!box.children.length)box.innerHTML='<div class="empty">本页没有任何结果</div>';
+  addSection('LEGEND CALLOUTS',SCOPE_GROUPS.filter(g=>g.kind==='legend'));
+  addSection('FENCE TEXT & GATES',SCOPE_GROUPS.filter(g=>g.kind!=='legend'));
+  // Fenceline：只有 fence 类别、且真的绑到线型的 callout 才在这里。
+  // gate 不找线，residual / plan 外的也不在 —— 那些在上面那节里照常显示。
+  if(LT_INDEX.rows.length||LT_INDEX.orphans.length){
+    const h=document.createElement('div');
+    h.className='scope-section'; h.textContent='FENCELINE';
+    box.appendChild(h);
+    for(const row of LT_INDEX.rows){
+      const b=document.createElement('button');
+      b.type='button'; b.className='scope-item fence lt-row';
+      b.dataset.scope=row.scopeId; b.dataset.lt=row.number;
+      b.dataset.row=rowKey('FENCELINE',row.scopeId);
+      b.setAttribute('aria-pressed',String(selectedRow===b.dataset.row));
+      const meta=['Line types #'+row.number];
+      if(row.family)meta.push(row.family);
+      meta.push(row.segments+'  segments');
+      if(row.terminals)meta.push(row.terminals+'  terminals');
+      // 这个线型是 fusion 连带丢弃后补回来的（method1 认领、
+      // method2 从未认领、fused 却无主）。标出来，免得当成 fused 同源。
+      if(row.recovered)meta.push('method1 recovered');
+      // 跨组合并出来的同型区域，没被指到的不画 —— 但要让人看得见有多少。
+      if(row.droppedRuns)
+        meta.push('plus  '+row.droppedRuns+'  more runs of the same type are not pointed at ('
+                  +row.droppedSegments+'  segments, not highlighted)');
+      b.innerHTML='<i class="scope-dot fence"></i><span class="scope-copy">'
+        +'<span class="scope-text">'+esc(row.text)+'</span><span class="scope-meta">'
+        +esc(meta.join(' · '))+'</span></span><span class="scope-n">#'
+        +row.number+'</span>';
+      b.classList.toggle('on',selectedRow===b.dataset.row);
+      b.onclick=()=>selectScope(row.scopeId,true,true,b.dataset.row);
+      box.appendChild(b);
+    }
+    for(const row of LT_INDEX.orphans){
+      const d=document.createElement('div');
+      d.className='scope-item fence lt-row lt-orphan';
+      d.innerHTML='<i class="scope-dot fence"></i><span class="scope-copy">'
+        +'<span class="scope-text">'+esc(row.text)+'</span><span class="scope-meta">'
+        +esc(['Line types #'+row.number,row.family,row.segments+'  segments',
+              'text not in the scope list'].filter(Boolean).join(' · '))
+        +'</span></span><span class="scope-n">#'+row.number+'</span>';
+      box.appendChild(d);
+    }
+  }
+  if(!SCOPE_GROUPS.length)box.innerHTML='<div class="empty">No fence results on this sheet</div>';
+  renderAllSection(box);
 }
 
 /* =============== 缩放 / 平移 =============== */
@@ -939,11 +2140,15 @@ function setScale(s,cx,cy){
   scale=Math.min(8,Math.max(fitS*0.3,s));
   svg.setAttribute('width',PAGE.w*scale); svg.setAttribute('height',PAGE.h*scale);
   vp.scrollLeft=ix*scale-ax; vp.scrollTop=iy*scale-ay;
-  $('zPct').textContent=Math.round(scale*100)+'%';
+
 }
-$('zIn').onclick=()=>setScale(scale*1.25);
-$('zOut').onclick=()=>setScale(scale/1.25);
-$('zFit').onclick=()=>{if(PAGE){setScale(fitS);const vp=$('viewport');vp.scrollLeft=0;vp.scrollTop=0}};
+/* 缩放控件全部去掉了。复位靠双击画布 —— 滚轮能放大缩小，但没有任何复位入口
+   会很难用，而这是唯一不占顶栏空间的做法。 */
+$('viewport').ondblclick=()=>{
+  if(!PAGE)return;
+  setScale(fitS);
+  const vp=$('viewport'); vp.scrollLeft=0; vp.scrollTop=0;
+};
 $('viewport').addEventListener('wheel',e=>{
   if(!PAGE)return;
   e.preventDefault();
@@ -953,6 +2158,7 @@ $('viewport').addEventListener('wheel',e=>{
   const vp=$('viewport'); let st=null;
   vp.addEventListener('mousedown',e=>{
     if(e.button!==0)return;
+    PANNED=false;
     st={x:e.clientX,y:e.clientY,sl:vp.scrollLeft,st:vp.scrollTop,moved:false};
   });
   window.addEventListener('mousemove',e=>{
@@ -961,12 +2167,17 @@ $('viewport').addEventListener('wheel',e=>{
     if(Math.abs(dx)+Math.abs(dy)>4){st.moved=true;vp.classList.add('pan')}
     if(st.moved){vp.scrollLeft=st.sl-dx;vp.scrollTop=st.st-dy}
   });
-  window.addEventListener('mouseup',()=>{st=null;vp.classList.remove('pan')});
+  window.addEventListener('mouseup',()=>{
+    // mouseup 早于 click，所以在这里把「这次手势拖过」记下来给 click 用。
+    if(st&&st.moved)PANNED=true;
+    st=null;vp.classList.remove('pan');
+  });
 })();
 window.addEventListener('keydown',e=>{
   if(e.target&&/INPUT|TEXTAREA/.test(e.target.tagName))return;
   if(e.key==='ArrowLeft')step(-1);
   if(e.key==='ArrowRight')step(1);
+  if(e.key==='Escape'){toggleProjectDrawer(false);clearScopeSelection()}
 });
 
 /* =============== 启动 =============== */

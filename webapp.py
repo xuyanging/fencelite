@@ -25,13 +25,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import (Flask, abort, jsonify, make_response, render_template,
+                   request, send_file)
+from werkzeug.exceptions import HTTPException
 from PIL import Image
 
 import job
 from core.config import BASE_DIR, MODEL_NAME, PRICING
 from core.pdfio import render_pdf_page
-from steps import arrows, store
+from steps import arrows, linetypes, store
 from steps.placements import has_current_placements
 from steps.symbols import (has_current_symbols, marker_code_indices,
                           symbols_dropped_view)
@@ -183,6 +185,7 @@ def _attach_arrows(record, slug, page, items, revision, plan_regions=None):
       not-run           该跑却没有结果文件条目
       failed            边车算失败（含走完堆梯子仍 OOM），detail 里有原因
       stale             有结果但签名/版本不当期，页面不会显示它
+      image-only        只有嵌入图片、没有矢量路径；按规则标记后不追箭头
       ok                算过了；count 为找到箭头的锚数（0 表示确实没有）
     """
     if not arrows.ENABLED:
@@ -199,6 +202,14 @@ def _attach_arrows(record, slug, page, items, revision, plan_regions=None):
         return
     if arrows.has_current_arrows(entry, sig):
         record["arrows"] = entry["items"]
+        record["arrow_anchors"] = entry.get("anchors") or {}
+        if entry.get("page_kind") == "image-only":
+            record["arrows_status"] = {
+                "state": "image-only",
+                "anchors": len(items) + len(extra),
+                "detail": "this sheet has only an embedded image and no vector paths; arrow tracing was skipped by rule",
+            }
+            return
         record["arrows_status"] = {"state": "ok", "count": len(entry["items"]),
                                    "anchors": len(items) + len(extra)}
         return
@@ -234,6 +245,118 @@ def _attach_arrows(record, slug, page, items, revision, plan_regions=None):
         record["arrows_status"] = {"state": "stale", "anchors": inside}
 
 
+def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
+    """线型层的结果与**分层状态**（只读盘，零模型调用）.
+
+    plan 在这里、而且只在这里起作用：它是**显示闸**，不进缓存签名。所以步骤3
+    重分类或 VIEW_VERSION bump 会立刻改变可见范围，却不会作废一页 80 秒的聚类。
+    闸门锚在末端 tip 而不是 callout 的文字框 —— callout 几乎都在图纸边缘 /
+    明细表里，只有引线伸进俯视图，按文字框卡会把绝大多数正确绑定误杀。
+
+    state 取值：
+      disabled            接缝没打开（LINETYPES=1 未设）
+      no-arrows           箭头层不当期，或这页没有任何末端 —— 没有可绑的对象
+      not-run             该跑却没有结果条目
+      failed              边车算失败，detail 里有原因
+      stale               有结果但签名/版本不当期，页面不会显示它
+      hidden-no-plan      算过了，但这页没有 plan 框 → 一条都不显示
+      hidden-outside-plan 有 plan 框，但没有末端落在里面（详图页的常态）
+      all-gate            这页的 callout 全是 gate —— gate 不找线，不是失败
+      no-line-type        末端在 plan 内、但它指的那段 ink 不属于任何线型
+                          （residual / 太远 / 组内答案够不着），也就是"这里
+                          确实没有可高亮的线型"，与"没算过"和"被 plan 挡住"
+                          是三件不同的事
+      ok                  有可见线型；visible 是被指到的线型编号
+
+    这几个「空」必须分得清：真实案例 civil_ifb_167263 P3 的末端**就在 plan
+    内**（in_plan=1），旧代码却报 hidden-outside-plan —— 照着那个状态去查
+    plan 分类是白费功夫，真实原因是 tip 底下 0.012 pt 那条 op 是 residual。
+    """
+    if not linetypes.ENABLED:
+        record["linetypes_status"] = {"state": "disabled"}
+        return
+    extra = _placement_anchors_for(slug, page)
+    arrows_sig = arrows.arrows_signature(items, revision, extra)
+    arrow_entry = store.load_json(
+        store.slug_dir(slug) / "arrows.json", {}).get(str(page))
+    if not arrows.has_current_arrows(arrow_entry, arrows_sig):
+        record["linetypes_status"] = {"state": "no-arrows"}
+        return
+    anchors = linetypes.anchors_of(arrow_entry)
+    if not anchors:
+        record["linetypes_status"] = {"state": "no-arrows"}
+        return
+    sig = linetypes.linetypes_signature(arrows_sig)
+    entry = linetypes.load_page(slug, page)
+    if isinstance(entry, dict) and entry.get("error"):
+        record["linetypes_status"] = {"state": "failed",
+                                     "detail": str(entry["error"])[:200]}
+        return
+    if not linetypes.has_current_linetypes(entry, sig):
+        record["linetypes_status"] = {
+            "state": "stale" if entry is not None else "not-run",
+            "targets": len(anchors)}
+        return
+
+    owners = linetypes.symbol_owners_of(
+        (store.load_json(store.slug_dir(slug) / "symbols.json", {})
+         .get(str(page)) or {}).get("result") or {})
+    payload = linetypes.page_payload(entry, plan_regions or [], items, owners)
+    record["linetypes"] = payload
+    page_info = payload.get("page") or {}
+    status = {"targets": len(anchors),
+              "bound": len(entry.get("used_all") or ()),
+              "clusters": page_info.get("line_types"),
+              "residual_ops": page_info.get("residual_ops"),
+              "seconds": page_info.get("seconds_cluster")}
+    if payload.get("needs_recompute"):
+        # 旧缓存按当时的分组裁剪过折线，换了分组口径之后新的胜出线型没有几何
+        # 可画。显式说出来 —— 静默画不出线是最误导的失败方式。
+        status["state"] = "needs-recompute"
+        status["needs_recompute"] = payload["needs_recompute"]
+    elif payload["visible"]:
+        status["state"] = "ok"
+        status["visible"] = payload["visible"]
+    else:
+        groups = payload.get("groups") or []
+        fence = [g for g in groups if g.get("scope") != "gate"]
+        # 逐层判：先看有没有非 gate 的组，再看它们的末端在不在 plan 内，
+        # 最后才是"在里面但那段 ink 不属于任何线型"。顺序反了就会像旧代码
+        # 那样把 residual 报成 plan 问题。
+        inside = sum(int(g.get("in_plan_count") or 0) for g in fence)
+        by_state = {}
+        for row in payload.get("bindings") or ():
+            if row.get("scope") == "gate":
+                continue
+            by_state[row.get("state")] = by_state.get(row.get("state"), 0) + 1
+        status["binding_states"] = by_state
+        if groups and not fence:
+            status["state"] = "all-gate"
+        elif not plan_regions:
+            status["state"] = "hidden-no-plan"
+        elif not inside:
+            status["state"] = "hidden-outside-plan"
+        else:
+            status["state"] = "no-line-type"
+            status["in_plan_targets"] = inside
+    record["linetypes_status"] = status
+
+
+# 上传体积上限。上传路径会把整份 PDF 同时持有在内存里（read() 一份 +
+# write_bytes 一份），所以这个数字直接决定最小机器规格。可用环境变量调，
+# 反代（Caddy 的 request_body max_size / nginx client_max_body_size）必须配同一个数，
+# 否则先被反代截断，用户拿到的是反代的 HTML 错误页而不是这里的 JSON。
+MAX_UPLOAD_MB = int(os.environ.get("FENCE_MAX_UPLOAD_MB", "512"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+@app.errorhandler(413)
+def _too_large(_e):
+    """Flask 默认的 413 是 HTML。前端只按 JSON 解 error 字段，不转的话
+    用户看到的是「解析失败」而不是「文件太大」。"""
+    return jsonify({"error": f"PDF too large (limit {MAX_UPLOAD_MB} MB)"}), 413
+
+
 def _cross_site_write_blocked():
     """Reject browser cross-site writes while keeping CLI/test clients usable."""
     if request.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
@@ -255,15 +378,48 @@ def _base_img_path(slug, page):
             / f"base_P{page}_{store.pdf_revision(store.pdf_path(slug))}.jpg")
 
 
+def _drop_stale_base(slug, page, keep):
+    """Delete this page's base images left over from earlier pdf_revisions.
+
+    ``pdf_revision`` carries the PDF's mtime, so re-uploading the same drawing
+    renames every base image and nothing ever removed the old ones.  Only files
+    for *this* page whose name is not the current one are touched -- no code
+    path can reach those, since the filename is always derived from the current
+    revision."""
+    try:
+        for old in store.slug_dir(slug).glob(f"base_P{page}_*.jpg"):
+            if old.name != keep.name:
+                old.unlink(missing_ok=True)
+    except OSError:
+        pass            # a reader may still hold the handle on Windows; retry next time
+
+
 def _ensure_base(slug, page):
     """Render + cache the page base image (render_pdf_page owns FITZ_LOCK)."""
+    pdf = store.pdf_path(slug)
+    if not pdf.is_file():
+        # Do this BEFORE _base_img_path: slug_dir() creates the directory, so an
+        # unknown slug used to leave an empty data/<slug>/ behind and then 500.
+        abort(404)
     f = _base_img_path(slug, page)
     if f.exists():
         with Image.open(f) as im:
             return f, im.size
-    img = render_pdf_page(store.pdf_path(slug), page - 1, dpi=600,
-                          max_px=BASE_LONG)
-    img.save(f, "JPEG", quality=JPEG_Q, optimize=True)
+    img = render_pdf_page(pdf, page - 1, dpi=600, max_px=BASE_LONG)
+    # Write to a temp name and rename into place.  A direct save leaves a
+    # permanently truncated file if the process dies mid-write (f.exists() is
+    # then true forever), and lets a concurrent reader send half a JPEG with a
+    # one-day Cache-Control on it.
+    tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+    try:
+        img.save(tmp, "JPEG", quality=JPEG_Q, optimize=True)
+        os.replace(tmp, f)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _drop_stale_base(slug, page, f)
     return f, img.size
 
 
@@ -280,6 +436,7 @@ def _overview_row(res, slug):
         revision = None
     directory = store.slug_dir(slug)
     symbol_cache = store.load_json(directory / "symbols.json", {})
+    arrow_cache = store.load_json(directory / "arrows.json", {})
     pages = []
     tot_added = tot_vlm = tot_cov = tot_sym = tot_plc = tot_stale = 0
     for p in range(1, page_count + 1):
@@ -289,8 +446,9 @@ def _overview_row(res, slug):
                           "sym": 0, "plc": 0, "err": None, "has_text": None,
                           "present": False})
             continue
-        a = len(rec.get("vec_added", []))
-        v = len(rec.get("vlm_items", []))
+        raw_a = len(rec.get("vec_added", []))
+        raw_v = len(rec.get("vlm_items", []))
+        a, v = raw_a, raw_v
         c = len(rec.get("vec_covered", []))
         items = store.items_of(rec)
         entry = symbol_cache.get(str(p)) if revision else None
@@ -305,12 +463,30 @@ def _overview_row(res, slug):
             tot_stale += len([s for s in entry["result"]["symbols"]
                               if isinstance(s, dict)])
         placements = sum(len(s.get("placements") or []) for s in symbols)
+        raw_result = (entry or {}).get("result") or {}
+        arrow_extra = []
+        for si, symbol in enumerate(raw_result.get("symbols") or []):
+            for pi, box in enumerate(symbol.get("placements") or []):
+                if isinstance(box, (list, tuple)) and len(box) == 4:
+                    arrow_extra.append((f"s{si}:{pi}", list(box)))
+        arrow_entry = arrow_cache.get(str(p)) if revision else None
+        arrow_current = bool(
+            revision and arrow_entry and arrows.has_current_arrows(
+                arrow_entry, arrows.arrows_signature(items, revision, arrow_extra)))
+        image_only = bool(arrow_current
+                          and arrow_entry.get("page_kind") == "image-only")
+        if arrow_current:
+            hidden = arrows.suppressed_unverified_duplicates(
+                items, arrow_entry.get("anchors"))
+            v -= sum(1 for index in hidden if index < raw_v)
+            a -= sum(1 for index in hidden if index >= raw_v)
         tot_added += a; tot_vlm += v; tot_cov += c
         tot_sym += len(symbols); tot_plc += placements
         pages.append({"page": p, "added": a, "vlm": v, "covered": c,
                       "sym": len(symbols), "plc": placements,
                       "err": rec.get("vlm_error"),
                       "has_text": bool(rec.get("has_text")),
+                      "image_only": image_only,
                       "present": True})
     status = job.get_job(slug) or {}
     # Prefer the live/session job stats; fall back to the summary persisted in
@@ -360,7 +536,14 @@ def _processing_row(slug, status):
 # -------------------------------------------------------------------- routes --
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # 禁缓存。模板这边开了 TEMPLATES_AUTO_RELOAD（第 47-48 行），改完立刻重渲染，
+    # 但**响应上一个缓存头都没有**时浏览器会按启发式规则自行缓存整份 HTML ——
+    # 而这一页的 JS 是内联的，于是前端改动看起来"没生效"，实际是压根没取到。
+    # 实测就这么误判过一次：服务端已经返回新代码，界面还是旧行为。
+    response = make_response(render_template("index.html"))
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.route("/favicon.ico")
@@ -476,7 +659,7 @@ def rerun(slug):
     if not store.pdf_path(slug).exists():
         return jsonify({"error": "project not found"}), 404
     if job.job_running(slug):
-        return jsonify({"error": "这个项目正在跑"}), 409
+        return jsonify({"error": "this project is in progress"}), 409
     body = request.get_json(silent=True) or {}
     target = body.get("target")
     if target is None:
@@ -543,7 +726,7 @@ def make_variant(slug):
     except Exception as e:                                     # noqa: BLE001
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 400
     if job.job_running(vslug):
-        return jsonify({"error": "这个对比运行正在跑", "slug": vslug}), 409
+        return jsonify({"error": "this comparison run is in progress", "slug": vslug}), 409
     target = body.get("target")
     if target is None:
         target = job.stored_target(slug)   # compare like-for-like
@@ -635,6 +818,10 @@ def page_data(slug, page):
             slug, page, items, revision)
         plan_boxes_now = plan_boxes
     _attach_arrows(record, slug, page, items, revision, plan_boxes_now)
+    # 线型层跟在箭头之后：它绑的就是箭头末端。plan 在这里只当显示闸。
+    _attach_linetypes(record, slug, page, items, revision, plan_boxes_now)
+    suppressed_items = arrows.suppressed_unverified_duplicates(
+        items, record.get("arrow_anchors"))
     placements = sum(len(s.get("placements") or [])
                      for s in symbols["symbols"])
     marker_codes = marker_code_indices(items, symbols.get("groups") or [],
@@ -657,6 +844,10 @@ def page_data(slug, page):
                     "record": record, "items": items,
                     "symbols": symbols, "dropped_symbols": dropped,
                     "plan_boxes": plan_boxes,
+                    # Preserve raw union indices/caches; the default viewer
+                    # hides only weak duplicate members rejected by arrow/text
+                    # ownership validation. Debug mode still renders them.
+                    "suppressed_items": sorted(suppressed_items),
                     # 其实是图例编码标记、不是独立 fence 文字的那些 item 下标。
                     # 只标记不删除：删 item 会让步骤② 的付费缓存签名失效（每页
                     # 重新付费），还会让 union index 错位。前端默认不把它们画进
@@ -666,11 +857,67 @@ def page_data(slug, page):
                     # 不要让前端把它显示成「没找到」
                     "symbols_stale": bool(symbols.get("stale")),
                     "stale_symbols": int(symbols.get("stale_symbols") or 0),
-                    "counts": {"text": len(items) - len(marker_codes),
+                    "counts": {"text": len(items)
+                               - len(marker_codes | suppressed_items),
                                "marker_codes": len(marker_codes),
                                "symbols": len(symbols["symbols"]),
                                "placements": placements,
                                "plan_groups": len(plan_boxes)}})
+
+
+@app.route("/api/linetypes_all/<slug>/<int:page>")
+def linetypes_all(slug, page):
+    """调试视图：这一页**全部**线型的几何 + residual ink（前端按需拉）.
+
+    为什么单独一个接口而不挂进 /api/page：正常视图只发被指到的那几个线型，
+    这是它能上前端的前提。全部线型是它的 1.8 倍（rapid_city_2 P11 实测
+    6.3 → 11.2 MB），塞进每次页面加载就是给所有人付调试的代价。
+
+    它回答的是「这个 callout 没找到线，到底是没聚出来还是聚出来了没被选中」——
+    正常视图里这两种原因看起来一模一样。所以除了全部线型，还发 residual：
+    不属于任何线型的 path ink。residual 里有那条线 = 没聚出来；某个线型盖着
+    那条线但末端没绑上 = 聚出来了没被选中。
+
+    state：
+      disabled      接缝没打开
+      no-arrows     箭头层不当期 / 这页没有末端 —— 主结果本身就没算
+      not-run       没有 .all.json（跑 tools/linetype_sidecar/
+                    verify_all_geometry.py 补）
+      stale         .all.json 的 sig 与当期主结果不符 —— 那是**另一次聚类**
+                    的几何，拿它下结论会得出关于别的结果的结论，所以不发
+      ok            types / residual 可用
+    """
+    if not store.is_valid_slug(slug):
+        return jsonify({"error": "bad slug"}), 400
+    if not linetypes.ENABLED:
+        return jsonify({"state": "disabled"})
+    res, stale_reason = _results_state(slug)
+    if res is None or stale_reason not in (None, "missing"):
+        return jsonify({"state": "no-arrows", "detail": stale_reason})
+    record = (res.get("pages") or {}).get(str(page)) or {}
+    # 并集索引口径：items_of(rec) = vlm_items ++ vec_added。arrows_signature
+    # 锚的就是这个列表，用别的口径算出来的签名一定对不上。
+    items = store.items_of(record)
+    revision = res.get("pdf_revision")
+    extra = _placement_anchors_for(slug, page)
+    arrows_sig = arrows.arrows_signature(items, revision, extra)
+    arrow_entry = store.load_json(
+        store.slug_dir(slug) / "arrows.json", {}).get(str(page))
+    if not arrows.has_current_arrows(arrow_entry, arrows_sig):
+        return jsonify({"state": "no-arrows"})
+    sig = linetypes.linetypes_signature(arrows_sig)
+    main_entry = linetypes.load_page(slug, page)
+    if not linetypes.has_current_linetypes(main_entry, sig):
+        return jsonify({"state": "no-arrows", "detail": "main result not current"})
+
+    all_entry = linetypes.load_all_page(slug, page)
+    if all_entry is None:
+        return jsonify({"state": "not-run"})
+    if all_entry.get("sig") != sig:
+        return jsonify({"state": "stale"})
+    payload = linetypes.all_payload(all_entry, main_entry)
+    payload["state"] = "ok"
+    return jsonify(payload)
 
 
 @app.route("/img/<slug>/<int:page>")
@@ -680,8 +927,13 @@ def img(slug, page):
         return "bad slug", 400
     try:
         f, _ = _ensure_base(slug, page)
+    except HTTPException:
+        raise                       # abort(404) from _ensure_base -- not a render failure
     except Exception as e:                                  # noqa: BLE001
-        return f"render failed: {e}", 500
+        # Detail goes to the log, not to the client: the exception text carries
+        # absolute filesystem paths.
+        print(f"[img] {slug} p{page} render failed: {e}", flush=True)
+        return "render failed", 500
     resp = send_file(f, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "public, max-age=86400"
     return resp

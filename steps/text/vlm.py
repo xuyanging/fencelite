@@ -87,26 +87,42 @@ def scan_page(pdf_path, page_index, model=None, timeout_ms=300_000,
     # a JSON array truncated by the model output cap.
     parsed = _parse_scan_response(resp.text)
     items = []
+    # 逐行的毛病只丢那一行，不赔上整页。实测 grand_island_casino P272 上模型
+    # 稳定地吐出一个只有 text、没有 box_2d 的行，三次重试全失败 —— 旧代码
+    # 直接抛错，那一页所有**正常**的行也跟着没了。缺框的行下游确实用不了
+    # （定位全靠 box_2d），但没有理由连累同页其它行。
+    #
+    # 注意这**不是**放宽整体判据：空响应 / 解析不出数组 / 被输出上限截断，
+    # 仍由 _parse_scan_response 一律 fail-closed —— "静默的 []" 会被当成
+    # 「这页没有围栏文字」缓存住，是最坏的失败方式。
+    dropped = []
     for row_index, it in enumerate(parsed):
+        why = None
         if not isinstance(it, dict):
-            raise RuntimeError(
-                f"Gemini scan row {row_index} must be an object")
-        if "text" not in it or not isinstance(it["text"], str):
-            raise RuntimeError(
-                f"Gemini scan row {row_index} has no valid text")
-        txt = it["text"].strip()
-        if not txt:
-            raise RuntimeError(
-                f"Gemini scan row {row_index} has empty text")
-        if "box_2d" not in it:
-            raise RuntimeError(
-                f"Gemini scan row {row_index} has no box_2d")
-        box = _coerce_box(it["box_2d"])
-        if box is None:
-            raise RuntimeError(
-                f"Gemini scan row {row_index} has an invalid box_2d")
-        items.append({"text": txt, "box_2d": box,
+            why = "not an object"
+        elif "text" not in it or not isinstance(it["text"], str):
+            why = "no valid text"
+        elif not it["text"].strip():
+            why = "empty text"
+        elif "box_2d" not in it:
+            why = "no box_2d"
+        else:
+            box = _coerce_box(it["box_2d"])
+            if box is None:
+                why = "invalid box_2d"
+        if why is not None:
+            dropped.append(f"row {row_index}: {why}")
+            continue
+        items.append({"text": it["text"].strip(), "box_2d": box,
                       "label": str(it.get("label", "other")).strip() or "other"})
+    # 全丢 = 响应整体不可信，不能当成「这页没有围栏文字」。
+    if parsed and not items:
+        raise RuntimeError(
+            f"Gemini scan: all {len(parsed)} rows unusable ({'; '.join(dropped[:5])})")
+    if dropped:
+        # 丢了行必须能被看见 —— 静默丢比报错更糟。走 stderr，作业日志里能查到。
+        print(f"  [vlm] dropped opped  {len(dropped)}  malformed rowsormed rows: {'; '.join(dropped[:5])}",
+              flush=True)
     return items, elapsed, usage_from_response(resp)
 
 

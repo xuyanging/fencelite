@@ -252,6 +252,29 @@ class TestStripContextSmoke(unittest.TestCase):
               f"segs={len(ctx['segs'])}")
 
 
+# strip_marker_codes 的 reason 标签：本仓是英文，5051 冻结语料是中文。
+# 同一个判据的两种写法归一到同一个 key。**只收录确实等价的对**——
+# 新出现的标签会原样落到 key 上，于是照样比得出差异，不会被这层悄悄吃掉。
+_REASON_ALIASES = {
+    "marker code: a short code inside a small closed shape (symbol territory)":
+        "marker-code-in-closed-shape",
+    "marker码：小闭合形状里的短码（符号地盘）":
+        "marker-code-in-closed-shape",
+    "inline token: lines approach from two opposite directions":
+        "inline-token-two-sided",
+    "嵌线token: 线条从两个相对方向逼近":
+        "inline-token-two-sided",
+    "marker code (vector row)": "marker-code-vector-row",
+    "marker码（矢量行）": "marker-code-vector-row",
+    "inline token (vector row)": "inline-token-vector-row",
+    "嵌线token（矢量行）": "inline-token-vector-row",
+}
+
+
+def _reason_key(reason):
+    return _REASON_ALIASES.get(reason, reason)
+
+
 @unittest.skipUnless(HAS_REF, f"reference data not found at {REF}")
 @unittest.skipUnless(HAS_VECGEOM, "core.vecgeom not available")
 class TestStripMarkerCodesParity(unittest.TestCase):
@@ -275,7 +298,7 @@ class TestStripMarkerCodesParity(unittest.TestCase):
                     "label": "other"}
                    for d in rec["debug"]["stripped"]]
         self.assertEqual(len(dropped), rec["codes_stripped"])
-        self.assertTrue(all("矢量行" not in d["reason"]
+        self.assertTrue(all("vector row" not in d["reason"]
                             for d in rec["debug"]["stripped"]))
         instances = [dict(it) for it in rec["vec_covered"]]
 
@@ -289,9 +312,13 @@ class TestStripMarkerCodesParity(unittest.TestCase):
         self.assertEqual(n, rec["codes_stripped"])
         self.assertEqual([key(it) for it in keep_v], [key(it) for it in kept])
         self.assertEqual(keep_i, instances)
-        self.assertEqual({(d["text"], tuple(d["box_2d"]), d["reason"])
+        # reason 只是给人看的调试标签，本仓已英文化，而冻结基准来自**未翻译的
+        # 5051 生产语料** —— 逐字比会把"标签换了语言"报成 parity 破了。
+        # 真正要证明的是「剥掉了同样的东西、且判据相同」，所以先把两边的标签
+        # 归一到同一个 key 再比：(text, box) 仍然严格相等，判据也仍然严格相等。
+        self.assertEqual({(d["text"], tuple(d["box_2d"]), _reason_key(d["reason"]))
                           for d in dbg.data["stripped"]},
-                         {(d["text"], tuple(d["box_2d"]), d["reason"])
+                         {(d["text"], tuple(d["box_2d"]), _reason_key(d["reason"]))
                           for d in rec["debug"]["stripped"]})
         print(f"  [strip] koch P4: dropped {n}, kept {len(keep_v)} vlm "
               f"({[it['text'] for it in keep_v if len(it['text']) <= 6]} "

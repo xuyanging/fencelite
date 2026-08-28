@@ -50,17 +50,17 @@ GEMINI_INLINE_BYTES_LIMIT = 90 * 1024 * 1024
 # Pro models are prompt-size-tiered at 200K prompt tokens; thinking tokens billed as output.
 # Order matters: this is also the dropdown order in the UI.
 PRICING = {
-    "gemini-3.1-pro-preview":      {"display": "Gemini 3.1 Pro (Preview)",   "note": "视觉最强",   "thr": 200_000, "in_low": 2.00, "in_high": 4.00, "out_low": 12.00, "out_high": 18.00},
-    "gemini-3-pro-preview":        {"display": "Gemini 3 Pro (Preview)",     "note": "旧版本",     "thr": 200_000, "in_low": 2.00, "in_high": 4.00, "out_low": 12.00, "out_high": 18.00},
-    "gemini-2.5-pro":              {"display": "Gemini 2.5 Pro",             "note": "上一代 Pro", "thr": 200_000, "in_low": 1.25, "in_high": 2.50, "out_low": 10.00, "out_high": 15.00},
-    "gemini-3.5-flash":            {"display": "Gemini 3.5 Flash",           "note": "快 / 中价",                  "flat": True, "in_low": 1.50, "out_low":  9.00},
-    "gemini-3-flash-preview":      {"display": "Gemini 3 Flash (Preview)",   "note": "快 / 价格未定",              "flat": True, "in_low": 1.50, "out_low":  9.00},
-    "gemini-2.5-flash":            {"display": "Gemini 2.5 Flash",           "note": "便宜 / 快",                  "flat": True, "in_low": 0.30, "out_low":  2.50},
-    "gemini-3.1-flash-lite":       {"display": "Gemini 3.1 Flash-Lite",      "note": "便宜 / 3.x",                 "flat": True, "in_low": 0.25, "out_low":  1.50},
-    "gemini-3.1-flash-lite-preview": {"display": "Gemini 3.1 Flash-Lite (Preview)", "note": "便宜 / 3.x preview", "flat": True, "in_low": 0.25, "out_low":  1.50},
-    "gemini-2.5-flash-lite":       {"display": "Gemini 2.5 Flash-Lite",      "note": "最便宜",                     "flat": True, "in_low": 0.10, "out_low":  0.40},
-    "gemini-2.0-flash":            {"display": "Gemini 2.0 Flash",           "note": "老一代",                     "flat": True, "in_low": 0.10, "out_low":  0.40},
-    "gemini-2.0-flash-lite":       {"display": "Gemini 2.0 Flash-Lite",      "note": "最老",                       "flat": True, "in_low": 0.075,"out_low":  0.30},
+    "gemini-3.1-pro-preview":      {"display": "Gemini 3.1 Pro (Preview)",   "note": "best vision",   "thr": 200_000, "in_low": 2.00, "in_high": 4.00, "out_low": 12.00, "out_high": 18.00},
+    "gemini-3-pro-preview":        {"display": "Gemini 3 Pro (Preview)",     "note": "older version",     "thr": 200_000, "in_low": 2.00, "in_high": 4.00, "out_low": 12.00, "out_high": 18.00},
+    "gemini-2.5-pro":              {"display": "Gemini 2.5 Pro",             "note": "previous Pro", "thr": 200_000, "in_low": 1.25, "in_high": 2.50, "out_low": 10.00, "out_high": 15.00},
+    "gemini-3.5-flash":            {"display": "Gemini 3.5 Flash",           "note": "fast / mid price",                  "flat": True, "in_low": 1.50, "out_low":  9.00},
+    "gemini-3-flash-preview":      {"display": "Gemini 3 Flash (Preview)",   "note": "fast / price TBD",              "flat": True, "in_low": 1.50, "out_low":  9.00},
+    "gemini-2.5-flash":            {"display": "Gemini 2.5 Flash",           "note": "cheap / fast",                  "flat": True, "in_low": 0.30, "out_low":  2.50},
+    "gemini-3.1-flash-lite":       {"display": "Gemini 3.1 Flash-Lite",      "note": "cheap / 3.x",                 "flat": True, "in_low": 0.25, "out_low":  1.50},
+    "gemini-3.1-flash-lite-preview": {"display": "Gemini 3.1 Flash-Lite (Preview)", "note": "cheap / 3.x preview", "flat": True, "in_low": 0.25, "out_low":  1.50},
+    "gemini-2.5-flash-lite":       {"display": "Gemini 2.5 Flash-Lite",      "note": "cheapest",                     "flat": True, "in_low": 0.10, "out_low":  0.40},
+    "gemini-2.0-flash":            {"display": "Gemini 2.0 Flash",           "note": "older generation",                     "flat": True, "in_low": 0.10, "out_low":  0.40},
+    "gemini-2.0-flash-lite":       {"display": "Gemini 2.0 Flash-Lite",      "note": "oldest",                       "flat": True, "in_low": 0.075,"out_low":  0.30},
 }
 
 # Anthropic Claude models, served through core/llm.py instead of google-genai.
@@ -69,8 +69,8 @@ PRICING = {
 # Appended after the Gemini literal so Gemini 3.1 Pro stays first in the UI order
 # and remains the default — selecting one of these is an explicit opt-in.
 PRICING.update({
-    "claude-sonnet-5": {"display": "Claude Sonnet 5", "note": "Anthropic / 对比", "provider": "anthropic", "flat": True, "in_low": 2.00, "out_low": 10.00},
-    "claude-opus-5":   {"display": "Claude Opus 5",   "note": "Anthropic / 最强", "provider": "anthropic", "flat": True, "in_low": 5.00, "out_low": 25.00},
+    "claude-sonnet-5": {"display": "Claude Sonnet 5", "note": "Anthropic / comparison", "provider": "anthropic", "flat": True, "in_low": 2.00, "out_low": 10.00},
+    "claude-opus-5":   {"display": "Claude Opus 5",   "note": "Anthropic / strongest", "provider": "anthropic", "flat": True, "in_low": 5.00, "out_low": 25.00},
 })
 
 

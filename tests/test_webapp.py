@@ -505,8 +505,10 @@ class IndexTests(WebappCase):
     def test_index_renders_single_page_ui(self):
         html = self.client.get("/").get_data(as_text=True)
         self.assertIn("fence_lite", html)
+        # "Only sheets with results" 曾是这里的标记，随统计框/状态栏一起删掉了。
+        # 换成仍然在页面上的同一块 UI（画廊的命中页计数）。
         for marker in ("#2563eb", "#7c3aed", "#16a34a", "#64748b",
-                       "只看有结果的页", "/api/page/"):
+                       "sheets with results", "/api/page/"):
             self.assertIn(marker, html)
 
     def test_favicon(self):

@@ -27,6 +27,7 @@
 """
 import hashlib
 import json
+import os
 import re
 import tempfile
 import time
@@ -74,8 +75,15 @@ def load_json(path, default):
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as exc:
+            # 别静默。symbols/view_types/arrows 都是整文件读-改-写，返回 default
+            # 之后第一个写回的页会把整份重写成只剩一页 —— 那时坏文件已经没了，
+            # 没有任何线索能说明发生过什么。
+            #
+            # 刻意**不**在这里给坏文件改名：读路径上不做写操作。
+            print(f"[store] {path} is not valid JSON ({exc}); "
+                  f"treating as absent - the file will be overwritten",
+                  flush=True)
     return default
 
 
@@ -94,6 +102,10 @@ def save_json(path, obj):
                 delete=False) as handle:
             tmp = Path(handle.name)
             json.dump(obj, handle, ensure_ascii=False, indent=1)
+            # replace 是原子的，但只对"已经落盘的字节"原子。不 fsync 的话，
+            # 断电或 OOM 之后可能留下一个长度正确、内容是空洞的文件。
+            handle.flush()
+            os.fsync(handle.fileno())
         for attempt in range(5):
             try:
                 tmp.replace(path)
@@ -129,10 +141,22 @@ def items_of(rec):
     调整拼接顺序或往中间插项 = 静默错位所有归属。
     没有 box_2d 的条目被丢弃（画不出来也没法当锚）。
     """
-    return [{"text": it.get("text", ""), "box_2d": it["box_2d"],
-             "label": it.get("label", ""), "tbl": bool(it.get("tbl"))}
-            for it in rec.get("vlm_items", []) + rec.get("vec_added", [])
-            if it.get("box_2d")]
+    out = []
+    for it in rec.get("vlm_items", []) + rec.get("vec_added", []):
+        if not it.get("box_2d"):
+            continue
+        row = {"text": it.get("text", ""), "box_2d": it["box_2d"],
+               "label": it.get("label", ""), "tbl": bool(it.get("tbl"))}
+        # Free provenance/evidence metadata.  sig_of intentionally ignores it
+        # so paid symbols do not rerun, while the arrow ownership stage can
+        # distinguish a decoded vector-backed callout from an unverified VLM
+        # box without reaching back into the three fusion buckets.
+        if "source" in it:
+            row["source"] = it.get("source")
+        if "vec_backed" in it:
+            row["vec_backed"] = bool(it.get("vec_backed"))
+        out.append(row)
+    return out
 
 
 def sig_of(items, revision=None):

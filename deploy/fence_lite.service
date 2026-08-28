@@ -1,0 +1,65 @@
+# fence_lite systemd 单元。装法见同目录 setup_ubuntu.sh。
+#
+# 路径按 /home/ubuntu/fence_lite2 写死。换目录的话这里、setup 脚本、反代三处一起改。
+[Unit]
+Description=fence_lite (six-stage pipeline: vec/judge/text/symbols/placements/arrows/linetypes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/fence_lite2
+EnvironmentFile=/home/ubuntu/fence_lite2/.env
+Environment=PYTHONUTF8=1
+Environment=PYTHONUNBUFFERED=1
+# glibc 的 arena 会攥着渲染峰值不还。实测把常驻 RSS 从 777M 压到 111M。
+Environment=MALLOC_ARENA_MAX=2
+
+# --- 两个接缝开关 ---
+# 都是模块级 os.environ.get(..., "0")，import 期定死。不设这两行的话作业照样报
+# done、progress=1.0、零 warning，盘上却少两个阶段 —— 这是最安静的一种失败。
+Environment=ARROWS=1
+Environment=LINETYPES=1
+
+# --- 边车解释器显式钉死 ---
+# arrows_signature 既不含 node 版本也不含 sidecar.mjs 摘要：换了解释器结果变了
+# 缓存**不会**失效。所以必须写死，不能靠 PATH 上碰巧是哪个。
+Environment=ARROWS_NODE=/home/ubuntu/.local/opt/node/bin/node
+Environment=LINETYPE_PYTHON=/home/ubuntu/fence_lite2/tools/linetype_sidecar/venv/bin/python
+
+# --- 并发旋钮全部显式给值 ---
+# core/hw.py 会按机器推，但它在容器里读到的是宿主规格，而且 clamp 的下限
+# (page_workers=2, cpu_budget=2) 在 2GB 机器上仍然偏高。显式给值是唯一可靠的办法。
+# 下面这组是 2 vCPU / 1.9GB 调试机的值，换机器要按实际重估：
+#   网络型阶段(TEXT/JUDGE/SYMBOLS/VIEW)每路在飞约 55MB，受模型延迟限制，不跟 CPU 走
+#   ARROWS 每路是 Node 进程，堆阶梯最高 6144MB，上限由**内存**决定
+#   LINETYPE 每页约 2GB
+Environment=VEC_WORKERS=1
+Environment=TEXT_WORKERS=4
+Environment=JUDGE_WORKERS=4
+Environment=SYMBOLS_WORKERS=4
+Environment=VIEW_WORKERS=4
+Environment=ARROWS_WORKERS=1
+Environment=LINETYPE_PAGE_WORKERS=1
+Environment=LINETYPE_CPU_BUDGET=2
+
+# -w 1 是硬约束，不是调优项：core.gemini.RECORDER 计费会话、job._PROC_LOCK、
+# _IO_LOCK、_VLM_LOCK 全是**进程级**的。多 worker 会让 symbols.json / vlm.json /
+# arrows.json 那些「整文件读-改-写」跨进程互相覆盖 —— 已付费的 raw 成批消失且零报错。
+# --timeout 900：/img 首渲是 600 DPI / 长边 5000px，且串在全局 FITZ_LOCK 后，
+# gunicorn 默认的 30s 会把 worker 杀掉，而 -w 1 下那等于整服务瞬断。
+ExecStart=/home/ubuntu/fence_lite2/venv/bin/gunicorn -w 1 --threads 4 \
+          --worker-class gthread --timeout 900 --graceful-timeout 60 \
+          --access-logfile - --error-logfile - \
+          -b 0.0.0.0:5051 wsgi:app
+# 线型边车用 start_new_session=True 脱离了服务进程组（POSIX 上要 killpg 才杀得掉
+# 孙进程，不建新组的话 killpg 会连 webapp 自己一起杀）。control-group 是唯一的
+# 孤儿兜底 —— 裸 nohup/screen 停服会留下抱着管道的边车进程。
+KillMode=control-group
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

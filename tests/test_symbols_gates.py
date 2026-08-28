@@ -60,7 +60,7 @@ class TestGeometryFirstGroupGate(unittest.TestCase):
         # 理由要说得出「它实际落在哪个 kind 的组里」
         self.assertIn("view", reason)
         self.assertIn("legend", reason)          # 模型声称的那个
-        self.assertIn("组内校验", reason)
+        self.assertIn("in-group check", reason)
 
     def test_geometry_in_legend_wins_over_a_view_group_index(self):
         """几何为准的另一面：group_index 指向 view，框在图例里 → 放行。"""
@@ -119,7 +119,7 @@ class TestOwnerFallback(unittest.TestCase):
         items = [_item([700, 600, 710, 690], "6' CHAIN LINK FENCE")]
         ok, reason = symbol_group_verdict(symbol, groups, items)
         self.assertFalse(ok)
-        self.assertIn("本页没有任何图例类组", reason)
+        self.assertIn("no legend-type group on this sheet", reason)
         self.assertEqual(filter_owned_group_symbols([symbol], groups, 1, items),
                          [])
 
@@ -158,7 +158,7 @@ class TestDeterministicDedupe(unittest.TestCase):
         self.assertEqual([s["text_index"] for s in kept], [7])
         self.assertEqual(len(dropped), 1)
         self.assertEqual(dropped[0]["text_index"], 10)
-        self.assertIn("重复", dropped[0]["reason"])
+        self.assertIn("duplicate", dropped[0]["reason"])
         self.assertIn("text_index=7", dropped[0]["reason"])
 
     def test_bare_code_first_still_loses(self):
@@ -228,7 +228,7 @@ class TestDeterministicDedupe(unittest.TestCase):
         view = symbols_dropped_view(entry, items)
         self.assertEqual(len(view["dropped"]), 1)
         self.assertEqual(view["dropped"][0]["text_index"], 10)
-        self.assertIn("重复", view["dropped"][0]["reason"])
+        self.assertIn("duplicate", view["dropped"][0]["reason"])
 
     def test_dropped_view_explains_a_geometry_drop(self):
         raw_symbols = [_sym(IN_LEGEND, 0), _sym(IN_VIEW, 0, group_index=1)]
@@ -239,7 +239,7 @@ class TestDeterministicDedupe(unittest.TestCase):
         self.assertEqual(len(view["dropped"]), 1)
         reason = view["dropped"][0]["reason"]
         self.assertIn("view", reason)
-        self.assertIn("组内校验", reason)
+        self.assertIn("in-group check", reason)
 
 
 # --------------------------------------------------- 4. 步骤②b 补扫结果合并

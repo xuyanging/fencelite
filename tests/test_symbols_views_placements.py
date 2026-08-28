@@ -305,7 +305,7 @@ class TestSymbolCachePredicates(unittest.TestCase):
         self.assertEqual(len(view["raw_symbols"]), 3)
         self.assertEqual(len(view["dropped"]), 2)
         self.assertIn("owner", view["dropped"][0]["reason"])
-        self.assertIn("组内校验", view["dropped"][1]["reason"])
+        self.assertIn("in-group check", view["dropped"][1]["reason"])
 
 
 # ------------------------------------------------------- 步骤3：视图分类

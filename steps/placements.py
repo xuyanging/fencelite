@@ -20,7 +20,7 @@ from steps.versions import PLACEMENT_VERSION
 # the rest of the stack use for "center inside this box".
 PLAN_PAD = 2
 
-LINE_NOTE = "line 暂不匹配（只标出图例样例）"
+LINE_NOTE = "line samples are not matched (only the legend sample is marked)"
 NO_PLAN_NOTE = "no_plan_view"
 
 # Written afresh on every run so a reused cache entry never keeps a stale

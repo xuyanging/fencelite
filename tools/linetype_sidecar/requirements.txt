@@ -1,0 +1,12 @@
+# 线型边车的独立环境。**绝对不要和宿主 venv 合并** —— 宿主钉 PyMuPDF 1.27.x，
+# 这里要 1.28.x，两个版本的 get_drawings() 输出不同。
+#
+# 这四个版本进 engine_digest()，而 engine_digest() 是线型缓存签名的一部分：
+# 装成别的版本 → 摘要变 → 全站线型缓存作废、每页重算约 100 s。
+# 数字来自开发机 venv 里的 dist-info 目录名，逐字抄。
+#
+# Python 必须是 3.10（原 venv 是 3.10.20）。
+pymupdf==1.28.2
+pypdf==6.14.2
+scipy==1.15.3
+numpy==2.2.6

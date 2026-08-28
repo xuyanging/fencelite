@@ -140,7 +140,7 @@ def _owner_item(symbol, items):
 
 
 def _kinds_text(kinds):
-    return "/".join(str(k) for k in kinds) if kinds else "任何分组之外"
+    return "/".join(str(k) for k in kinds) if kinds else "outside every group"
 
 
 # ---------------------------------------------------------------- 硬闸（过滤）
@@ -172,32 +172,32 @@ def symbol_group_verdict(symbol, groups, items=None):
     if any(k in SYMBOL_GROUP_KINDS for k in kinds):
         return True, None
 
-    prefix = "" if page_has_legend_group(groups) else "本页没有任何图例类组；"
+    prefix = "" if page_has_legend_group(groups) else "no legend-type group on this sheet; "
     if kinds:
         # 框中心确实落在某个组里，只是那个组不是图例类 —— 这正是「平面图里的
         # marker」：模型可以把 group_index 填成 legend，几何不会骗人。
         claimed = claimed_group_kind(symbol, groups)
         if claimed in SYMBOL_GROUP_KINDS:
             return False, (
-                f"{prefix}模型声称属于图例组(group_index → {claimed})，框中心"
-                f"几何却落在 {_kinds_text(kinds)} 组内 — 组内校验剥离（几何为准）")
+                f"{prefix}the model claims it belongs to legend group  claims it belongs to legend group  claims it belongs to legend group (group_index → {claimed}), box center x center x center "
+                f"but geometrically falls in eometrically falls in eometrically falls in  {_kinds_text(kinds)} in-group-group-group — stripped by the in-group check (geometry wins)the in-group check (geometry wins)the in-group check (geometry wins)")
         return False, (
-            f"{prefix}框中心几何落在 {_kinds_text(kinds)} 组内，不是 "
-            "legend/schedule/note_cluster — 组内校验剥离（几何为准）")
+            f"{prefix}box center geometrically falls in ter geometrically falls in  {_kinds_text(kinds)} , not   "
+            "legend/schedule/note_cluster — stripped by the in-group check (geometry wins)the in-group check (geometry wins)")
 
-    # 框中心不落在任何分组框里：模型的组框并不铺满整页，这时没有几何反证，
+    # box center falls in no group box: the model group in no group box: the model group 框并不铺满整页，这时没有几何反证，
     # 退回用 owner 文字的位置判断（符号一定挨着它的 owner 文字）。
     owner = _owner_item(symbol, items)
     if owner is None:
         return False, (
-            f"{prefix}框中心不在任何分组框内，也没有 owner 文字可兜底 — "
-            "组内校验剥离（几何为准）")
+            f"{prefix}box center is inside no group box and there is no owner text to fall back on — "
+            "stripped by the in-group check (geometry wins)")
     owner_kinds = containing_group_kinds(owner.get("box_2d"), groups)
     if any(k in SYMBOL_GROUP_KINDS for k in owner_kinds):
         return True, None
     return False, (
-        f"{prefix}框中心不在任何分组框内；退回 owner 文字位置，owner 落在 "
-        f"{_kinds_text(owner_kinds)} — 组内校验剥离（几何为准）")
+        f"{prefix}box center is inside no group box; fell back to the owner text position, whose owner lands in  fell back to the owner text position, whose owner lands in  "
+        f"{_kinds_text(owner_kinds)} — stripped by the in-group check (geometry wins)the in-group check (geometry wins)")
 
 
 def symbol_in_allowed_group(symbol, groups, items=None):
@@ -338,8 +338,8 @@ def dedupe_symbols(symbols, items=None):
         for loser in ranked[1:]:
             dropped.append({
                 **rows[loser],
-                "reason": ("与另一个 symbol 框重复（同一个样例框被配给了多个"
-                           f"文字），已保留描述行那条(text_index={win_ti})"),
+                "reason": ("duplicate of another symbol box (one sample box assigned to several"
+                           f"text rows); kept the description row(text_index={win_ti})"),
             })
     return [rows[i] for i in range(len(rows)) if i in keep_index], dropped
 
@@ -375,8 +375,8 @@ def classify_symbols(symbols, groups, item_count, items=None,
         if isinstance(text_index, bool) or not isinstance(text_index, int) \
                 or not 0 <= text_index < item_count:
             dropped.append({**symbol,
-                            "reason": "无有效归属文字(text_index) — "
-                                      "硬性 owner 校验剥离"})
+                            "reason": "no valid owner text(text_index) — "
+                                      "stripped by the hard owner check"})
             continue
         ok, reason = symbol_group_verdict(symbol, groups, items)
         if not ok:
@@ -866,16 +866,16 @@ def symbols_dropped_view(entry, items=None):
         ti = s.get("text_index")
         box = s.get("box_2d")
         if isinstance(ti, bool) or not isinstance(ti, int) or ti < 0:
-            reason = "无有效归属文字(text_index) — 硬性 owner 校验剥离"
+            reason = "no valid owner text(text_index) — stripped by the hard owner check"
         else:
             ok, gate_reason = symbol_group_verdict(s, groups, items)
             if not ok:
                 reason = gate_reason
             elif _valid_box(box) and _dup_key(box) in kept_boxes:
-                reason = ("与另一个 symbol 框重复（同一个样例框被配给了多个"
-                          "文字），已保留描述行那条"
+                reason = ("duplicate of another symbol box (one sample box assigned to several"
+                          "text rows); kept the description row"
                           f"(text_index={kept_boxes[_dup_key(box)]})")
             else:
-                reason = "未通过当前 owner/组内/去重硬校验"
+                reason = "failed the current owner / in-group / dedup hard checks"
         dropped.append({**s, "reason": reason})
     return {"raw_symbols": raw.get("symbols") or [], "dropped": dropped}

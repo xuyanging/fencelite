@@ -1,5 +1,19 @@
-flask>=3.0
-PyMuPDF>=1.24
-google-genai>=0.3.0
-Pillow>=10.0.0
-anthropic>=0.60.0
+# 钉死版本，不用范围。理由不是洁癖：
+#   * PyMuPDF 的 page.get_drawings() 输出跨版本会变 → core/vecgeom.py 的图元跟着变
+#     → placement 框静默位移。而 sig_of 只签 (text, box_2d) + pdf_revision，**不含
+#     任何库版本**，所以这种差异既不失效缓存也不报 stale，只会悄悄给出错位的结果。
+#   * 这里的数字是 2026-08-28 在开发机实测装着的版本（pip freeze），云上必须一致。
+flask==3.1.3
+Werkzeug==3.1.8
+PyMuPDF==1.27.2.3
+Pillow==12.2.0
+google-genai==2.7.0
+numpy==2.2.6
+
+# 生产 WSGI 服务器。wsgi.py 顶部一直写着 gunicorn 命令，但它从来不在这里，
+# 照 README 装完直接跑会落到 werkzeug 开发服务器上。
+gunicorn==23.0.0
+
+# 只有切到 Claude provider 时才需要（core/gemini.py 里是局部 import）。
+# 开发机上根本没装，所以不钉版本、也不设下限装不上就算了。
+# anthropic>=0.60.0

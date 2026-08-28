@@ -18,8 +18,11 @@ callout 检测（content stream 解析 → 顺序分段 → 引线拓扑恢复 �
 import hashlib
 import json
 import os
+import shutil
+import re
 import subprocess
 import tempfile
+import unicodedata
 from pathlib import Path
 
 import fitz
@@ -36,26 +39,69 @@ ENABLED = os.environ.get("ARROWS", "0") not in ("0", "", "false", "no", "off")
 PLAN_GATE = os.environ.get("ARROWS_PLAN_GATE", "0") not in ("0", "", "false", "no", "off")
 
 # 改箭头算法语义时 bump，让 arrows.json 重算。
-ARROWS_VERSION = 10
+ARROWS_VERSION = 17
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 _SIDECAR = _BASE_DIR / "tools" / "arrow_sidecar" / "sidecar.mjs"
-_NODE = Path(os.environ.get(
-    "ARROWS_NODE", Path.home() / ".local" / "opt" / "node" / "bin" / "node"))
+
+
+def _find_node():
+    """按顺序找 node：显式 env → 本机自装目录 → PATH → 裸名。
+
+    home 那条排在 which() 前面是刻意的：arrows_signature 既不含 node 版本也不含
+    sidecar.mjs 摘要，换解释器结果变了缓存**不会**失效。所以宁可保持既有选择，
+    也不要让 PATH 上碰巧另一个版本悄悄接管。
+
+    Path.home() 单独 try：容器里 HOME 未设且 uid 不在 /etc/passwd 时它会抛
+    RuntimeError，而 job.py 是无条件 import 本模块的 —— 那会让整个服务起不来。
+    """
+    explicit = os.environ.get("ARROWS_NODE", "").strip()
+    if explicit:
+        return Path(explicit)
+    try:
+        local = Path.home() / ".local" / "opt" / "node" / "bin" / "node"
+        for candidate in (local, local.with_suffix(".exe")):
+            if candidate.exists():
+                return candidate
+    except (RuntimeError, OSError):
+        pass
+    return Path(shutil.which("node") or "node")
+
+
+_NODE = _find_node()
 
 # 单页超时。重页实测 ~11 s（整份 22 MB PDF），留足余量。
 _TIMEOUT = int(os.environ.get("ARROWS_TIMEOUT", "600"))
 # 逐级加堆。绝大多数页 384 MB 够用（实测轻页峰值 ~120 MB）；重页会 OOM，
 # 于是加到 768（实测 rapid_city P27 165,913 ops 需要 ~595 MB RSS），仍不够再到
-# 1536。宁可为个别页多花一次解析，也不接受「静默无结果」——空结果和没算过
-# 在下游是完全不同的两件事。
-_HEAP_LADDER = [int(v) for v in
-                os.environ.get("ARROWS_HEAP_LADDER", "384,768,1536").split(",")]
-# 超预算页的放宽档：默认预算是 1 GiB 主机档，只在重试时放宽。
-_BUDGET_RETRY = {"maxSceneOps": 1_000_000, "maxPathSegments": 8_000_000,
-                 "maxDecodedBytes": 128 * 1024 * 1024,
-                 "maxSourceLength": 128 * 1024 * 1024,
-                 "maxSegmentsPerPath": 400_000}
+# 1536、3072、6144。宁可为个别页多花几次解析，也不接受「静默无结果」——
+# 空结果和没算过在下游是完全不同的两件事。
+_HEAP_LADDER = [int(v) for v in os.environ.get(
+    "ARROWS_HEAP_LADDER", "384,768,1536,3072,6144").split(",")]
+# 超预算页的放宽阶梯。**堆和预算是两个独立的失败原因**，所以各走各的梯子：
+# OOM 只加堆，PAGE_TOO_LARGE 加预算（并同时加一档堆，因为更多线段本身就更吃内存）。
+#
+# 为什么要加到这么高：lenexa_fuel_station P34（63,698 条 drawings / 71,104 个
+# item / 5.9 MB content stream）在旧的两档预算下一律被拒（解析出的路径线段
+# 超过 2,000,000 与 8,000,000 两条上限，错误里明写「包含裁剪路径」），而实测
+# 把上限提到 6400 万之后，它在 heap=1536 MB 下 **5.4 秒**就算完、找到 33 个
+# automatic callout。也就是说这页一点都不难算，纯粹是预算把它挡在门外。
+# 本机 16 核 / 61 GB，宁可为这种页多花几秒，也不要白丢一页结果。
+_BUDGET_LADDER = [
+    None,                                  # 先用边车自己的默认预算
+    {"maxSceneOps": 1_000_000, "maxPathSegments": 8_000_000,
+     "maxDecodedBytes": 128 * 1024 * 1024,
+     "maxSourceLength": 128 * 1024 * 1024,
+     "maxSegmentsPerPath": 400_000},
+    {"maxSceneOps": 8_000_000, "maxPathSegments": 64_000_000,
+     "maxDecodedBytes": 512 * 1024 * 1024,
+     "maxSourceLength": 512 * 1024 * 1024,
+     "maxSegmentsPerPath": 2_000_000},
+    {"maxSceneOps": 32_000_000, "maxPathSegments": 256_000_000,
+     "maxDecodedBytes": 2048 * 1024 * 1024,
+     "maxSourceLength": 2048 * 1024 * 1024,
+     "maxSegmentsPerPath": 8_000_000},
+]
 
 
 def arrows_signature(items, revision, extra_anchors=None):
@@ -65,6 +111,17 @@ def arrows_signature(items, revision, extra_anchors=None):
     它必须进签名：放置变了而文字没变时，箭头结果同样要重算。
     """
     base = sig_of(items, revision)
+    # sig_of intentionally signs only text + box because most downstream
+    # stages are label-agnostic.  Arrow recovery is not: callout/vector text
+    # may use the spatial fallback while titles, notes and legend rows must not.
+    # Include the label vector explicitly so a relabel cannot reuse arrows that
+    # were produced under a different eligibility decision.
+    label_digest = hashlib.sha1(json.dumps(
+        [[str((item or {}).get("label") or ""),
+          str((item or {}).get("source") or ""),
+          bool((item or {}).get("vec_backed"))] for item in items],
+        ensure_ascii=False).encode()).hexdigest()[:12]
+    base = f"{base}+l{label_digest}"
     if extra_anchors:
         digest = hashlib.sha1(json.dumps(
             [[str(k), list(b)] for k, b in extra_anchors],
@@ -91,8 +148,264 @@ def sidecar_available():
     return _SIDECAR.exists() and _NODE.exists()
 
 
+def page_geometry_status(pdf_path, page_index):
+    """Classify pages whose drawing is only a large embedded raster image.
+
+    Small logos do not make an otherwise text-only page a scan.  A page is
+    marked image-only only when MuPDF exposes no vector paths at all and one
+    large image (or a set of image tiles) covers most of the sheet.
+    """
+    with FITZ_LOCK:
+        doc = fitz.open(pdf_path)
+        try:
+            if not 0 <= int(page_index) < doc.page_count:
+                raise ValueError(
+                    f"page {page_index} out of range (total {doc.page_count})")
+            page = doc[int(page_index)]
+            drawings = page.get_drawings()
+            images = page.get_images(full=True)
+            page_area = max(1.0, float(page.rect.width * page.rect.height))
+            coverages = []
+            seen = set()
+            for image in images:
+                xref = int(image[0])
+                # The same XObject can be painted more than once; each placement
+                # matters, but exact duplicate rects must not inflate coverage.
+                for rect in page.get_image_rects(xref):
+                    clipped = rect & page.rect
+                    token = tuple(round(float(v), 3) for v in clipped)
+                    if token in seen or clipped.is_empty:
+                        continue
+                    seen.add(token)
+                    coverages.append(float(clipped.width * clipped.height)
+                                     / page_area)
+        finally:
+            doc.close()
+    largest = max(coverages, default=0.0)
+    total = min(1.0, sum(coverages))
+    image_only = not drawings and bool(coverages) and (
+        largest >= 0.45 or total >= 0.75)
+    return {
+        "state": "image-only" if image_only else "vector",
+        "vector_paths": len(drawings),
+        "images": len(coverages),
+        "image_coverage": round(max(largest, total), 3),
+    }
+
+
+def _stroke_token(stroke):
+    """A direction-independent, stable token for one page-frame polyline."""
+    try:
+        points = tuple((round(float(p[0]), 2), round(float(p[1]), 2))
+                       for p in stroke if len(p) >= 2)
+    except (TypeError, ValueError):
+        return None
+    if len(points) < 2:
+        return None
+    reverse = tuple(reversed(points))
+    return min(points, reverse)
+
+
+def _point_distance(left, right):
+    try:
+        return ((float(left[0]) - float(right[0])) ** 2
+                + (float(left[1]) - float(right[1])) ** 2) ** .5
+    except (TypeError, ValueError, IndexError):
+        return float("inf")
+
+
+def _stroke_endpoints(strokes):
+    points = []
+    for stroke in strokes or []:
+        if not isinstance(stroke, (list, tuple)) or len(stroke) < 2:
+            continue
+        for point in (stroke[0], stroke[-1]):
+            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                points.append(point)
+    return points
+
+
+def _supplement_touches_current(current, supplement, tolerance=1.5):
+    """Require a supplemental component to share an authored endpoint/root."""
+    old = _stroke_endpoints(current.get("leader_strokes") or [])
+    new = _stroke_endpoints(supplement.get("leader_strokes") or [])
+    if not old or not new:
+        return True
+    return any(_point_distance(left, right) <= tolerance
+               for left in old for right in new)
+
+
+def _is_internal_terminal(tip, strokes, tolerance=1.1):
+    """A terminal has one outgoing ray; a continued line/junction has >=2."""
+    rays = []
+    for stroke in strokes or []:
+        if not isinstance(stroke, (list, tuple)):
+            continue
+        for left, right in zip(stroke, stroke[1:]):
+            for near, far in ((left, right), (right, left)):
+                if _point_distance(tip, near) > tolerance:
+                    continue
+                try:
+                    dy = float(far[0]) - float(near[0])
+                    dx = float(far[1]) - float(near[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                length = (dy * dy + dx * dx) ** .5
+                if length <= 1e-6:
+                    continue
+                ray = (dy / length, dx / length)
+                # Repainted/duplicate strokes in the same direction are one
+                # topological ray.  Opposite directions remain distinct.
+                if not any(ray[0] * old[0] + ray[1] * old[1] > .94
+                           for old in rays):
+                    rays.append(ray)
+    return len(rays) >= 2
+
+
+def _has_arrowhead(entry):
+    return any(isinstance(row, dict)
+               and row.get("terminal_kind") == "arrowhead"
+               for row in ((entry or {}).get("targets") or []))
+
+
+def _has_new_target(current, supplement, tolerance=3.0):
+    old_tips = [row.get("tip") for row in (current.get("targets") or [])
+                if isinstance(row, dict)]
+    for row in supplement.get("targets") or []:
+        if not isinstance(row, dict):
+            continue
+        tip = row.get("tip")
+        if not old_tips or all(_point_distance(tip, old) > tolerance
+                               for old in old_tips):
+            return True
+    return False
+
+
+def _point_to_segment_distance(point, left, right):
+    """Euclidean distance from one page-frame point to a line segment."""
+    try:
+        py, px = float(point[0]), float(point[1])
+        ay, ax = float(left[0]), float(left[1])
+        by, bx = float(right[0]), float(right[1])
+    except (TypeError, ValueError, IndexError):
+        return float("inf")
+    dy, dx = by - ay, bx - ax
+    denom = dy * dy + dx * dx
+    if denom <= 1e-12:
+        return ((py - ay) ** 2 + (px - ax) ** 2) ** .5
+    t = max(0.0, min(1.0, ((py - ay) * dy + (px - ax) * dx) / denom))
+    qy, qx = ay + t * dy, ax + t * dx
+    return ((py - qy) ** 2 + (px - qx) ** 2) ** .5
+
+
+def _bare_supplement_crosses_head(current, supplement, tolerance=4.0):
+    """Whether an arrowless trace merely runs through an existing head."""
+    tips = [row.get("tip") for row in (current.get("targets") or [])
+            if isinstance(row, dict)
+            and row.get("terminal_kind") == "arrowhead"]
+    for stroke in supplement.get("leader_strokes") or []:
+        if not isinstance(stroke, (list, tuple)):
+            continue
+        for left, right in zip(stroke, stroke[1:]):
+            if any(_point_to_segment_distance(tip, left, right) <= tolerance
+                   for tip in tips):
+                return True
+    return False
+
+
+def _merge_arrow_entry(current, supplement):
+    """Merge a connected recovery component into an incomplete result.
+
+    The authored sidecar remains authoritative.  A second detector may extend
+    a free terminal to its real arrowhead or recover branches that share the
+    same root.  A disconnected nearby line is a different callout and is
+    rejected.  Strokes are retained; a free target that becomes an internal
+    junction is removed because it is no longer a terminal.
+    """
+    if not isinstance(current, dict):
+        return supplement
+    if not isinstance(supplement, dict):
+        return current
+    # Once a real head exists, repainting the same branch in a second vector
+    # representation is not a recovery.  It only thickens the highlight and
+    # can drag neighbouring geometry into the result.  Continue only when the
+    # supplement contributes a genuinely distinct terminal.
+    if _has_arrowhead(current) and not _has_new_target(current, supplement):
+        return current
+    # The endpoint graph can trace the same authored branch through a filled
+    # marker and continue into glyph/linework beyond it, yielding a fake bare
+    # target after a real arrowhead.  A genuinely separate bare branch may
+    # still merge when it diverges at the shared root; only a trace that
+    # physically crosses the existing semantic head is rejected.
+    if (_has_arrowhead(current) and not _has_arrowhead(supplement)
+            and _bare_supplement_crosses_head(current, supplement)):
+        return current
+    if not _supplement_touches_current(current, supplement):
+        return current
+
+    merged = dict(current)
+    for field in ("leader_strokes", "arrow_strokes"):
+        strokes = list(current.get(field) or [])
+        seen = {token for token in (_stroke_token(row) for row in strokes)
+                if token is not None}
+        for row in supplement.get(field) or []:
+            token = _stroke_token(row)
+            if token is not None and token not in seen:
+                strokes.append(row)
+                seen.add(token)
+        merged[field] = strokes
+
+    # A second detector often describes the same terminal with a slightly
+    # different box.  Upgrade coincident terminals and append genuinely new
+    # branch ends only.
+    targets = [dict(row) for row in (current.get("targets") or [])
+               if isinstance(row, dict)]
+    for row in supplement.get("targets") or []:
+        if not isinstance(row, dict):
+            continue
+        tip = row.get("tip")
+        owner = None
+        if isinstance(tip, (list, tuple)) and len(tip) >= 2:
+            for index, old in enumerate(targets):
+                old_tip = old.get("tip")
+                if not (isinstance(old_tip, (list, tuple))
+                        and len(old_tip) >= 2):
+                    continue
+                try:
+                    distance = ((float(tip[0]) - float(old_tip[0])) ** 2
+                                + (float(tip[1]) - float(old_tip[1])) ** 2) ** .5
+                except (TypeError, ValueError):
+                    continue
+                if distance <= 3.0:
+                    owner = index
+                    break
+        if owner is None:
+            targets.append(dict(row))
+        elif (row.get("terminal_kind") == "arrowhead"
+              and targets[owner].get("terminal_kind") != "arrowhead"):
+            targets[owner] = dict(row)
+    # A sidecar free-end can be the elbow where the endpoint graph continues
+    # to a real arrowhead.  Once two distinct rays meet there it is an internal
+    # point, not an additional target box.  Keep every stroke, but remove the
+    # stale semantic endpoint.
+    merged["targets"] = [
+        row for row in targets
+        if (row.get("terminal_kind") == "arrowhead"
+            or not _is_internal_terminal(
+                row.get("tip"), merged.get("leader_strokes") or []))
+    ]
+
+    if (current.get("confidence") != "high"
+            and supplement.get("confidence") == "high"):
+        merged["confidence"] = "high"
+    notes = [str(value) for value in (current.get("note"),
+                                      supplement.get("note")) if value]
+    merged["note"] = " + ".join(dict.fromkeys(notes))
+    return merged
+
+
 def find_page_arrows(pdf_path, page_index, items, *, plan_regions=None,
-                     extra_anchors=None, dbg=None):
+                     extra_anchors=None, dbg=None, return_diagnostics=False):
     """一页里为每个文字锚找箭头 / 引线。
 
     参数
@@ -111,13 +424,13 @@ def find_page_arrows(pdf_path, page_index, items, *, plan_regions=None,
       int 键 = 文字锚的 union index；str 键 = extra_anchors 传进来的 key。
     """
     if not items:
-        return {}
+        return ({}, {}) if return_diagnostics else {}
     # 取景开启时才 fail-closed（与 steps.views.plan_boxes 的下游约定一致：
     # 分类缺失就一个结果都不给）。关闭时不看 plan，任何框都去找。
     if PLAN_GATE and not plan_regions:
         if dbg:
             dbg.note("arrows: no plan regions — fail-closed, skipped page")
-        return {}
+        return ({}, {}) if return_diagnostics else {}
     # 取景判断先在这里做：纯坐标比较，零成本。落在 plan 外的锚本来就拿不到
     # 箭头，没必要为它们启动边车、解析整页、再跑一遍全页检测——实测一页要
     # 14-24 s。真实图纸里多数文字锚在标题栏 / 明细表 / 图例里，一页 12 个锚
@@ -131,7 +444,7 @@ def find_page_arrows(pdf_path, page_index, items, *, plan_regions=None,
             if dbg:
                 dbg.note(f"arrows: all {len(anchors)} anchors outside plan "
                          "views, sidecar not started")
-            return {}
+            return ({}, {}) if return_diagnostics else {}
     else:
         inside = anchors
 
@@ -172,16 +485,52 @@ def find_page_arrows(pdf_path, page_index, items, *, plan_regions=None,
             # 见边车里 arrowheadOnly 的说明。
             "anchor_kinds": ["placement" if isinstance(key, str) else "text"
                              for key, _box in inside],
+            # The spatial marked-leader fallback is label-aware: table/title/
+            # legend text never gets a geometry-only association.  Text and
+            # labels therefore belong to this stage's cache identity (see
+            # arrows_signature) and travel beside every anchor.
+            "anchor_labels": [
+                "placement" if isinstance(key, str)
+                else str((items[int(key)] or {}).get("label") or "")
+                for key, _box in inside
+            ],
+            "anchor_texts": [
+                "" if isinstance(key, str)
+                else str((items[int(key)] or {}).get("text") or "")
+                for key, _box in inside
+            ],
+            # A decoded vector instance is strong independent evidence that a
+            # supplied box really owns the nearby wording.  The sidecar uses
+            # this only to reject geometry-only borrowing by an unbacked,
+            # text-less VLM hallucination; normal automatic/ROI ownership and
+            # every vec-backed outline callout keep their existing behaviour.
+            "anchor_vec_backed": [
+                False if isinstance(key, str)
+                else bool((items[int(key)] or {}).get("vec_backed"))
+                for key, _box in inside
+            ],
             # 取景关闭时不传区域：边车对空列表的语义就是「不过滤」。
             "plan_regions": ([list(box) for box in plan_regions]
                              if PLAN_GATE else []),
         }
         payload = None
         last = None
-        for attempt, heap in enumerate(_HEAP_LADDER):
-            # 上一轮是「超预算」而不是 OOM 时，放宽预算再试；否则只加堆。
-            if last == "PAGE_TOO_LARGE":
-                job["budget"] = _BUDGET_RETRY
+        detail = None
+        heap_index = 0
+        budget_index = 0
+        attempts = 0
+        # 两个梯子各自升级：OOM 只加堆，PAGE_TOO_LARGE 加预算并跟着加一档堆。
+        # 上限是两条梯子长度之和，防止某种反复交替把循环拖成无限。
+        while (heap_index < len(_HEAP_LADDER)
+               and budget_index < len(_BUDGET_LADDER)
+               and attempts < len(_HEAP_LADDER) + len(_BUDGET_LADDER)):
+            attempts += 1
+            heap = _HEAP_LADDER[heap_index]
+            budget = _BUDGET_LADDER[budget_index]
+            if budget:
+                job["budget"] = budget
+            else:
+                job.pop("budget", None)
             proc = subprocess.run(
                 [str(_NODE), f"--max-old-space-size={heap}",
                  "--optimize-for-size", str(_SIDECAR)],
@@ -199,11 +548,17 @@ def find_page_arrows(pdf_path, page_index, items, *, plan_regions=None,
                     payload = parsed
                     break
                 last = parsed.get("code")
+                # 边车的解释（哪条上限、超了多少）是排查这类页唯一的线索，
+                # 必须留到最终的错误里 —— 只报「走完梯子」等于把原因丢掉。
+                detail = parsed.get("error")
                 if last != "PAGE_TOO_LARGE":
                     raise RuntimeError(
-                        f"arrow sidecar {last}: {parsed.get('error')}")
+                        f"arrow sidecar {last}: {detail}")
+                budget_index += 1
+                heap_index = min(heap_index + 1, len(_HEAP_LADDER) - 1)
                 if dbg:
-                    dbg.note(f"arrows: over budget at heap={heap}, widening")
+                    dbg.note(f"arrows: over budget at heap={heap}, "
+                             f"widening to budget rung {budget_index}")
                 continue
             oom = (proc.returncode in (134, -6)
                    or "heap out of memory" in proc.stderr.lower())
@@ -212,23 +567,34 @@ def find_page_arrows(pdf_path, page_index, items, *, plan_regions=None,
                     f"arrow sidecar exit {proc.returncode}: "
                     f"{proc.stderr.strip()[:400]}")
             last = "OOM"
+            heap_index += 1
             if dbg:
                 dbg.note(f"arrows: OOM at heap={heap} MB, retrying higher")
         if payload is None:
             # 走完梯子仍算不出来。这必须是一个显式失败，让上层记警告并把这页
             # 标成未完成 —— 绝不能写一个空结果冒充「这页没有引线」。
+            # 边车的原话一并带出去：只报「走完梯子」的话，到底是哪条上限、
+            # 超了多少全都看不到，排查时只能靠猜。
             raise RuntimeError(
-                f"arrow sidecar exhausted heap ladder {_HEAP_LADDER} "
-                f"(last={last})")
+                f"arrow sidecar exhausted ladders (heap={_HEAP_LADDER}, "
+                f"budget rungs={len(_BUDGET_LADDER)}, last={last})"
+                + (f": {str(detail)[:300]}" if detail else ""))
         if dbg:
             dbg.note("arrows: " + json.dumps(payload.get("page", {})))
 
     out = {}
+    anchor_diagnostics = {}
     resolved = set()
     for row in payload.get("results", []):
+        index = inside[int(row["index"])][0]  # 子集下标 → union / placement key
+        if isinstance(index, int):
+            anchor_diagnostics[index] = {
+                "source": str(row.get("source") or ""),
+                "carrier_is_text": bool(row.get("carrier_is_text")),
+                "has_leader": bool(row.get("has_leader")),
+            }
         if not row.get("has_leader"):
             continue
-        index = inside[int(row["index"])][0]   # 子集下标 → union index / 放置 key
         resolved.add(index)
         targets = row.get("targets") or []
         out[index] = {
@@ -242,6 +608,46 @@ def find_page_arrows(pdf_path, page_index, items, *, plan_regions=None,
             "note": f"{row.get('source')} · {row.get('leader_count')} leader"
                     f" · {len(targets)} target",
         }
+
+    # Second vector pass: ignore PDF paint order and walk an endpoint graph
+    # from each supplied text box.  This may add a real second branch to an
+    # already-headed result, but _merge_arrow_entry accepts it only when the
+    # two components share an authored endpoint/root.  Thus valid multi-leader
+    # callouts remain recoverable while a nearby, disconnected dimension or
+    # non-fence note cannot leak into the fence result.
+    text_anchors = []
+    for key, box in inside:
+        if not isinstance(key, int):
+            continue
+        item = items[key] or {}
+        diagnostic = anchor_diagnostics.get(key) or {}
+        # Apply the same evidence gate to the order-independent fallback as
+        # the sidecar spatial pass.  Otherwise it can correctly trace a real
+        # neighbouring annotation's triangle but assign it to an unbacked VLM
+        # hallucination whose supplied box contains no decoded text at all.
+        if (str(item.get("source") or "").lower() == "vlm"
+                and not bool(item.get("vec_backed"))
+                and diagnostic.get("source") == "text-only"
+                and not bool(diagnostic.get("carrier_is_text"))):
+            continue
+        text_anchors.append((key, box, item.get("label"), item.get("text")))
+    if text_anchors:
+        from steps import textleaders       # local import: optional fallback
+        allow_bare = {key for key, _box, label, _text in text_anchors
+                      if str(label or "").strip().lower() == "callout"}
+        try:
+            recovered = textleaders.text_box_leaders(
+                pdf_path, page_index, text_anchors,
+                allow_bare_keys=allow_bare)
+        except Exception as exc:             # noqa: BLE001
+            if dbg:
+                dbg.note(f"arrows: text endpoint pass failed: {exc}")
+            recovered = {}
+        for key, entry in recovered.items():
+            out[key] = _merge_arrow_entry(out.get(key), entry)
+        if dbg and recovered:
+            dbg.note(f"arrows: text endpoint pass recovered/supplemented "
+                     f"{len(recovered)}/{len(text_anchors)} anchors")
 
     # 放置锚的兜底：边车靠「文字与引线绘制顺序相邻」做簇形成，对编号标记
     # （圆圈里一个数字）在 combined_bid P20 上 12 个放置全部失败。放置锚有
@@ -262,4 +668,64 @@ def find_page_arrows(pdf_path, page_index, items, *, plan_regions=None,
             dbg.note(f"arrows: geometric pass recovered {len(geo)}/{len(todo)} "
                      "placement anchors the sidecar missed")
         out.update(geo)
+    # The sidecar diagnostics precede the order-independent Python passes.
+    # Reflect any later recovery so the UI never hides a real recovered member.
+    for key in out:
+        if isinstance(key, int) and key in anchor_diagnostics:
+            anchor_diagnostics[key]["has_leader"] = True
+    if return_diagnostics:
+        return out, anchor_diagnostics
     return out
+
+
+def suppressed_unverified_duplicates(items, anchor_diagnostics=None):
+    """Indices of weak duplicate VLM members hidden from the default UI.
+
+    Raw/fused items and their union indices stay untouched.  Suppression is
+    deliberately narrow: only a VLM callout with no vector backing, no decoded
+    sidecar carrier and no leader can be hidden, and only when an identical
+    same-page text member has independent vector/automatic/ROI/leader evidence.
+    Debug mode can still display the weak member for audit.
+    """
+    diagnostics = anchor_diagnostics or {}
+
+    def diag(index):
+        return diagnostics.get(str(index), diagnostics.get(index, {})) or {}
+
+    def key(text):
+        value = unicodedata.normalize("NFKC", str(text or ""))
+        return re.sub(r"\s+", " ", value).strip().upper()
+
+    def weak(index, item):
+        row = diag(index)
+        return (str(item.get("source") or "").lower() == "vlm"
+                and str(item.get("label") or "").strip().lower() == "callout"
+                and not bool(item.get("vec_backed"))
+                and row.get("source") == "text-only"
+                and not bool(row.get("carrier_is_text"))
+                and not bool(row.get("has_leader")))
+
+    groups = {}
+    for index, item in enumerate(items or []):
+        token = key((item or {}).get("text"))
+        if token:
+            groups.setdefault(token, []).append(index)
+
+    hidden = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        verified = []
+        for index in members:
+            item = items[index] or {}
+            row = diag(index)
+            if not weak(index, item) and (
+                    bool(item.get("vec_backed"))
+                    or row.get("source") in ("automatic", "roi")
+                    or bool(row.get("carrier_is_text"))
+                    or bool(row.get("has_leader"))):
+                verified.append(index)
+        if verified:
+            hidden.update(index for index in members
+                          if weak(index, items[index] or {}))
+    return hidden

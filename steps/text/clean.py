@@ -91,10 +91,10 @@ def strip_marker_codes(vlm_items, instances, pdf_path, page_index, dbg=None):
         if any(
                 mb[0] - 1 <= cy <= mb[2] + 1 and mb[1] - 1 <= cx <= mb[3] + 1
                 for mb in mboxes):
-            _record(it, "marker码: 短码落在小闭合图形内(符号领域)")
+            _record(it, "marker code: a short code inside a small closed shape (symbol territory)")
             return True
         if _breaks_line(b, segs):
-            _record(it, "嵌线token: 线条从两个相对方向逼近")
+            _record(it, "inline token: lines approach from two opposite directions")
             return True
         return False
 
@@ -113,7 +113,7 @@ def strip_marker_codes(vlm_items, instances, pdf_path, page_index, dbg=None):
                 for mb in mboxes)
             bad = bool(in_marker) or _breaks_line(b, segs)
             if bad:
-                _record(it, "marker码(矢量行)" if in_marker else "嵌线token(矢量行)")
+                _record(it, "marker code (vector row)" if in_marker else "inline token (vector row)")
         if not bad:
             keep_i.append(it)
     n = len(vlm_items or []) + len(instances or []) - len(keep_v) - len(keep_i)
