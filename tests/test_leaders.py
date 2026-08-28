@@ -1,0 +1,211 @@
+"""放置锚引线的几何判据回归 —— 零模型调用，PDF 现场合成.
+
+每个用例自己画一页 PDF（标记外圈 + 引线 + 填充箭头 + 干扰物），所以判据是被
+真正端到端验证的：core.vecgeom 的抽取、坐标帧换算、分类闸全都在链路里。
+
+要钉住的是「不能误连」这一侧 —— 平面图上标记常压在围栏线上、周围几十条
+hatch 短刺，判据一松就会到处连线：
+  * hatch 短刺不能当引线（够不到 MIN_REACH）；
+  * 气泡自己的扫描线填充条不能当箭头（最小边 <= SLIVER_PX）；
+  * 没有箭头时默认不发布（require_head）。
+"""
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+os.environ.setdefault("GEMINI_API_KEY", "test-key-not-used")
+
+import fitz
+
+from steps.leaders import marker_leaders
+
+PW, PH = 600.0, 400.0
+CX, CY, R = 100.0, 200.0, 9.0          # 标记外圈
+TIPX = 200.0                            # 引线远端
+
+
+def _box(cx=CX, cy=CY, r=R):
+    """标记外圈 -> 页面帧 0-1000 的 box_2d。"""
+    return [(cy - r) / PH * 1000, (cx - r) / PW * 1000,
+            (cy + r) / PH * 1000, (cx + r) / PW * 1000]
+
+
+class _Page:
+    """一页合成 PDF，用完即删。"""
+
+    def __init__(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        self.tmp.close()
+        self.doc = fitz.open()
+        self.page = self.doc.new_page(width=PW, height=PH)
+
+    def marker(self):
+        self.page.draw_circle((CX, CY), R, color=(0, 0, 0), width=0.7)
+        return self
+
+    def leader(self, tipx=TIPX):
+        self.page.draw_line((CX + R, CY), (tipx, CY), color=(0, 0, 0), width=0.7)
+        return self
+
+    def head(self, tipx=TIPX, size=4.0):
+        self.page.draw_polyline(
+            [(tipx, CY), (tipx - size, CY - size / 2),
+             (tipx - size, CY + size / 2), (tipx, CY)],
+            color=(0, 0, 0), fill=(0, 0, 0), width=0.3, closePath=True)
+        return self
+
+    def scanline_fill(self, n=31):
+        """气泡的扫描线填充：n 条极薄的填充条，必须不能被当成箭头。"""
+        for i in range(n):
+            y = CY - R + i * (2 * R / n)
+            self.page.draw_rect(fitz.Rect(CX - R, y, CX + R, y + 0.3),
+                                color=None, fill=(1, 1, 1), width=0)
+        return self
+
+    def hatch(self, n=20):
+        """围栏 hatch 短刺：很短，够不到 MIN_REACH。"""
+        for i in range(n):
+            x = CX + R + 2 + i * 3
+            self.page.draw_line((x, CY + 6), (x + 1.2, CY + 7.2),
+                                color=(0, 0, 0), width=0.24)
+        return self
+
+    def fence_line(self):
+        self.page.draw_line((0, CY + 20), (PW, CY + 20), color=(0, 0, 0), width=1.4)
+        return self
+
+    def save(self):
+        self.doc.save(self.tmp.name)
+        self.doc.close()
+        return self.tmp.name
+
+    def cleanup(self):
+        try:
+            os.unlink(self.tmp.name)
+        except OSError:
+            pass
+
+
+class LeaderGeometryTests(unittest.TestCase):
+    def setUp(self):
+        self.pages = []
+
+    def tearDown(self):
+        for p in self.pages:
+            p.cleanup()
+
+    def _run(self, page, **kw):
+        self.pages.append(page)
+        path = page.save()
+        return marker_leaders(path, 0, [("s0:0", _box())], **kw)
+
+    # ── 正例 ──────────────────────────────────────────────────────────────
+    def test_finds_leader_and_arrowhead(self):
+        got = self._run(_Page().marker().leader().head())
+        self.assertIn("s0:0", got, "标记 + 引线 + 箭头应当被找到")
+        ent = got["s0:0"]
+        self.assertEqual(ent["targets"][0]["terminal_kind"], "arrowhead")
+        self.assertEqual(ent["confidence"], "high")
+        self.assertTrue(ent["leader_strokes"], "必须给出引线折线")
+        self.assertTrue(ent["arrow_strokes"], "必须给出箭头笔画")
+
+    def test_tip_lands_at_the_far_end(self):
+        got = self._run(_Page().marker().leader().head())
+        tip = got["s0:0"]["targets"][0]["tip"]          # [y, x] 0-1000
+        self.assertAlmostEqual(tip[1], TIPX / PW * 1000, delta=12,
+                               msg="末端 x 应当在引线远端")
+        self.assertAlmostEqual(tip[0], CY / PH * 1000, delta=12)
+
+    def test_target_box_is_on_the_arrowhead(self):
+        got = self._run(_Page().marker().leader().head())
+        box = got["s0:0"]["targets"][0]["box_2d"]
+        self.assertEqual(len(box), 4)
+        self.assertLess(box[0], box[2])                 # 正面积
+        self.assertLess(box[1], box[3])
+        cx = (box[1] + box[3]) / 2
+        self.assertAlmostEqual(cx, TIPX / PW * 1000, delta=15)
+
+    def test_survives_the_noisy_neighbourhood(self):
+        # 实测环境：标记压在围栏线上，周围 hatch + 气泡扫描线填充。
+        got = self._run(_Page().marker().scanline_fill().hatch()
+                        .fence_line().leader().head())
+        self.assertIn("s0:0", got)
+        self.assertEqual(got["s0:0"]["targets"][0]["terminal_kind"], "arrowhead")
+
+    # ── 反例 ──────────────────────────────────────────────────────────────
+    def test_no_arrowhead_is_not_published_by_default(self):
+        got = self._run(_Page().marker().leader())
+        self.assertEqual(got, {}, "没有箭头时默认不发布")
+
+    def test_no_arrowhead_can_be_opted_into(self):
+        got = self._run(_Page().marker().leader(), require_head=False)
+        self.assertIn("s0:0", got)
+        self.assertEqual(got["s0:0"]["targets"][0]["terminal_kind"], "bare-end")
+        self.assertEqual(got["s0:0"]["confidence"], "medium")
+
+    def test_hatch_ticks_are_not_leaders(self):
+        got = self._run(_Page().marker().hatch().head())
+        self.assertEqual(got, {}, "hatch 短刺够不到 MIN_REACH，不能当引线")
+
+    def test_scanline_strips_are_not_arrowheads(self):
+        # 有引线、没有真箭头，只有气泡的扫描线填充条 -> 不发布。
+        got = self._run(_Page().marker().scanline_fill().leader())
+        self.assertEqual(got, {}, "薄填充条不能当箭头")
+
+    def test_bare_marker_yields_nothing(self):
+        got = self._run(_Page().marker())
+        self.assertEqual(got, {})
+
+    def test_fence_line_alone_is_not_a_leader(self):
+        # 围栏长线离标记中心 20pt，根端够不上外圈，不能被当成引线。
+        got = self._run(_Page().marker().fence_line().head())
+        self.assertEqual(got, {})
+
+    # ── 契约 ──────────────────────────────────────────────────────────────
+    def test_empty_anchors_is_a_no_op(self):
+        p = _Page().marker().leader().head()
+        self.pages.append(p)
+        self.assertEqual(marker_leaders(p.save(), 0, []), {})
+
+    def test_malformed_box_is_skipped(self):
+        p = _Page().marker().leader().head()
+        self.pages.append(p)
+        path = p.save()
+        self.assertEqual(marker_leaders(path, 0, [("k", [1, 2])]), {})
+        self.assertEqual(marker_leaders(path, 0, [("k", None)]), {})
+
+    def test_coordinates_are_in_the_0_1000_frame(self):
+        got = self._run(_Page().marker().leader().head())
+        for pts in got["s0:0"]["leader_strokes"] + got["s0:0"]["arrow_strokes"]:
+            for y, x in pts:
+                self.assertGreaterEqual(y, 0.0)
+                self.assertLessEqual(y, 1000.0)
+                self.assertGreaterEqual(x, 0.0)
+                self.assertLessEqual(x, 1000.0)
+
+
+class ArrowsWiringTests(unittest.TestCase):
+    def test_arrows_version_was_bumped(self):
+        # 发布结果集变了就必须 bump，否则盘上的旧 arrows.json 会被当作当期。
+        from steps.arrows import ARROWS_VERSION
+        self.assertGreaterEqual(ARROWS_VERSION, 10)
+
+    def test_only_placement_anchors_get_the_geometric_pass(self):
+        # 文字锚没有「外圈」这个锚点，同一条规则用在文字上会乱连 ——
+        # find_page_arrows 里的筛选必须只挑 str 键（放置锚）。
+        import inspect
+
+        from steps import arrows
+        src = inspect.getsource(arrows.find_page_arrows)
+        self.assertIn("isinstance(key, str)", src)
+        self.assertIn("marker_leaders", src)
+
+
+if __name__ == "__main__":
+    unittest.main()

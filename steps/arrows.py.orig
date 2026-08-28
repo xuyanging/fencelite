@@ -1,0 +1,59 @@
+"""预留接缝：根据文字 callout 找箭头 / 引线（尚未实现）.
+
+这里只定义接口与存储契约，默认 ENABLED=False，管线里是零成本 no-op。
+接入时只需要：
+  1. 实现 find_page_arrows(...)（可以自由调用 core.gemini.gen_json 或纯矢量几何，
+     费用会被 core.gemini.RECORDER 自动计入作业统计，不必改计量代码）；
+  2. 把 ENABLED 置 True，或设环境变量 ARROWS=1。
+管线（job.py）会自己多跑一个 arrows 阶段并把结果写进 data/<slug>/arrows.json，
+webapp 的 /api/page 会原样带上 record["arrows"]，前端画层已留好位置。
+
+约定（务必遵守，否则归属会错位）：
+  * items 是 steps.store.items_of(rec) 的返回值，**下标即 union index**，
+    与 symbol 的 text_index、前端选中态共用同一套编号；
+  * 返回 dict 的键必须是这个 int 下标；
+  * 所有坐标都是页面帧 [ymin, xmin, ymax, xmax] / [y, x]，0-1000 闭区间，
+    与文字框、symbol 框完全同帧（模型只在它看到的那张图里作答，
+    回映射到页面帧是调用方的责任）。
+"""
+import os
+
+from steps.store import sig_of
+
+# 接缝总开关。ARROWS=1 可在不改代码的情况下打开。
+ENABLED = os.environ.get("ARROWS", "0") not in ("0", "", "false", "no", "off")
+
+# 改箭头算法语义时 bump，让 arrows.json 重算。
+ARROWS_VERSION = 0
+
+
+def arrows_signature(items, revision):
+    """arrows.json 的缓存签名：文字锚 + PDF 身份 + 算法版本。"""
+    return f"{sig_of(items, revision)}|v{ARROWS_VERSION}"
+
+
+def has_current_arrows(entry, sig):
+    return bool(isinstance(entry, dict) and entry.get("sig") == sig
+                and isinstance(entry.get("items"), dict))
+
+
+def find_page_arrows(pdf_path, page_index, items, *, dbg=None):
+    """一页里为每个文字锚找箭头 / 引线。
+
+    参数
+      pdf_path    : pathlib.Path，源 PDF
+      page_index  : 0-based 页号
+      items       : steps.store.items_of(rec)，下标 = union index
+      dbg         : steps.debug.DebugSink 或 None（None 时所有记录点是 no-op）
+
+    返回
+      {union_index: {...}}  —— 只包含真的找到箭头的锚；建议字段：
+        "arrow_tip"   : [y, x]        箭头尖端（页面帧 0-1000）
+        "leader_start": [y, x]        引线在文字侧的起点
+        "polyline"    : [[y, x], ...] 引线折线（可选）
+        "confidence"  : "high"|"medium"|"low"
+        "note"        : str           简短理由，便于排查
+    """
+    raise NotImplementedError(
+        "arrows step not wired yet — implement steps.arrows.find_page_arrows "
+        "and set ENABLED / env ARROWS=1")

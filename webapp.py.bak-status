@@ -1,0 +1,576 @@
+"""fence_lite 的 Flask 层(5060)：上传 PDF → 后台作业跑完整链 → 只读可视化.
+
+这一层只做四件事：
+  * 上传编排：收 PDF + 用户可编辑的「检测目标」→ job.create_project /
+    job.start_job，返回 slug 供前端轮询；
+  * 作业状态 / 费用的只读出口（/api/jobs、/api/job/<slug>、/api/cancel）；
+  * 装配画廊（/api/overview）和单页的全部图层（/api/page）；
+  * 页面底图的渲染缓存（/img）。
+
+**这里绝不发起任何付费调用。** 所有 Gemini 调用都在上传作业内部跑完，网页端
+只读 data/<slug>/ 里已经算好的缓存，所以 5051 那套「点一下才检测」的
+GET/POST 付费接口（/api/symbols、/api/fenceline、/api/rescan）在这里完全
+不存在；/api/page 一次把该页所有图层给全。
+
+发布纪律（照抄 5051 的理由）：结果必须同时对上「当前 PDF 的 pdf_revision」
+与「当期版本号」才发布。底图缓存是按 pdf_revision 建的，PDF 换了以后还把
+旧的归一化框发出去，会把旧几何画到新渲染的图纸上 —— 看起来是对的，几何上
+是错的。对不上就报 pending，让作业重跑。
+
+Run:  venv\\Scripts\\python.exe webapp.py   →  http://127.0.0.1:5060/
+"""
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from flask import Flask, jsonify, render_template, request, send_file
+from PIL import Image
+
+import job
+from core.config import BASE_DIR
+from core.pdfio import render_pdf_page
+from steps import arrows, store
+from steps.placements import has_current_placements
+from steps.symbols import (has_current_symbols, marker_code_indices,
+                          symbols_dropped_view)
+from steps.text.target import TARGET_DEFAULT
+from steps.versions import FUSED_VERSION
+from steps.views import (groups_need_classification, has_current_view_types,
+                         merge_view_types, plan_boxes)
+
+BASE_LONG = 5000          # base render long side (px) — sharp enough to zoom
+JPEG_Q = 80
+
+app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.jinja_env.auto_reload = True
+
+
+# ------------------------------------------------------------- publish gates --
+def _results_state(slug):
+    """Return only project results that match the current PDF and schema.
+
+    The base-image cache is keyed by the live PDF revision. Returning an old
+    page record after that PDF changes would draw stale normalized boxes over
+    a newly rendered sheet, which looks valid but is geometrically false.
+    """
+    if not store.is_valid_slug(slug):
+        return None, "bad_slug"
+    res = store.load_results(slug)
+    if not isinstance(res, dict):
+        return None, "missing"
+    if res.get("fused_v") != FUSED_VERSION:
+        return None, "fused_version"
+    try:
+        revision = store.pdf_revision(store.pdf_path(slug))
+    except OSError:
+        return None, "pdf_missing"
+    if res.get("pdf_revision") != revision:
+        return None, "pdf_revision"
+    return res, None
+
+
+def _results(slug):
+    return _results_state(slug)[0]
+
+
+def _fused_pending(reason):
+    return jsonify({
+        "pending": True,
+        "stage": "fused",
+        "reason": reason,
+        "error": "fused results are stale; re-run the upload job",
+    }), 409
+
+
+def _symbols_publishable(entry, sig):
+    """符号 + 放置是否当期可发布 —— 直接用写缓存那两步自己的判定函数.
+
+    has_current_symbols 锚定 (items, pdf_revision) + 提示词/过滤版本，
+    has_current_placements 锚定本地放置匹配版本。任何一项不当期都视作
+    「这一页还没算」，返回空符号层，绝不把旧几何画到新底图上。
+    """
+    return bool(has_current_symbols(entry, sig)
+                and has_current_placements(entry.get("result")))
+
+
+def _typed_groups(slug, page, groups, revision):
+    """Cache-only read.  Return typed groups, or ``None`` when pending."""
+    if not groups_need_classification(groups):
+        return merge_view_types(groups, None)
+    entry = store.load_json(
+        store.slug_dir(slug) / "view_types.json", {}).get(str(page))
+    if not has_current_view_types(entry, groups, revision):
+        return None
+    return merge_view_types(groups, entry)
+
+
+def _page_symbols(slug, page, items, revision):
+    """一页的符号层：图例样例 symbol + plan 视图内的放置 + 免费的剥离解释.
+
+    纯读盘：symbols.json（付费步的产物）+ view_types.json（分类步的产物）。
+    分类不当期时照发分区框，但一个 plan 框都不给 —— 没有取景框就 fail-closed，
+    绝不退化成「整页都算 plan」。
+    """
+    empty = {"groups": [], "symbols": []}
+    if not items:
+        return empty, [], []
+    entry = store.load_json(
+        store.slug_dir(slug) / "symbols.json", {}).get(str(page))
+    if not _symbols_publishable(entry, store.sig_of(items, revision)):
+        # 盘上明明有符号、只是版本戳对不上当前算法（改了算法/版本号之后就会这样）
+        # —— 这种"陈旧"必须显式说出来。静默返回 0 会让人以为"模型没找到"，
+        # 那是最误导的失败方式：真实案例里用户按着截图问"这条线怎么没框出来"，
+        # 其实是这一页整个符号层被扣着没发。
+        stale_count = len([s for s in ((entry or {}).get("result") or {})
+                           .get("symbols") or [] if isinstance(s, dict)])
+        if stale_count:
+            return ({"groups": [], "symbols": [], "stale": True,
+                     "stale_symbols": stale_count}, [], [])
+        return empty, [], []
+    result = entry["result"]
+    raw_groups = result.get("groups") or []
+    typed = _typed_groups(slug, page, raw_groups, revision)
+    payload = dict(result)
+    payload["symbols"] = [symbol for symbol in (result.get("symbols") or [])
+                          if isinstance(symbol, dict)]
+    if typed is None:
+        # Only classifier-versioned view types may reach an API response.
+        groups = merge_view_types(raw_groups, None)
+        for group in groups:
+            if group.get("kind") == "view":
+                group.pop("view_type", None)
+                group.pop("view_type_reason", None)
+        payload["groups"] = groups
+        payload["view_types_pending"] = True
+        plans = []
+    else:
+        payload["groups"] = typed
+        plans = plan_boxes(typed)
+    # symbols_dropped_view 返回 {raw_symbols, dropped}；前端只要 dropped 那一层。
+    dropped = symbols_dropped_view(entry) or {}
+    return payload, list(dropped.get("dropped") or []), plans
+
+
+def _placement_anchors_for(slug, page):
+    """与 job._placement_anchors 同源：shape 放置也是箭头步的锚，必须进签名。"""
+    result = ((store.load_json(store.slug_dir(slug) / "symbols.json", {})
+               .get(str(page)) or {}).get("result") or {})
+    anchors = []
+    for si, symbol in enumerate(result.get("symbols") or []):
+        for pi, box in enumerate(symbol.get("placements") or []):
+            if isinstance(box, (list, tuple)) and len(box) == 4:
+                anchors.append((f"s{si}:{pi}", list(box)))
+    return anchors
+
+
+def _attach_arrows(record, slug, page, items, revision):
+    """箭头步是预留接缝（steps.arrows.ENABLED 默认关）.
+
+    打开并且 arrows.json 当期时，把它原样挂到 record["arrows"] 上；关着的时候
+    这里一行 IO 都不做。
+    """
+    if not arrows.ENABLED:
+        return
+    entry = store.load_json(
+        store.slug_dir(slug) / "arrows.json", {}).get(str(page))
+    sig = arrows.arrows_signature(items, revision,
+                                  _placement_anchors_for(slug, page))
+    if arrows.has_current_arrows(entry, sig):
+        record["arrows"] = entry["items"]
+
+
+def _cross_site_write_blocked():
+    """Reject browser cross-site writes while keeping CLI/test clients usable."""
+    if request.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+        return True
+    origin = request.headers.get("Origin")
+    return bool(origin and origin.rstrip("/") != request.host_url.rstrip("/"))
+
+
+def _empty_rec():
+    """Placeholder record for a sheet with no detected text box, so the viewer
+    can still display the bare page (default view) or hide it (toggle)."""
+    return {"vlm_items": [], "vec_added": [], "vec_covered": [],
+            "has_text": None, "vlm_error": None, "empty": True}
+
+
+# ------------------------------------------------------------------- base img --
+def _base_img_path(slug, page):
+    return (store.slug_dir(slug)
+            / f"base_P{page}_{store.pdf_revision(store.pdf_path(slug))}.jpg")
+
+
+def _ensure_base(slug, page):
+    """Render + cache the page base image (render_pdf_page owns FITZ_LOCK)."""
+    f = _base_img_path(slug, page)
+    if f.exists():
+        with Image.open(f) as im:
+            return f, im.size
+    img = render_pdf_page(store.pdf_path(slug), page - 1, dpi=600,
+                          max_px=BASE_LONG)
+    img.save(f, "JPEG", quality=JPEG_Q, optimize=True)
+    return f, img.size
+
+
+# ------------------------------------------------------------------- gallery --
+def _overview_row(res, slug):
+    """One gallery row.  ``pages`` lists EVERY sheet 1..page_count — sheets
+    with no detected text box get a zero-count placeholder so the frontend can
+    show them by default and hide them with the "只看有结果的页" toggle."""
+    page_count = int(res.get("page_count") or 0)
+    have = res.get("pages", {}) or {}
+    try:
+        revision = store.pdf_revision(store.pdf_path(slug))
+    except OSError:
+        revision = None
+    directory = store.slug_dir(slug)
+    symbol_cache = store.load_json(directory / "symbols.json", {})
+    pages = []
+    tot_added = tot_vlm = tot_cov = tot_sym = tot_plc = tot_stale = 0
+    for p in range(1, page_count + 1):
+        rec = have.get(str(p))
+        if rec is None:
+            pages.append({"page": p, "added": 0, "vlm": 0, "covered": 0,
+                          "sym": 0, "plc": 0, "err": None, "has_text": None,
+                          "present": False})
+            continue
+        a = len(rec.get("vec_added", []))
+        v = len(rec.get("vlm_items", []))
+        c = len(rec.get("vec_covered", []))
+        items = store.items_of(rec)
+        entry = symbol_cache.get(str(p)) if revision else None
+        symbols = []
+        if items and revision \
+                and _symbols_publishable(entry, store.sig_of(items, revision)):
+            symbols = [s for s in (entry["result"].get("symbols") or [])
+                       if isinstance(s, dict)]
+        elif (entry or {}).get("result", {}).get("symbols"):
+            # 有结果但版本戳不当期：算进 stale 计数，让画廊显示「符号待重跑」
+            # 而不是让这一页看起来"什么都没找到"。
+            tot_stale += len([s for s in entry["result"]["symbols"]
+                              if isinstance(s, dict)])
+        placements = sum(len(s.get("placements") or []) for s in symbols)
+        tot_added += a; tot_vlm += v; tot_cov += c
+        tot_sym += len(symbols); tot_plc += placements
+        pages.append({"page": p, "added": a, "vlm": v, "covered": c,
+                      "sym": len(symbols), "plc": placements,
+                      "err": rec.get("vlm_error"),
+                      "has_text": bool(rec.get("has_text")),
+                      "present": True})
+    status = job.get_job(slug) or {}
+    # Prefer the live/session job stats; fall back to the summary persisted in
+    # results.json so cost/time survive a server restart.
+    llm = status.get("llm") or res.get("llm_summary")
+    wall = status.get("wall_seconds") or res.get("wall_seconds")
+    return {"slug": res.get("slug", slug), "page_count": page_count,
+            "no_text_layer": bool(res.get("no_text_layer")),
+            "mode": res.get("mode", "fence"),
+            "target": res.get("target"),
+            "generated": res.get("generated"),
+            "vlm": tot_vlm, "added": tot_added, "covered": tot_cov,
+            "symbols": tot_sym, "placements": tot_plc,
+            "llm": llm, "wall_seconds": wall,
+            # 结果是从别的服务搬进来的（旧流水线跑的付费缓存），还是这套代码
+            # 自己跑出来的？前端据此打标，用户想确认就点「重新跑」。
+            "imported": res.get("imported") or None,
+            # 盘上有符号但算法版本戳不当期 → 画廊打「符号待重跑」，
+            # 否则「符号 0」会被读成「这份图纸没有图例符号」
+            "stale_symbols": tot_stale,
+            "pages": pages}
+
+
+def _processing_row(slug, status):
+    """Gallery row for a project whose results are not ready yet (uploading /
+    processing / failed).  Its PDF exists, so every page is previewable now."""
+    pc = int(status.get("pages_total") or job.page_count_of(slug) or 0)
+    pages = [{"page": p, "added": 0, "vlm": 0, "covered": 0, "sym": 0,
+              "plc": 0, "err": None, "has_text": None, "present": False}
+             for p in range(1, pc + 1)]
+    failed = bool(status.get("done") and not status.get("ok"))
+    return {"slug": slug, "page_count": pc, "no_text_layer": False,
+            "mode": status.get("mode", "fence"),
+            "target": status.get("target"), "generated": None,
+            "vlm": 0, "added": 0, "covered": 0, "symbols": 0, "placements": 0,
+            "llm": status.get("llm"),
+            "wall_seconds": status.get("wall_seconds"),
+            "processing": not status.get("done"),
+            "job_error": status.get("error") if failed else None,
+            "pages": pages}
+
+
+# -------------------------------------------------------------------- routes --
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
+
+
+@app.route("/api/preset_target")
+def preset_target():
+    """The default, user-editable detection TARGET (what to find), shown
+    pre-filled in the upload dialog.  Only this part is editable — the JSON
+    output-format scaffolding is fixed server-side and never exposed, so an
+    edit can change WHAT is detected but never break the data format.  The one
+    target drives both the image VLM and the vector-text judge."""
+    return jsonify({"target": TARGET_DEFAULT})
+
+
+@app.route("/api/overview")
+def overview():
+    out = []
+    seen = set()
+    for d in sorted(store.DATA_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        slug = d.name
+        # A still-running job shows as "processing" (bare pages, no partial
+        # results) even if a partial results.json already exists — results only
+        # surface once the whole run finishes.
+        if job.job_running(slug):
+            out.append(_processing_row(slug, job.get_job(slug) or {}))
+            seen.add(slug)
+            continue
+        res = _results(slug)
+        if not res:
+            continue
+        out.append(_overview_row(res, slug))
+        seen.add(slug)
+    # projects still processing with no results.json yet — previewable now.
+    for status in job.all_jobs():
+        slug = status.get("slug")
+        if slug in seen or not store.is_valid_slug(slug):
+            continue
+        if not store.pdf_path(slug).exists():
+            continue
+        out.append(_processing_row(slug, status))
+    out.sort(key=lambda r: r["slug"])
+    return jsonify(out)
+
+
+@app.route("/api/jobs")
+def jobs():
+    """All processing jobs (running + finished this session) for the gallery
+    progress cards."""
+    return jsonify(job.all_jobs())
+
+
+@app.route("/api/job/<slug>")
+def job_status(slug):
+    if not store.is_valid_slug(slug):
+        return jsonify({"error": "bad slug"}), 400
+    return jsonify(job.get_job(slug))
+
+
+@app.route("/api/cancel/<slug>", methods=["POST"])
+def cancel_job(slug):
+    """Request cooperative cancellation of a running job (user got tired of
+    waiting on a big PDF).  Stages stop scheduling new pages and the run
+    unwinds; a few in-flight model calls may still finish."""
+    if _cross_site_write_blocked():
+        return jsonify({"error": "cross-site write rejected"}), 403
+    if not store.is_valid_slug(slug):
+        return jsonify({"error": "bad slug"}), 400
+    result = job.request_cancel(slug)
+    return jsonify({"ok": True, "was_running": bool(result.get("was_running")),
+                    "job": result.get("job")})
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload():
+    """Accept a PDF + optional edited detection target, start background
+    processing, and return the new slug for the gallery to poll."""
+    if _cross_site_write_blocked():
+        return jsonify({"error": "cross-site write rejected"}), 403
+    f = request.files.get("pdf")
+    if f is None or not f.filename:
+        return jsonify({"error": "no PDF uploaded (field 'pdf')"}), 400
+    data = f.read()
+    if not data[:5] == b"%PDF-":
+        return jsonify({"error": "not a PDF file"}), 400
+    # editable detection target ("what to find")
+    target = request.form.get("target", "")
+    try:
+        slug = job.create_project(data, f.filename)
+    except Exception as e:                                     # noqa: BLE001
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify({"slug": slug, "job": job.start_job(slug, target=target)})
+
+
+@app.route("/api/rerun/<slug>", methods=["POST"])
+def rerun(slug):
+    """Re-run an existing PDF.
+
+    ``reset`` (default true) wipes every cached artifact for the project first,
+    so the new run cannot be shaped by anything an earlier/older pipeline left
+    on disk — the only survivor is projects/<slug>/input.pdf.  Pass
+    ``{"reset": false}`` to reuse whatever is still current (cheap, but then
+    the result is only as new as the cache).
+    """
+    if _cross_site_write_blocked():
+        return jsonify({"error": "cross-site write rejected"}), 403
+    if not store.is_valid_slug(slug):
+        return jsonify({"error": "bad slug"}), 400
+    if not store.pdf_path(slug).exists():
+        return jsonify({"error": "project not found"}), 404
+    if job.job_running(slug):
+        return jsonify({"error": "这个项目正在跑"}), 409
+    body = request.get_json(silent=True) or {}
+    target = body.get("target")
+    if target is None:
+        target = job.stored_target(slug)
+    cleared = []
+    if body.get("reset", True):
+        try:
+            cleared = job.reset_project_cache(slug)
+        except Exception as e:                                 # noqa: BLE001
+            return jsonify({"error": f"{type(e).__name__}: {e}"}), 409
+    return jsonify({"slug": slug, "cleared": cleared,
+                    "job": job.start_job(slug, target=target)})
+
+
+@app.route("/api/project/<slug>", methods=["DELETE"])
+def delete_project(slug):
+    if _cross_site_write_blocked():
+        return jsonify({"error": "cross-site write rejected"}), 403
+    if not store.is_valid_slug(slug):
+        return jsonify({"error": "bad slug"}), 400
+    try:
+        removed = job.delete_project(slug)
+    except Exception as e:                                     # noqa: BLE001
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify({"ok": True, "removed": removed})
+
+
+@app.route("/api/page/<slug>/<int:page>")
+def page_data(slug, page):
+    """该页的全部图层，一次给全（全部来自缓存，零模型调用）。"""
+    if not store.is_valid_slug(slug):
+        return jsonify({"error": "bad slug"}), 400
+    res, stale_reason = _results_state(slug)
+    if stale_reason not in (None, "missing"):
+        return _fused_pending(stale_reason)
+    # While a job is still running, only preview the bare sheet — do NOT surface
+    # partial results.  Treat it the same as "no results yet" even if a partial
+    # results.json already exists.
+    if job.job_running(slug):
+        res = None
+    # Preview mode: results not produced yet (still processing / failed) but the
+    # PDF is on disk — render the sheet with an empty overlay so it is viewable.
+    if res is None:
+        if not store.pdf_path(slug).exists():
+            return jsonify({"error": "page not found"}), 404
+        pc = job.page_count_of(slug)
+        if not (1 <= page <= pc):
+            return jsonify({"error": "page not found"}), 404
+        try:
+            _, (w, h) = _ensure_base(slug, page)
+        except Exception as e:                              # noqa: BLE001
+            return jsonify({"error": f"render failed: {e}"}), 500
+        return jsonify({"page": page, "page_count": pc, "mode": "fence",
+                        "w": w, "h": h, "img": f"/img/{slug}/{page}",
+                        "record": _empty_rec(), "items": [],
+                        "symbols": {"groups": [], "symbols": []},
+                        "dropped_symbols": [], "plan_boxes": [],
+                        "counts": {"text": 0, "symbols": 0, "placements": 0,
+                                   "plan_groups": 0},
+                        "processing": True})
+    page_count = int(res.get("page_count") or 0)
+    # A page absent from results.json but within the PDF is a legitimately
+    # empty sheet — synthesize a blank record instead of 404 so it is viewable.
+    if res.get("pages", {}).get(str(page)) is None \
+            and not 1 <= page <= page_count:
+        return jsonify({"error": "page not found"}), 404
+    try:
+        _, (w, h) = _ensure_base(slug, page)
+    except Exception as e:                                  # noqa: BLE001
+        return jsonify({"error": f"render failed: {e}"}), 500
+    # Re-check after rendering: the PDF or the results cache can be replaced
+    # while this request is producing the base image.
+    res, stale_reason = _results_state(slug)
+    if stale_reason is not None:
+        return _fused_pending(stale_reason)
+    page_count = int(res.get("page_count") or 0)
+    rec = res.get("pages", {}).get(str(page))
+    if rec is None:
+        if not 1 <= page <= page_count:
+            return jsonify({"error": "page not found"}), 404
+        rec = _empty_rec()
+    record = dict(rec)
+    items = store.items_of(record)
+    revision = res.get("pdf_revision")
+    symbols, dropped, plan_boxes = ({"groups": [], "symbols": []}, [], [])
+    if res.get("mode", "fence") == "fence":
+        # 图例符号 / plan 放置是 fence 专属的；自定义检测目标只有文字层。
+        symbols, dropped, plan_boxes = _page_symbols(
+            slug, page, items, revision)
+    _attach_arrows(record, slug, page, items, revision)
+    placements = sum(len(s.get("placements") or [])
+                     for s in symbols["symbols"])
+    marker_codes = marker_code_indices(items, symbols.get("groups") or [],
+                                       symbols.get("symbols") or [])
+    # 图例行文字框把行首编码（"3G  3'-0\" WIDE GATE..."）含在里面时，套用
+    # 放置阶段算好的裁剪：文字框只该框文字，不该框住那个标记。裁剪结果单独
+    # 存表、不改 results.json 里的 item —— 动 item 就要重跑步骤② 的付费推理。
+    for key, trimmed in (symbols.get("text_trim") or {}).items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < len(items) and isinstance(trimmed, list) \
+                and len(trimmed) == 4:
+            items[index] = {**items[index], "box_2d": trimmed,
+                            "box_raw": items[index].get("box_2d")}
+    return jsonify({"page": page, "page_count": page_count,
+                    "mode": res.get("mode", "fence"),
+                    "w": w, "h": h, "img": f"/img/{slug}/{page}",
+                    "record": record, "items": items,
+                    "symbols": symbols, "dropped_symbols": dropped,
+                    "plan_boxes": plan_boxes,
+                    # 其实是图例编码标记、不是独立 fence 文字的那些 item 下标。
+                    # 只标记不删除：删 item 会让步骤② 的付费缓存签名失效（每页
+                    # 重新付费），还会让 union index 错位。前端默认不把它们画进
+                    # 文字层，Debug 里单独一层看。
+                    "marker_codes": sorted(marker_codes),
+                    # 盘上有符号但版本戳不是当期 → 显式说「要重跑」，
+                    # 不要让前端把它显示成「没找到」
+                    "symbols_stale": bool(symbols.get("stale")),
+                    "stale_symbols": int(symbols.get("stale_symbols") or 0),
+                    "counts": {"text": len(items) - len(marker_codes),
+                               "marker_codes": len(marker_codes),
+                               "symbols": len(symbols["symbols"]),
+                               "placements": placements,
+                               "plan_groups": len(plan_boxes)}})
+
+
+@app.route("/img/<slug>/<int:page>")
+def img(slug, page):
+    if "/" in slug or "\\" in slug or ".." in slug \
+            or not store.is_valid_slug(slug):
+        return "bad slug", 400
+    try:
+        f, _ = _ensure_base(slug, page)
+    except Exception as e:                                  # noqa: BLE001
+        return f"render failed: {e}", 500
+    resp = send_file(f, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+if __name__ == "__main__":
+    # Mark any job interrupted by a previous server stop (never auto-relaunched:
+    # silently re-spending on a big PDF at startup is a surprise bill).
+    try:
+        job.resume_interrupted()
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"[resume] skipped: {exc}", flush=True)
+    host = os.environ.get("FENCE_LITE_HOST", "127.0.0.1")
+    port = int(os.environ.get("FENCE_LITE_PORT", "5060"))
+    print(f"fence_lite  →  http://{host}:{port}/", flush=True)
+    app.run(host=host, port=port, threaded=True)

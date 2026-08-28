@@ -1,0 +1,203 @@
+"""Shared Gemini JSON call, usage, and image-encoding helpers for 5054.
+
+fence_takeoff_web addition: ``gen_json`` is the single chokepoint every paid
+Gemini call in the whole pipeline passes through (verified: exactly one
+``generate_content`` site in the codebase).  We therefore record each call's
+wall-time + token usage + USD cost into a thread-safe global ``RECORDER`` so
+the web layer can report a processing job's total model time and spend.  The
+recorder is a pure observer — it never changes call behaviour.
+"""
+import io
+import threading
+import time
+
+from google import genai
+from google.genai import types
+from PIL import Image
+
+from core.config import API_KEY, GEMINI_INLINE_BYTES_LIMIT, compute_cost
+
+client = genai.Client(api_key=API_KEY)
+
+_USAGE_FIELDS = (
+    ("prompt_token_count", "input_tokens"),
+    ("candidates_token_count", "output_tokens"),
+    ("thoughts_token_count", "thoughts_tokens"),
+    ("cached_content_token_count", "cached_tokens"),
+    ("total_token_count", "total_tokens"),
+)
+
+
+class CallRecorder:
+    """Accumulates (model, elapsed, usage, cost) for every gen_json call.
+
+    Recording is a global session toggled by the web orchestrator around one
+    processing job (jobs are serialized, so no interleaving).  Every counter is
+    guarded by a lock because the batch stages fan calls out across many worker
+    threads.  ``elapsed`` is summed across concurrent calls, so ``model_seconds``
+    is total model busy-time (not wall-clock); the orchestrator reports both.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._on = False
+        # optional callback fired (outside the lock) after each counted call,
+        # so the web layer can persist cumulative cost on every completion
+        self.on_update = None
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self.calls = 0
+            self.model_seconds = 0.0
+            self.input_tokens = 0
+            self.output_tokens = 0
+            self.thoughts_tokens = 0
+            self.cost_usd = 0.0
+            self.by_model = {}
+            self.active = 0            # model calls in flight right now
+            self.peak_concurrency = 0  # max simultaneous calls this session
+
+    def enter(self):
+        """Mark a call in flight; tracks peak simultaneity = real parallelism."""
+        with self._lock:
+            self.active += 1
+            if self._on and self.active > self.peak_concurrency:
+                self.peak_concurrency = self.active
+
+    def leave(self):
+        with self._lock:
+            if self.active > 0:
+                self.active -= 1
+
+    def start(self):
+        self.reset()
+        with self._lock:
+            self._on = True
+
+    def stop(self):
+        with self._lock:
+            self._on = False
+        return self.summary()
+
+    def add(self, model, elapsed, usage):
+        if not self._on:
+            return
+        self._add_locked(model, elapsed, usage)
+        cb = self.on_update
+        if cb:
+            try:
+                cb()
+            except Exception:                                  # noqa: BLE001
+                pass  # persistence must never break a paid call
+
+    def _add_locked(self, model, elapsed, usage):
+        cost = compute_cost(model, usage) or {}
+        in_tok = int((usage or {}).get("input_tokens") or 0)
+        out_tok = int((usage or {}).get("output_tokens") or 0)
+        th_tok = int((usage or {}).get("thoughts_tokens") or 0)
+        usd = float(cost.get("total_usd") or 0.0)
+        with self._lock:
+            self.calls += 1
+            self.model_seconds += float(elapsed or 0.0)
+            self.input_tokens += in_tok
+            self.output_tokens += out_tok
+            self.thoughts_tokens += th_tok
+            self.cost_usd += usd
+            m = self.by_model.setdefault(
+                model, {"calls": 0, "seconds": 0.0, "cost_usd": 0.0,
+                        "input_tokens": 0, "output_tokens": 0,
+                        "thoughts_tokens": 0})
+            m["calls"] += 1
+            m["seconds"] += float(elapsed or 0.0)
+            m["cost_usd"] += usd
+            m["input_tokens"] += in_tok
+            m["output_tokens"] += out_tok
+            m["thoughts_tokens"] += th_tok
+
+    def summary(self):
+        with self._lock:
+            return {
+                "calls": self.calls,
+                "model_seconds": round(self.model_seconds, 2),
+                "peak_concurrency": self.peak_concurrency,
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "thoughts_tokens": self.thoughts_tokens,
+                "cost_usd": round(self.cost_usd, 4),
+                "by_model": {k: {**v, "seconds": round(v["seconds"], 2),
+                                 "cost_usd": round(v["cost_usd"], 4)}
+                             for k, v in self.by_model.items()},
+            }
+
+
+RECORDER = CallRecorder()
+
+
+def gen_json(model, contents, timeout_ms=None, thinking_budget=None,
+             response_json_schema=None):
+    """The one shared entry point for every Gemini call in the pipeline:
+    temperature=0 + forced JSON output. timeout_ms optionally caps the HTTP
+    request (the SDK default has none, so a hung connection stalls forever);
+    thinking_budget optionally caps reasoning tokens — thinking time is the
+    dominant, highly variable share of latency on vision calls."""
+    t0 = time.perf_counter()
+    RECORDER.enter()
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_json_schema=response_json_schema,
+                http_options=types.HttpOptions(timeout=timeout_ms) if timeout_ms else None,
+                thinking_config=(types.ThinkingConfig(thinking_budget=thinking_budget)
+                                 if thinking_budget else None),
+            ),
+        )
+    finally:
+        RECORDER.leave()
+    try:
+        RECORDER.add(model, time.perf_counter() - t0, usage_from_response(resp))
+    except Exception:                                          # noqa: BLE001
+        pass  # instrumentation must never break a paid call
+    return resp
+
+
+def usage_from_response(resp, include_cached=True):
+    """Map SDK usage_metadata onto our own field names. include_cached=False
+    reproduces the 4-field variant used by cross-ref / secondary-ref
+    responses (kept for response-schema compatibility)."""
+    usage = getattr(resp, "usage_metadata", None)
+    out = {}
+    if usage is None:
+        return out
+    for src, dst in _USAGE_FIELDS:
+        if not include_cached and dst == "cached_tokens":
+            continue
+        v = getattr(usage, src, None)
+        if v is not None:
+            out[dst] = int(v)
+    return out
+
+
+def _encode_image_for_gemini(image: Image.Image):
+    """PNG by default; JPEG fallback if PNG exceeds the inline byte limit.
+
+    compress_level=1: PNG is lossless at every level, so the DECODED pixels the
+    model sees are byte-identical to the zlib default (level 6) — only the file
+    size and, crucially, the CPU encode time differ.  On a single-core box the
+    per-call PNG encode of a 15-MP CAD page (~1.25s at level 6) serializes under
+    the GIL and throttles LLM concurrency; level 1 cuts that ~40% (~0.74s) for a
+    <2% size increase.  Not an algorithm change — the image content is identical."""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG", compress_level=1)
+    data = buf.getvalue()
+    if len(data) <= GEMINI_INLINE_BYTES_LIMIT:
+        return data, "image/png"
+    # too big: re-encode as JPEG quality 92 (lossy but still pixel-precise for line art)
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=92, optimize=True)
+    return buf.getvalue(), "image/jpeg"
+

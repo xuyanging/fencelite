@@ -1,0 +1,809 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>fence_lite · 围栏文字与图例符号</title>
+<style>
+:root{
+  --bg:#f4f5f7; --pn:#fff; --bd:#dcdfe4; --fg:#1f2328; --mut:#6b7280;
+  --c-uni:#2563eb;        /* 最终文字并集 */
+  --c-sym:#7c3aed;        /* 图例样例符号 / plan 内放置 */
+  --c-plan:#16a34a;       /* plan 视图框 */
+  --c-grp:#64748b;        /* 页面分区 */
+  --c-vlm:#ea580c;        /* debug: 纯模型 */
+  --c-add:#dc2626;        /* debug: 矢量补检 */
+  --c-cov:#16a34a;        /* debug: 被覆盖的矢量文字 */
+  --c-drop:#7f1d1d;       /* debug: 被硬闸剥掉的 symbol */
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font:13px/1.45 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;
+     color:var(--fg);background:var(--bg);display:flex;flex-direction:column}
+button{font:inherit;cursor:pointer;border:1px solid var(--bd);background:#fff;
+       border-radius:6px;padding:4px 10px}
+button:hover{background:#f0f1f3}
+button:disabled{opacity:.5;cursor:default}
+button.primary{background:var(--c-uni);border-color:var(--c-uni);color:#fff}
+button.primary:hover{filter:brightness(1.08)}
+code{font:12px/1.3 ui-monospace,Consolas,monospace;background:#f1f2f4;
+     padding:1px 4px;border-radius:3px}
+
+/* ---------------- top bar ---------------- */
+#top,#bar{display:flex;align-items:center;gap:10px;padding:7px 12px;background:var(--pn);
+     border-bottom:1px solid var(--bd);flex:none;flex-wrap:wrap}
+#bar{padding-top:5px;padding-bottom:5px}
+#top h1{font-size:14px;margin:0 6px 0 0;font-weight:700;letter-spacing:.2px}
+#top .sp{flex:1}
+.pill{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--bd);
+      border-radius:999px;padding:2px 9px;background:#fff;font-size:12px;color:var(--mut)}
+.pill b{color:var(--fg);font-size:13px}
+.lay{display:inline-flex;align-items:center;gap:5px;font-size:12px;border:1px solid var(--bd);
+     border-radius:6px;padding:3px 8px;background:#fff;cursor:pointer;user-select:none}
+.lay.off{opacity:.45}
+.lay i{width:16px;height:0;border-top-width:2.5px;border-top-style:solid;display:inline-block}
+.lay.dash i{border-top-style:dashed}
+/* 放置层画的是半透明色块，图例色标也用色块，别用线条误导 */
+.lay.mask i{height:11px;border-top:none;border-radius:2px;
+            background:rgba(124,58,237,.30);border:1px solid rgba(124,58,237,.55)}
+
+/* ---------------- layout ---------------- */
+#main{flex:1;display:flex;min-height:0}
+#side{width:288px;flex:none;background:var(--pn);border-right:1px solid var(--bd);
+      overflow:auto;padding:9px}
+#stage{flex:1;min-width:0;display:flex;flex-direction:column}
+#panel{width:308px;flex:none;background:var(--pn);border-left:1px solid var(--bd);
+       overflow:auto;padding:9px}
+h2{font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);
+   margin:12px 0 6px}
+h2:first-child{margin-top:0}
+
+/* ---------------- gallery ---------------- */
+.row{border:1px solid var(--bd);border-radius:7px;padding:7px 8px;margin-bottom:7px;
+     background:#fff;cursor:pointer}
+.row:hover{border-color:#b9bec6;background:#fbfcfd}
+.row.on{border-color:var(--c-uni);box-shadow:0 0 0 2px rgba(37,99,235,.14)}
+.row .t{display:flex;align-items:center;gap:6px}
+.row .t b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}
+.row .m{margin-top:4px;display:flex;flex-wrap:wrap;gap:4px}
+.tag{font-size:11px;border-radius:4px;padding:1px 6px;background:#eef0f3;color:#475569}
+.tag.mode{background:#e0e7ff;color:#3730a3}
+.tag.cost{background:#fef3c7;color:#92400e}
+.tag.warn{background:#fee2e2;color:#991b1b}
+.tag.txt{background:rgba(37,99,235,.12);color:#1d4ed8}
+.tag.sym{background:rgba(124,58,237,.12);color:#6d28d9}
+.tag.old{background:#e2e8f0;color:#475569;border:1px dashed #94a3b8;cursor:help}
+.del,.rerun{border:none;background:transparent;color:#9ca3af;padding:0 3px;font-size:14px}
+.del:hover{color:#dc2626;background:transparent}
+.rerun:hover{color:#2563eb;background:transparent}
+
+/* ---------------- job cards ---------------- */
+.job{border:1px solid var(--bd);border-left:3px solid var(--c-uni);border-radius:7px;
+     padding:7px 8px;margin-bottom:7px;background:#fff}
+.job.err{border-left-color:#dc2626}
+.job.ok{border-left-color:#16a34a}
+.job .jt{display:flex;gap:6px;align-items:center;font-size:12.5px}
+.job .jt b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.job .js{color:var(--mut);font-size:11.5px;margin-top:3px}
+.job .js.e{color:#b91c1c}
+.bar{height:6px;background:#eceef1;border-radius:4px;overflow:hidden;margin-top:6px}
+.bar i{display:block;height:100%;background:var(--c-uni);transition:width .3s}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:1px 8px;margin-top:6px;font-size:11.5px}
+.kv span{color:var(--mut)}
+.kv b{text-align:right;font-variant-numeric:tabular-nums}
+.jfoot{display:flex;align-items:center;gap:6px;margin-top:6px}
+.jfoot .pct{font-size:11.5px;color:var(--mut);flex:1;font-variant-numeric:tabular-nums}
+
+/* ---------------- viewer ---------------- */
+#viewport{flex:1;overflow:auto;background:#eceef1;position:relative}
+#viewport.pan{cursor:grabbing}
+#viewport svg{display:block;margin:16px}
+#hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+      color:#9aa0aa;font-size:14px;pointer-events:none;text-align:center;padding:20px}
+rect.bx{fill:transparent;vector-effect:non-scaling-stroke;cursor:pointer;pointer-events:all}
+.bx-uni{stroke:var(--c-uni);stroke-width:2.2}
+.bx-uni:hover,.bx-uni.pick{fill:rgba(37,99,235,.16)}
+.bx-vlm{stroke:var(--c-vlm);stroke-width:2}
+.bx-vlm:hover,.bx-vlm.pick{fill:rgba(234,88,12,.16)}
+/* 注意：静态 fill 必须写成 rect.bx.xxx —— 只写 .xxx 的话优先级 (0,0,1,0)
+   低于上面的 rect.bx{fill:transparent} (0,0,1,1)，会被静默盖掉。 */
+rect.bx.bx-add{stroke:var(--c-add);stroke-width:2.6;fill:rgba(220,38,38,.10)}
+.bx-add:hover,.bx-add.pick{fill:rgba(220,38,38,.22)}
+.bx-cov{stroke:var(--c-cov);stroke-width:1.6;stroke-opacity:.9}
+.bx-cov:hover,.bx-cov.pick{fill:rgba(22,163,74,.16)}
+.bx-sym{stroke:var(--c-sym);stroke-width:2}
+.bx-sym.line{stroke-dasharray:8 5}
+.bx-sym:hover,.bx-sym.pick{fill:rgba(124,58,237,.16)}
+/* 矢量匹配出来的放置：一页可能有几百个，虚线框会糊成一片噪点，
+   改成半透明色块（mask）—— 远看是分布，近看是位置，且整块可点。 */
+/* 图例编码标记：不是文字、也不是样例，灰点线示意（只在 Debug 里出现） */
+rect.bx.bx-mark{stroke:#94a3b8;stroke-width:1.4;stroke-dasharray:2 3;fill:rgba(148,163,184,.14)}
+rect.bx.bx-mark:hover,rect.bx.bx-mark.pick{fill:rgba(148,163,184,.34)}
+.arw-mask{fill-opacity:.28;stroke-width:1.2;stroke-opacity:.9}
+.arw-leader{fill:none;stroke-opacity:.95;stroke-linecap:round;stroke-linejoin:round}
+.arw-head{fill:none;stroke-opacity:1;stroke-linecap:round;stroke-linejoin:round}
+.steps{display:inline-flex;gap:5px;margin-left:10px;vertical-align:middle}
+.steps .st{display:inline-flex;align-items:center;gap:4px;padding:3px 7px;border:1px solid #2b3b36;border-radius:6px;font:600 10px/1 monospace;color:#9fb3ac;background:#121b18;cursor:help}
+.steps .st i{font-style:normal;font-weight:800}
+.steps .st.good{border-color:#3a7f6a;color:#8fe3c6}
+.steps .st.warn{border-color:#8b6230;color:#f3c77b}
+.steps .st.bad{border-color:#a34a52;color:#ff9d9d}
+.steps .st.off{opacity:.55}
+rect.bx.bx-plc{fill:rgba(124,58,237,.30);stroke:rgba(124,58,237,.55);stroke-width:.8}
+rect.bx.bx-plc:hover,rect.bx.bx-plc.pick{fill:rgba(124,58,237,.62);
+  stroke:var(--c-sym);stroke-width:1.6}
+.bx-plan{stroke:var(--c-plan);stroke-width:1.2;stroke-dasharray:7 6}
+.bx-plan:hover,.bx-plan.pick{fill:rgba(22,163,74,.07)}
+.bx-grp{stroke:var(--c-grp);stroke-width:1.6;stroke-dasharray:12 6}
+.bx-grp:hover,.bx-grp.pick{fill:rgba(100,116,139,.10)}
+.bx-drop{stroke:var(--c-drop);stroke-width:2;stroke-dasharray:3 3}
+.bx-drop:hover,.bx-drop.pick{fill:rgba(127,29,29,.18)}
+rect.bx.flash{fill:rgba(37,99,235,.35)}
+
+/* ---------------- info panel ---------------- */
+.num{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.num div{flex:1 1 60px;border:1px solid var(--bd);border-radius:6px;padding:5px 7px;background:#fff}
+.num b{display:block;font-size:19px;line-height:1.15;font-variant-numeric:tabular-nums}
+.num span{font-size:11px;color:var(--mut)}
+.item{border:1px solid var(--bd);border-radius:6px;padding:5px 7px;margin-bottom:5px;
+      background:#fff;cursor:pointer;font-size:12px}
+.item:hover{background:#f6f7f9}
+.item.on{border-color:var(--c-uni);background:#eff4ff}
+.item .h{display:flex;gap:5px;align-items:baseline}
+.item .h b{font-size:11px;color:var(--mut);font-variant-numeric:tabular-nums}
+.item .h span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.meta{font-size:11.5px;color:var(--mut);word-break:break-all}
+.meta b{color:var(--fg)}
+.empty{color:var(--mut);font-size:12px;padding:2px 0}
+
+/* ---------------- modal ---------------- */
+#modal{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;
+       align-items:center;justify-content:center;z-index:50}
+#modal .box{background:#fff;border-radius:10px;padding:16px;width:min(680px,92vw);
+            max-height:88vh;overflow:auto}
+#modal h3{margin:0 0 8px;font-size:15px}
+#modal textarea{width:100%;height:190px;font:12px/1.5 ui-monospace,Consolas,monospace;
+                border:1px solid var(--bd);border-radius:6px;padding:8px;resize:vertical}
+.note{background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:7px 9px;
+      font-size:12px;color:#92400e;margin:8px 0}
+.err{color:#b91c1c;font-size:12px;min-height:16px}
+.frow{display:flex;align-items:center;gap:8px;margin:8px 0}
+</style>
+
+<div id="top">
+  <h1>fence_lite</h1>
+  <button class="primary" id="bUp">上传 PDF</button>
+  <span class="sp"></span>
+  <span class="pill">页 <b id="pgNow">–</b> / <b id="pgAll">–</b></span>
+  <button id="bPrev">上一页</button>
+  <input id="pgIn" type="number" min="1" style="width:62px;padding:3px 5px;border:1px solid var(--bd);border-radius:6px">
+  <button id="bNext">下一页</button>
+  <label class="lay off" id="tgOnly"><input type="checkbox"> 只看有结果的页</label>
+  <span class="sp"></span>
+  <button id="zOut">−</button><span class="pill"><b id="zPct">–</b></span><button id="zIn">+</button>
+  <button id="zFit">适应</button>
+</div>
+
+<div id="bar">
+  <label class="lay" id="tgTxt"><input type="checkbox" checked><i style="border-top-color:var(--c-uni)"></i>文字并集</label>
+  <label class="lay" id="tgSym"><input type="checkbox" checked><i style="border-top-color:var(--c-sym)"></i>图例样例符号</label>
+  <label class="lay mask" id="tgArw"><input type="checkbox" checked>箭头引线</label><span id="stepStrip" class="steps"></span><label class="lay mask" id="tgPlc"><input type="checkbox" checked><i></i>plan 内放置</label>
+  <label class="lay dash" id="tgPlan"><input type="checkbox" checked><i style="border-top-color:var(--c-plan)"></i>plan 视图框</label>
+  <label class="lay dash off" id="tgGrp"><input type="checkbox"><i style="border-top-color:var(--c-grp)"></i>页面分区</label>
+  <span class="sp"></span>
+  <label class="lay off" id="tgDbg"><input type="checkbox">Debug（拆分来源 + 被剥离符号）</label>
+</div>
+
+<div id="main">
+  <div id="side">
+    <h2>处理中</h2>
+    <div id="jobs"><div class="empty">暂无任务</div></div>
+    <h2>项目</h2>
+    <div id="gallery"><div class="empty">还没有项目，先上传一个 PDF</div></div>
+  </div>
+  <div id="stage">
+    <div id="viewport"><div id="hint">左侧选一个项目</div></div>
+  </div>
+  <div id="panel">
+    <h2>本页数字</h2>
+    <div class="num">
+      <div><b id="nTxt">0</b><span>文字</span></div>
+      <div><b id="nSym">0</b><span>符号</span></div>
+      <div><b id="nPlc">0</b><span>放置</span></div>
+      <div><b id="nPlan">0</b><span>plan 组</span></div>
+    </div>
+    <div id="sel"><div class="empty">点图上任意框查看详情</div></div>
+    <h2>本页条目</h2>
+    <div id="list"></div>
+  </div>
+</div>
+
+<div id="modal">
+  <div class="box">
+    <h3>上传 PDF</h3>
+    <div class="frow">
+      <input id="upFile" type="file" accept="application/pdf">
+    </div>
+    <div>检测目标（找什么）：可以改成找门 / 树 / 消火栓等</div>
+    <textarea id="upTarget" spellcheck="false"></textarea>
+    <div class="note">
+      默认目标 = 找 fence 相关文字，会跑完整四步：文字 → 图例样例符号 → 视图分类 →
+      plan 视图内符号匹配。<b>一旦把目标改成别的东西，就只跑文字步</b> ——
+      图例符号与 plan 放置是 fence 专属逻辑，对任意目标不成立，会自动跳过。
+    </div>
+    <div class="err" id="upErr"></div>
+    <div class="frow" style="justify-content:flex-end">
+      <button id="upCancel">取消</button>
+      <button class="primary" id="upRun">开始处理</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const NS='http://www.w3.org/2000/svg';
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const STAGE_CN={queued:'排队中',text:'第 1 步 · 找文字',symbols:'第 2 步 · 图例样例符号',
+  views:'第 3 步 · 视图分类',placements:'第 4 步 · plan 内符号匹配',
+  arrows:'附加 · 箭头引线',done:'完成',error:'出错',cancelled:'已取消',
+  interrupted:'被中断（服务重启）'};
+
+let PRESET='';                 // 预置检测目标
+let OV=[];                     // /api/overview
+let JOBS={};                   // slug -> job status
+let POLL={};                   // slug -> interval id
+let CUR=null;                  // {slug,page}
+let PAGE=null;                 // /api/page payload
+let LOOK={};                   // key -> {kind,label,text,box,idx,rect,note}
+let picked=null;
+let svg=null, scale=1, fitS=1, epoch=0;
+
+/* =============== 通用 =============== */
+/* 挂在反代子路径下也要能跑：Caddy 的 handle_path 会把 /fencelite 前缀剥掉，
+   页面自己发的绝对路径 /api/... 就会打到站点根上（404）。所以所有请求都以
+   当前页面所在目录为基准拼。直接挂在根目录时 BASE='/'，行为不变。 */
+const BASE=location.pathname.replace(/[^/]*$/,'');
+const U=p=>BASE+String(p).replace(/^\//,'');
+async function api(url,opt){
+  const r=await fetch(U(url),opt);
+  let j=null;
+  try{ j=await r.json(); }catch(e){}
+  return {ok:r.ok,status:r.status,body:j};
+}
+const fmtUsd=v=>'$'+(Number(v||0)).toFixed(Number(v||0)<1?4:2);
+const fmtSec=v=>{const s=Number(v||0);return s<60?s.toFixed(1)+'s':Math.floor(s/60)+'m'+Math.round(s%60)+'s'};
+
+/* =============== 上传 =============== */
+$('bUp').onclick=async()=>{
+  if(!PRESET){
+    const r=await api('/api/preset_target');
+    PRESET=(r.body&&r.body.target)||'';
+  }
+  $('upTarget').value=PRESET;
+  $('upFile').value=''; $('upErr').textContent='';
+  $('modal').style.display='flex';
+};
+$('upCancel').onclick=()=>{$('modal').style.display='none'};
+$('modal').onclick=e=>{if(e.target===$('modal'))$('modal').style.display='none'};
+$('upRun').onclick=async()=>{
+  const f=$('upFile').files[0];
+  if(!f){ $('upErr').textContent='先选一个 PDF 文件'; return; }
+  const fd=new FormData();
+  fd.append('pdf',f);
+  // 没动过就发空串 → 后端用默认 fence 目标（完整四步）
+  const t=$('upTarget').value||'';
+  fd.append('target', t.trim()===PRESET.trim()?'':t);
+  $('upRun').disabled=true; $('upErr').textContent='上传中…';
+  const r=await api('/api/upload',{method:'POST',body:fd});
+  $('upRun').disabled=false;
+  if(!r.ok||!r.body||r.body.error){
+    $('upErr').textContent='失败：'+((r.body&&r.body.error)||('HTTP '+r.status));
+    return;
+  }
+  $('modal').style.display='none';
+  JOBS[r.body.slug]=r.body.job||{slug:r.body.slug,stage:'queued'};
+  renderJobs(); await loadOverview();
+  startPoll(r.body.slug);
+  show(r.body.slug,1);
+};
+
+/* =============== 任务卡片 =============== */
+function renderJobs(){
+  const box=$('jobs'), list=Object.values(JOBS).filter(j=>j&&j.slug)
+    .filter(j=>!(j.done&&j.ok))
+    .sort((a,b)=>(b.started||0)-(a.started||0));
+  box.innerHTML='';
+  if(!list.length){ box.innerHTML='<div class="empty">暂无任务</div>'; return; }
+  for(const j of list){
+    const llm=j.llm||{}, by=llm.by_model||{};
+    const failed=j.done&&!j.ok;
+    const d=document.createElement('div');
+    d.className='job'+(failed?' err':'');
+    const pct=Math.max(0,Math.min(100,Math.round((j.progress||0)*100)));
+    const pagey=!j.done&&Number(j.stage_total)>0;
+    let h='<div class="jt"><b title="'+esc(j.slug)+'">'+esc(j.slug)+'</b>'
+      +'<span class="tag mode">'+(j.mode==='custom'?'自定义目标':'fence')+'</span></div>';
+    if(failed){
+      h+='<div class="js e">'+(j.cancelled?'已取消':'出错：'+esc(j.error||'未知错误'))+'</div>';
+    }else{
+      h+='<div class="js">'+esc(STAGE_CN[j.stage]||j.stage||'处理中')
+        +(pagey?' · '+(j.stage_done||0)+'/'+j.stage_total+' 页':'')+'</div>';
+    }
+    for(const w of (j.warnings||[]))h+='<div class="js e">⚠ '+esc(w)+'</div>';
+    h+='<div class="kv">'
+      +'<span>模型调用</span><b>'+(llm.calls||0)+' 次</b>'
+      +'<span>累计模型耗时</span><b>'+fmtSec(llm.model_seconds)+'</b>'
+      +'<span>墙钟耗时</span><b>'+fmtSec(j.wall_seconds)+'</b>'
+      +'<span>总费用</span><b>'+fmtUsd(llm.cost_usd)+'</b>';
+    for(const [m,v] of Object.entries(by))
+      h+='<span style="padding-left:8px">· '+esc(m)+'</span><b>'+fmtUsd(v.cost_usd)
+        +' / '+(v.calls||0)+' 次</b>';
+    h+='</div>';
+    if(!j.done){
+      h+='<div class="bar"><i style="width:'+pct+'%"></i></div>'
+        +'<div class="jfoot"><span class="pct">'+pct+'%</span>'
+        +'<button class="jc"'+(j.cancel_requested?' disabled':'')+'>'
+        +(j.cancel_requested?'正在取消…':'取消')+'</button></div>';
+    }else if(failed){
+      h+='<div class="jfoot"><span class="pct"></span><button class="jd">删除项目</button></div>';
+    }
+    d.innerHTML=h;
+    const c=d.querySelector('.jc'); if(c)c.onclick=()=>cancelJob(j.slug);
+    const x=d.querySelector('.jd'); if(x)x.onclick=()=>delProject(j.slug);
+    box.appendChild(d);
+  }
+}
+function startPoll(slug){
+  if(POLL[slug])return;
+  const tick=async()=>{
+    const r=await api('/api/job/'+encodeURIComponent(slug));
+    const j=r.body;
+    if(!j||j.error)return;
+    JOBS[slug]=j; renderJobs();
+    if(j.done){
+      clearInterval(POLL[slug]); delete POLL[slug];
+      await loadOverview();
+      if(j.ok&&CUR&&CUR.slug===slug)show(slug,CUR.page);
+    }
+  };
+  tick(); POLL[slug]=setInterval(tick,2000);
+}
+async function resumeJobs(){
+  const r=await api('/api/jobs');            // 数组，最新的在前
+  for(const j of (Array.isArray(r.body)?r.body:[])){
+    if(!j||!j.slug)continue;
+    JOBS[j.slug]=j;
+    if(!j.done)startPoll(j.slug);
+  }
+  renderJobs();
+}
+async function cancelJob(slug){
+  if(JOBS[slug]){JOBS[slug].cancel_requested=true;renderJobs()}
+  await api('/api/cancel/'+encodeURIComponent(slug),{method:'POST'});
+}
+async function delProject(slug){
+  if(!confirm('删除项目 "'+slug+'"？会连同 PDF 和全部结果一起删掉，不可恢复。'))return;
+  const r=await api('/api/project/'+encodeURIComponent(slug),{method:'DELETE'});
+  if(!r.ok||!r.body||r.body.error){alert('删除失败：'+((r.body&&r.body.error)||r.status));return}
+  if(POLL[slug]){clearInterval(POLL[slug]);delete POLL[slug]}
+  delete JOBS[slug]; renderJobs();
+  if(CUR&&CUR.slug===slug){CUR=null;PAGE=null;clearViewer('左侧选一个项目')}
+  await loadOverview();
+}
+
+/* 重新跑一个已有的 PDF。默认先清空该项目全部缓存（只留 input.pdf），
+   这样出来的结果一定是当前这套代码算的，不可能被任何旧缓存带偏 —— 代价是
+   步骤1/2 的模型调用全部重新付费。 */
+async function rerunProject(p){
+  const t=prompt('重新跑「'+p.slug+'」\n\n'
+    +'会先清空这个项目的全部缓存（只保留 PDF），然后从头跑一遍：\n'
+    +'  · 结果保证由当前算法产出，不受任何旧缓存影响\n'
+    +'  · 模型调用全部重新计费\n\n'
+    +'下面是检测目标，可以改（改成非默认目标就只跑文字步）：',
+    p.target||PRESET||'');
+  if(t===null)return;
+  const r=await api('/api/rerun/'+encodeURIComponent(p.slug),
+    {method:'POST',headers:{'Content-Type':'application/json'},
+     body:JSON.stringify({target:t,reset:true})});
+  if(!r.ok||!r.body||r.body.error){
+    alert('重新跑失败：'+((r.body&&r.body.error)||r.status));return;
+  }
+  startPoll(p.slug);
+  await loadOverview();
+}
+
+/* =============== 画廊 =============== */
+async function loadOverview(){
+  const r=await api('/api/overview');
+  OV=Array.isArray(r.body)?r.body:[];
+  const box=$('gallery'); box.innerHTML='';
+  if(!OV.length){box.innerHTML='<div class="empty">还没有项目，先上传一个 PDF</div>';return}
+  for(const p of OV){
+    const llm=p.llm||{};
+    const d=document.createElement('div');
+    d.className='row'+(CUR&&CUR.slug===p.slug?' on':'');
+    let h='<div class="t"><b title="'+esc(p.slug)+'">'+esc(p.slug)+'</b>'
+      +'<button class="rerun" title="重新跑这个 PDF（先清空缓存）">↻</button>'
+      +'<button class="del" title="删除">✕</button></div><div class="m">'
+      +'<span class="tag mode">'+(p.mode==='custom'?'自定义目标':'fence')+'</span>'
+      +'<span class="tag">'+(p.page_count||0)+' 页</span>';
+    if(p.processing){
+      h+='<span class="tag warn">处理中…</span>';
+    }else{
+      h+='<span class="tag txt">文字 '+(p.vlm+p.added)+'</span>'
+        +'<span class="tag sym">符号 '+(p.symbols||0)+'</span>'
+        +'<span class="tag sym">放置 '+(p.placements||0)+'</span>';
+      if(llm.cost_usd!=null)h+='<span class="tag cost">'+fmtUsd(llm.cost_usd)+'</span>';
+      if(p.no_text_layer)h+='<span class="tag warn">无文字层</span>';
+      /* 结果是从旧服务搬进来的付费缓存，不是这套代码在这里跑出来的。
+         想确认当前算法的产出就点 ↻ 重新跑（会先清空该项目全部缓存）。 */
+      /* 盘上有符号但算法版本变了 → 必须说「待重跑」。显示成「符号 0」会被
+         读成「这份图纸没有图例符号」，是最误导的失败方式。 */
+      if(p.stale_symbols)h+='<span class="tag warn" title="算法版本已更新，这个项目的符号结果是旧版本算的，点 ↻ 重新跑（步骤2 的付费结果会复用，只补跑差异）">符号待重跑 '+p.stale_symbols+'</span>';
+      if(p.imported)h+='<span class="tag old" title="'
+        +esc((p.imported.note||'')+'　导入自 '+(p.imported.from||'')
+             +'　'+(p.imported.at||''))+'">旧缓存</span>';
+    }
+    if(p.job_error)h+='<span class="tag warn">失败</span>';
+    h+='</div>';
+    d.innerHTML=h;
+    d.querySelector('.del').onclick=e=>{e.stopPropagation();delProject(p.slug)};
+    d.querySelector('.rerun').onclick=e=>{e.stopPropagation();rerunProject(p)};
+    d.onclick=()=>{
+      const pg=(p.pages||[]).find(x=>(x.vlm+x.added)>0)||{page:1};
+      show(p.slug,pg.page);
+    };
+    box.appendChild(d);
+  }
+}
+const ovRow=slug=>OV.find(x=>x.slug===slug)||null;
+function pageList(slug){
+  const row=ovRow(slug); if(!row)return [];
+  const all=row.pages||[];
+  if(!$('tgOnly').querySelector('input').checked)return all.map(x=>x.page);
+  const hit=all.filter(x=>(x.vlm+x.added)>0).map(x=>x.page);
+  return hit.length?hit:all.map(x=>x.page);
+}
+
+/* =============== 打开一页 =============== */
+function clearViewer(msg){
+  const vp=$('viewport');
+  vp.querySelectorAll('svg').forEach(s=>s.remove());
+  svg=null; LOOK={}; picked=null;
+  $('hint').style.display=''; $('hint').textContent=msg;
+  ['nTxt','nSym','nPlc','nPlan'].forEach(id=>$(id).textContent='0');
+  $('sel').innerHTML='<div class="empty">点图上任意框查看详情</div>';
+  $('list').innerHTML='';
+  $('pgNow').textContent='–'; $('pgAll').textContent='–'; $('zPct').textContent='–';
+}
+async function show(slug,page){
+  CUR={slug,page:Number(page)||1};
+  const my=++epoch;
+  loadOverview();
+  $('hint').style.display=''; $('hint').textContent='载入中…';
+  const r=await api('/api/page/'+encodeURIComponent(slug)+'/'+CUR.page);
+  if(my!==epoch)return;
+  if(r.status===409){
+    PAGE=null; clearViewer('结果已过期（'+esc((r.body&&r.body.reason)||'stale')
+      +'），需要重新跑一次上传作业');
+    return;
+  }
+  if(!r.ok||!r.body||r.body.error){
+    PAGE=null; clearViewer('打不开这一页：'+((r.body&&r.body.error)||('HTTP '+r.status)));
+    return;
+  }
+  PAGE=r.body;
+  $('pgNow').textContent=PAGE.page; $('pgAll').textContent=PAGE.page_count;
+  $('pgIn').value=PAGE.page; $('pgIn').max=PAGE.page_count;
+  const c=PAGE.counts||{};
+  $('nTxt').textContent=c.text||0; $('nSym').textContent=c.symbols||0;
+  $('nPlc').textContent=c.placements||0; $('nPlan').textContent=c.plan_groups||0;
+  /* 这一页的符号被版本戳扣着没发 → 在符号计数上直接标出来，别显示成 0 */
+  if(PAGE.symbols_stale){
+    $('nSym').textContent='待重跑';
+    $('nSym').parentElement.title='盘上有 '+(PAGE.stale_symbols||0)
+      +' 个符号，但它们是旧版本算法算的，点画廊里的 ↻ 重新跑';
+  }else{
+    $('nSym').parentElement.title='';
+  }
+  build();
+  renderList();
+}
+$('bPrev').onclick=()=>step(-1);
+$('bNext').onclick=()=>step(1);
+function step(dir){
+  if(!CUR)return;
+  const list=pageList(CUR.slug);
+  if(!list.length){show(CUR.slug,Math.max(1,CUR.page+dir));return}
+  let i=list.indexOf(CUR.page);
+  if(i<0){ // 当前页不在过滤集里：跳到方向上最近的一页
+    const near=dir>0?list.find(p=>p>CUR.page):[...list].reverse().find(p=>p<CUR.page);
+    if(near!=null)show(CUR.slug,near);
+    return;
+  }
+  i+=dir;
+  if(i<0||i>=list.length)return;
+  show(CUR.slug,list[i]);
+}
+$('pgIn').onchange=()=>{
+  if(!CUR)return;
+  const p=Math.max(1,Math.min(Number($('pgIn').value)||1,(PAGE&&PAGE.page_count)||1));
+  show(CUR.slug,p);
+};
+$('tgOnly').querySelector('input').onchange=e=>{
+  $('tgOnly').classList.toggle('off',!e.target.checked);
+};
+
+/* =============== 画图层 =============== */
+const DBG=()=>$('tgDbg').querySelector('input').checked;
+// 分层状态带。一个空结果可能来自任何一层：分类没跑、没有 plan 取景、锚全在
+// plan 外、边车算失败、结果不当期。把每一层单独摆出来，才不用靠猜。
+const ARW_STATE={
+  disabled:['关','箭头接缝未启用（ARROWS=1 未设）','off'],
+  'views-pending':['待分类','步骤3 还没给这页做视图分类，没有分类就 fail-closed','warn'],
+  'no-plan':['无 plan','这页分类过了，但没有 plan 视图；引线只在俯视图里找','off'],
+  'no-anchor-in-plan':['锚在 plan 外','有 plan 取景框，但没有任何锚完整落在框内','off'],
+  'not-run':['未运行','该跑但没有结果，作业可能没跑到这页','warn'],
+  failed:['失败','边车计算失败，见提示','bad'],
+  stale:['不当期','盘上有结果但签名/版本对不上，页面不显示它','warn'],
+  ok:['完成','','good'],
+};
+function renderSteps(){
+  const el=$('stepStrip'); if(!el)return;
+  const rec=(PAGE&&PAGE.record)||{};
+  const st=rec.arrows_status||{state:'not-run'};
+  const parts=[];
+  const chip=(label,txt,cls,tip)=>'<b class="st '+cls+'" title="'+esc(tip||'')+'">'
+      +esc(label)+'<i>'+esc(txt)+'</i></b>';
+  // ① 文字 ② 符号 ③ 视图分类 ④ 放置 ⑤ 箭头
+  const nText=(PAGE.items||[]).length;
+  parts.push(chip('①文字', nText?String(nText):'0', nText?'good':'off','步骤1 融合出的文字锚数'));
+  const nSym=((PAGE.symbols&&PAGE.symbols.symbols)||[]).length;
+  parts.push(chip('②符号', String(nSym), nSym?'good':'off','步骤2 图例样例符号数'));
+  const nPlan=(PAGE.plan_boxes||[]).length;
+  parts.push(chip('③plan', String(nPlan),
+      nPlan?'good':(PAGE.view_types_pending?'warn':'off'),
+      PAGE.view_types_pending?'步骤3 视图分类不当期':'步骤3 判定出的 plan 视图框数'));
+  const nPlc=(PAGE.counts&&PAGE.counts.placements)||0;
+  parts.push(chip('④放置', String(nPlc), nPlc?'good':'off','步骤4 矢量模板匹配出的放置数'));
+  const meta=ARW_STATE[st.state]||['?',st.state,'warn'];
+  const txt = st.state==='ok' ? (st.count+'/'+(st.anchors!==undefined?st.anchors:'?')) : meta[0];
+  parts.push(chip('⑤箭头', txt, st.state==='ok'&&st.count===0?'off':meta[2],
+      st.state==='ok' ? (st.count+' 个锚找到箭头，共 '+st.anchors+' 个锚')
+                      : (meta[1]+(st.detail?(' — '+st.detail):''))));
+  el.innerHTML=parts.join('');
+}
+function build(){
+  const vp=$('viewport');
+  vp.querySelectorAll('svg').forEach(s=>s.remove());
+  LOOK={}; picked=null;
+  const rec=PAGE.record||{}, W=PAGE.w, H=PAGE.h;
+  svg=document.createElementNS(NS,'svg');
+  svg.setAttribute('viewBox','0 0 '+W+' '+H);
+  const im=document.createElementNS(NS,'image');
+  im.setAttribute('href',U(PAGE.img)); im.setAttribute('width',W); im.setAttribute('height',H);
+  svg.appendChild(im);
+  const mk=id=>{const g=document.createElementNS(NS,'g');g.id=id;svg.appendChild(g);return g};
+  const gPlan=mk('gPlan'), gGrp=mk('gGrp'), gUni=mk('gUni'), gVlm=mk('gVlm'),
+        gAdd=mk('gAdd'), gCov=mk('gCov'), gPlc=mk('gPlc'), gSym=mk('gSym'),
+        gDrop=mk('gDrop'), gMark=mk('gMark'), gArw=mk('gArw');
+  const pad=Math.max(4,2.5/1000*W);   // 矢量框贴着字形，放一点气
+  // 箭头 / 引线层：给真实绘制的引线和箭头笔画上色，每个 callout 一种颜色；
+  // 末端只用半透明遮罩标出区域，不画额外的点或合成虚线。
+  const ARW_COLORS=['#ff9d3c','#4fc3f7','#a78bfa','#4ade80','#f472b6',
+                    '#facc15','#fb7185','#38bdf8','#c084fc','#34d399'];
+  const px=v=>v[1]/1000*W, py=v=>v[0]/1000*H;
+  const drawArrow=(key,ent,idx)=>{
+    const color=ARW_COLORS[idx%ARW_COLORS.length];
+    const stroke=(pts,cls,w)=>{
+      if(!Array.isArray(pts)||pts.length<2)return;
+      const ln=document.createElementNS(NS,'polyline');
+      ln.setAttribute('points',pts.filter(q=>Array.isArray(q)&&q.length===2)
+        .map(q=>px(q).toFixed(1)+','+py(q).toFixed(1)).join(' '));
+      ln.setAttribute('class',cls); ln.setAttribute('stroke',color);
+      ln.setAttribute('stroke-width',w); ln.dataset.k='arw:'+key;
+      gArw.appendChild(ln);
+    };
+    for(const pts of (ent.leader_strokes||[]))stroke(pts,'arw-leader',1.6);
+    for(const pts of (ent.arrow_strokes||[]))stroke(pts,'arw-head',2.4);
+    for(const t of (ent.targets||[])){
+      const box=t.box_2d;
+      if(!Array.isArray(box)||box.length!==4)continue;
+      const rc=document.createElementNS(NS,'rect');
+      rc.setAttribute('x',px([box[0],box[1]])); rc.setAttribute('y',py([box[0],box[1]]));
+      rc.setAttribute('width',Math.max((box[3]-box[1])/1000*W,3));
+      rc.setAttribute('height',Math.max((box[2]-box[0])/1000*H,3));
+      rc.setAttribute('class','arw-mask'); rc.setAttribute('fill',color);
+      rc.setAttribute('stroke',color); rc.dataset.k='arw:'+key;
+      const ti=document.createElementNS(NS,'title');
+      ti.textContent='箭头末端 · '+(t.terminal_kind||'')+' · '+(ent.note||'');
+      rc.appendChild(ti);
+      gArw.appendChild(rc);
+    }
+  };
+  Object.entries(((PAGE.record&&PAGE.record.arrows)||{}))
+        .forEach(([key,ent],i)=>drawArrow(key,ent,i));
+  renderSteps();
+  const put=(g,box,cls,key,ent,padded)=>{
+    if(!Array.isArray(box)||box.length!==4)return null;
+    const p=padded?pad:0;
+    const x=box[1]/1000*W-p, y=box[0]/1000*H-p,
+          w=(box[3]-box[1])/1000*W+2*p, h=(box[2]-box[0])/1000*H+2*p;
+    const rc=document.createElementNS(NS,'rect');
+    rc.setAttribute('x',x); rc.setAttribute('y',y);
+    rc.setAttribute('width',Math.max(w,2)); rc.setAttribute('height',Math.max(h,2));
+    rc.setAttribute('class','bx '+cls); rc.dataset.k=key;
+    const tip=document.createElementNS(NS,'title');
+    tip.textContent=(ent.label?ent.label+' · ':'')+(ent.text||'')+(ent.note?' · '+ent.note:'');
+    rc.appendChild(tip);
+    g.appendChild(rc);
+    LOOK[key]=Object.assign({rect:rc,box:box},ent);
+    return {x,y};
+  };
+  // plan 视图框（解释 shape 放置的搜索范围）
+  (PAGE.plan_boxes||[]).forEach((b,i)=>put(gPlan,b,'bx-plan','pl'+i,
+    {kind:'plan',label:'plan 视图',text:'shape 放置只在这个框里匹配'}));
+  // 页面分区
+  ((PAGE.symbols||{}).groups||[]).forEach((g,i)=>put(gGrp,g.box_2d,'bx-grp','gp'+i,
+    {kind:'group',label:g.kind||'group',
+     text:(g.view_type?'view_type='+g.view_type:'')+(g.view_type_reason?' · '+g.view_type_reason:'')}));
+  // 文字层：默认只画并集；Debug 打开后拆成 vlm / vec_added / vec_covered
+  // 图例编码标记（平面图上每处印的 "4CL" 那种）不是独立的 fence 文字 —— 画进
+  // 文字层就成了"symbol 被框成文字"。默认不画，Debug 里单独一层解释它是什么。
+  const MARK=new Set(PAGE.marker_codes||[]);
+  const nv=(rec.vlm_items||[]).length;
+  (PAGE.items||[]).forEach((it,i)=>{
+    const fromVec=i>=nv;
+    const ent={kind:'text',label:it.label||'',text:it.text||'',idx:i,
+               note:fromVec?'矢量补检':'纯模型',tbl:it.tbl};
+    if(MARK.has(i)){
+      if(DBG())put(gMark,it.box_2d,'bx-mark','t'+i,
+        {kind:'marker',label:'图例编码标记',text:it.text||'',idx:i,
+         note:'与图例某一行的编码相同 → 是那一行的实例，不是独立的 fence 文字；已从文字层隐藏'},true);
+      return;
+    }
+    if(DBG())put(fromVec?gAdd:gVlm,it.box_2d,fromVec?'bx-add':'bx-vlm','t'+i,ent,fromVec);
+    else put(gUni,it.box_2d,'bx-uni','t'+i,ent,fromVec);
+  });
+  if(DBG())(rec.vec_covered||[]).forEach((it,i)=>put(gCov,it.box_2d,'bx-cov','c'+i,
+    {kind:'covered',label:it.label||'',text:it.text||'',note:'矢量文字已被模型框覆盖'},true));
+  // 图例样例 symbol + 它在 plan 里的放置
+  ((PAGE.symbols||{}).symbols||[]).forEach((s,i)=>{
+    const cat=s.category||'symbol';
+    const lab=cat+(s.value?' '+s.value:'');
+    const owner=(PAGE.items||[])[s.text_index];
+    const note=[s.placement_note,s.placement_error,
+                s.dropped_outside_plan?('plan 外丢弃 '+s.dropped_outside_plan):'']
+               .filter(Boolean).join(' · ');
+    // 不在图上写 "shape 4.6" 这种角标：图例行挨得很近，几个角标必然叠在一起，
+    // 反而盖住底图。类别与编号点框后在右栏看。
+    put(gSym,s.box_2d,'bx-sym'+(cat==='line'?' line':''),'sy'+i,
+      {kind:'symbol',label:lab,text:owner?('归属文字：'+(owner.text||'')):'',
+       idx:s.text_index,note:note});
+    (s.placements||[]).forEach((b,j)=>put(gPlc,b,'bx-plc','sp'+i+'_'+j,
+      {kind:'placement',label:lab,
+       text:'第 '+(j+1)+'/'+s.placements.length+' 个同款放置（本地矢量匹配）',
+       idx:s.text_index}));
+  });
+  // Debug：被硬闸剥掉的 symbol
+  if(DBG())(PAGE.dropped_symbols||[]).forEach((s,i)=>put(gDrop,s.box_2d,'bx-drop','dr'+i,
+    {kind:'dropped',label:(s.category||'symbol')+(s.value?' '+s.value:''),
+     text:s.reason||'',idx:s.text_index,note:'已被发布过滤剥离'}));
+  vp.appendChild(svg);
+  svg.addEventListener('click',e=>{
+    const k=e.target&&e.target.dataset?e.target.dataset.k:null;
+    if(k)pick(k,false);
+  });
+  syncLayers();
+  const fw=(vp.clientWidth-48)/W, fh=(vp.clientHeight-48)/H;
+  fitS=Math.min(fw,fh)||1;
+  setScale(fitS);
+  vp.scrollLeft=0; vp.scrollTop=0;
+  $('hint').style.display='none';
+}
+const LAYERS=[['tgTxt',['gUni','gVlm','gAdd','gCov']],['tgSym',['gSym']],
+              ['tgPlc',['gPlc']],['tgPlan',['gPlan']],['tgGrp',['gGrp']],
+              ['tgDbg',['gDrop','gMark']],['tgArw',['gArw']]];
+function syncLayers(){
+  for(const [tg,ids] of LAYERS){
+    const on=$(tg).querySelector('input').checked;
+    $(tg).classList.toggle('off',!on);
+    for(const id of ids){
+      const g=document.getElementById(id);
+      if(!g)continue;
+      if(id==='gDrop')g.style.display=(on&&DBG())?'':'none';
+      else g.style.display=on?'':'none';
+    }
+  }
+}
+for(const [tg] of LAYERS){
+  $(tg).querySelector('input').addEventListener('change',()=>{
+    if(tg==='tgDbg'){ if(PAGE)build(); return; }   // 重画：拆分/合并文字层
+    syncLayers();
+  });
+}
+
+/* =============== 选中 / 详情 =============== */
+function pick(key,fly){
+  const e=LOOK[key]; if(!e)return;
+  if(picked&&LOOK[picked])LOOK[picked].rect.classList.remove('pick');
+  picked=key; e.rect.classList.add('pick');
+  const rows=[['类型',e.kind],['label',e.label],['text',e.text],
+              ['box_2d','['+e.box.map(v=>Math.round(v*10)/10).join(', ')+']'],
+              ['union idx',e.idx==null?'—':e.idx],['备注',e.note]];
+  $('sel').innerHTML='<div class="item on"><div class="meta">'
+    +rows.filter(r=>r[1]!==''&&r[1]!=null)
+         .map(r=>'<div><b>'+esc(r[0])+'</b>: '+esc(r[1])+'</div>').join('')
+    +'</div></div>';
+  document.querySelectorAll('#list .item').forEach(n=>
+    n.classList.toggle('on',n.dataset.k===key));
+  if(fly){
+    const vp=$('viewport'), b=e.rect;
+    const x=+b.getAttribute('x'), y=+b.getAttribute('y'),
+          w=+b.getAttribute('width'), h=+b.getAttribute('height');
+    vp.scrollLeft=(x+w/2)*scale-vp.clientWidth/2;
+    vp.scrollTop=(y+h/2)*scale-vp.clientHeight/2;
+    b.classList.remove('flash'); void b.getBoundingClientRect(); b.classList.add('flash');
+    setTimeout(()=>b.classList.remove('flash'),1200);
+  }
+}
+function renderList(){
+  const box=$('list'); box.innerHTML='';
+  const add=(key,head,sub)=>{
+    const d=document.createElement('div');
+    d.className='item'; d.dataset.k=key;
+    d.innerHTML='<div class="h"><b>'+esc(head)+'</b><span>'+esc(sub)+'</span></div>';
+    d.onclick=()=>pick(key,true);
+    box.appendChild(d);
+  };
+  (PAGE.items||[]).forEach((it,i)=>add('t'+i,'#'+i,it.text||'(无文字)'));
+  ((PAGE.symbols||{}).symbols||[]).forEach((s,i)=>{
+    const n=(s.placements||[]).length;
+    add('sy'+i,(s.category||'symbol')+(s.value?' '+s.value:''),
+        n?('放置 '+n+' 处'):(s.placement_error||s.placement_note||'无放置'));
+  });
+  if(DBG())(PAGE.dropped_symbols||[]).forEach((s,i)=>
+    add('dr'+i,'剥离 '+(s.category||'symbol'),s.reason||''));
+  if(!box.children.length)box.innerHTML='<div class="empty">本页没有任何结果</div>';
+}
+
+/* =============== 缩放 / 平移 =============== */
+function setScale(s,cx,cy){
+  if(!PAGE||!svg)return;
+  const vp=$('viewport'), rect=vp.getBoundingClientRect();
+  const ax=cx===undefined?rect.width/2:cx-rect.left;
+  const ay=cy===undefined?rect.height/2:cy-rect.top;
+  const ix=(vp.scrollLeft+ax)/scale, iy=(vp.scrollTop+ay)/scale;
+  scale=Math.min(8,Math.max(fitS*0.3,s));
+  svg.setAttribute('width',PAGE.w*scale); svg.setAttribute('height',PAGE.h*scale);
+  vp.scrollLeft=ix*scale-ax; vp.scrollTop=iy*scale-ay;
+  $('zPct').textContent=Math.round(scale*100)+'%';
+}
+$('zIn').onclick=()=>setScale(scale*1.25);
+$('zOut').onclick=()=>setScale(scale/1.25);
+$('zFit').onclick=()=>{if(PAGE){setScale(fitS);const vp=$('viewport');vp.scrollLeft=0;vp.scrollTop=0}};
+$('viewport').addEventListener('wheel',e=>{
+  if(!PAGE)return;
+  e.preventDefault();
+  setScale(scale*(e.deltaY<0?1.18:1/1.18),e.clientX,e.clientY);
+},{passive:false});
+(()=>{   // 拖拽平移；移动阈值以内仍然算点击
+  const vp=$('viewport'); let st=null;
+  vp.addEventListener('mousedown',e=>{
+    if(e.button!==0)return;
+    st={x:e.clientX,y:e.clientY,sl:vp.scrollLeft,st:vp.scrollTop,moved:false};
+  });
+  window.addEventListener('mousemove',e=>{
+    if(!st)return;
+    const dx=e.clientX-st.x, dy=e.clientY-st.y;
+    if(Math.abs(dx)+Math.abs(dy)>4){st.moved=true;vp.classList.add('pan')}
+    if(st.moved){vp.scrollLeft=st.sl-dx;vp.scrollTop=st.st-dy}
+  });
+  window.addEventListener('mouseup',()=>{st=null;vp.classList.remove('pan')});
+})();
+window.addEventListener('keydown',e=>{
+  if(e.target&&/INPUT|TEXTAREA/.test(e.target.tagName))return;
+  if(e.key==='ArrowLeft')step(-1);
+  if(e.key==='ArrowRight')step(1);
+});
+
+/* =============== 启动 =============== */
+(async()=>{ await resumeJobs(); await loadOverview(); })();
+</script>

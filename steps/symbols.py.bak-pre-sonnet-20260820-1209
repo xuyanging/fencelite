@@ -1,0 +1,876 @@
+"""步骤2：VLM 一次推理拿到「页面分组 + 图例样例符号」，再过三条硬闸后发布.
+
+为什么是一次推理：分组（view / legend / schedule / note_cluster / title_block）
+和「这个 fence 文字左边配的样例图形」必须在同一张图、同一次判断里给出，否则
+symbol 的归属就没有可信的上下文，图例区和视图区会混起来。
+
+三条确定性硬闸（classify_symbols，只做剥离，不发明/不排序/不移动任何框）：
+
+  1. **owner** —— symbol 只因为「步骤1 的某个 fence 文字拥有它」而存在，
+     text_index 必须是 items 范围内的合法非 bool int；没有主人的框一律不发布。
+
+  2. **图例组内（几何为准）** —— 框中心必须落在某个 kind ∈ legend / schedule /
+     note_cluster 的组框内（±2）。
+     *为什么改成几何为准*：老口径是「模型给的 group_index 指向图例类组 **或**
+     几何落在图例类组内」的**或**关系，走 group_index 那条分支时一点几何校验都
+     不做 —— 平面图里的 keyed marker 只要模型把 group_index 填成 legend 就能
+     发布，实测就是这么漏进来的。产品要求是「只找 legend table 里的样例」，
+     所以模型自称的 group_index 降级成**审计信息**（发布结果里改名
+     ``claimed_group_index``），通行证只认几何。
+     几何兜底：框中心不落在**任何**分组框里时（模型的组框并不铺满整页），没有
+     反证，退回看 **owner 文字**落在哪个组里 —— 符号一定挨着它的 owner 文字，
+     owner 的位置比模型自称的 group_index 可靠得多。owner 也不在图例类组里
+     （比如 owner 本身就是 view 里的 callout）就照样剥掉。
+     本页压根没有任何图例类组时，这一条会把符号剥光（fail-closed），理由里会
+     写明 —— 召回由步骤②b「图例块裁剪补扫」补，不靠放松闸门。
+
+  3. **同框去重（确定性）** —— 实测 drawings_volume_4_binder P5 / koch P4：
+     裸编码（"4CL" / "SF-#"）会作为独立文字项漏进步骤1 的文字层，于是**同一个**
+     样例框同时被配给「真正的图例描述行」和「那个裸编码行」，前端画两遍、
+     放置也算两遍。按量化后的框分组，一组只留一条：
+       ① owner 文字与样例框重叠度低的优先（inter/min(area) <= 0.5）——
+          重叠度高说明这个「文字」就是框里的编码本身，不是描述行；
+       ② 其次 owner 文字更长的优先（描述行一定比裸编码长）；
+       ③ 再次 text_index 小的优先（稳定 tiebreak）。
+
+发布结果里的每条 symbol 都带 ``source``：步骤② 原生的是 ``"page"``，
+步骤②b 裁剪补扫并进来的是 ``"sweep"``（见 merge_sweep）。
+
+缓存：symbols.json 的单页 entry = {sig, v, pv, model, raw, result[, sweep,
+sweep_v]}
+  raw    —— 未过滤的付费原始输出（groups + symbols），留着让将来的过滤版本
+             免费重跑（can_reuse_raw 不看 v）
+  result —— {symbols, groups[, usage, elapsed]}，符号步只负责这两个键；
+             步骤4 的放置结果由 steps.placements 往同一个 result 上加 plc_v。
+  sweep  —— 步骤②b 的落痕 {version, model, blocks, errors, skipped}；
+             sweep_v 参与 has_current_symbols（没跑过补扫 = 不当期），
+             steps.legend_sweep 缺席时这一项不参与判定（本模块可独立使用）。
+"""
+import json as _json
+import math as _math
+import re as _re
+import time as _time
+
+from google.genai import types as _genai_types
+
+from core.config import MODEL_NAME, resolve_model
+from core.gemini import _encode_image_for_gemini, gen_json, usage_from_response
+from core.parsing import _bbox_overlap_ratio, _coerce_box
+from core.pdfio import render_pdf_page
+from steps.prompts import (GROUP_KINDS, GROUP_SYMBOL_PROMPT,
+                           GROUP_SYMBOL_RESPONSE_SCHEMA, SYMBOL_GROUP_KINDS,
+                           VIEW_TYPES)
+from steps.versions import SYMBOL_PROMPT_V, SYMBOL_VERSION
+
+# 「中心落在这个框里」的统一容差（0-1000 帧），与 steps.placements 的 PLAN_PAD
+# 以及全栈其它包含判定保持一致。
+GROUP_PAD = 2
+
+# 去重规则 ①：owner 文字与样例框的 inter/min(area) 超过这个值，就认为这个
+# 「文字」其实是框里的编码本身，而不是描述行。
+DUP_OVERLAP_MAX = 0.5
+
+# 发布结果里的来源标签（前端 / 调试用来区分「全页那次推理」和「裁剪补扫」）。
+SOURCE_PAGE = "page"
+SOURCE_SWEEP = "sweep"
+
+
+# ------------------------------------------------------------------ 几何工具
+
+def _valid_box(box):
+    # bool 是 int 的子类；NaN/inf 会让 round() 崩掉 —— 两个都必须排除，
+    # 因为这些框可能是从盘上读回来的历史数据，不只是刚校验过的付费响应。
+    return (isinstance(box, (list, tuple)) and len(box) == 4
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and _math.isfinite(v) for v in box))
+
+
+def _center_in(box, container, pad=GROUP_PAD):
+    """框中心是否落在 container 里（外扩 pad）。"""
+    if not (_valid_box(box) and _valid_box(container)):
+        return False
+    cy, cx = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+    return (container[0] - pad <= cy <= container[2] + pad
+            and container[1] - pad <= cx <= container[3] + pad)
+
+
+def containing_group_kinds(box, groups):
+    """框中心几何上落在哪些组里 → kind 列表（按 groups 顺序去重保序）.
+
+    只看几何，不看任何模型自称的下标 —— 这就是「几何为准」那条闸的判据，
+    同时也是剥离理由里「它实际落在哪个 kind 的组里」的来源。
+    """
+    kinds = []
+    if not isinstance(groups, list):
+        return kinds
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        if _center_in(box, group.get("box_2d")):
+            kind = group.get("kind")
+            if kind not in kinds:
+                kinds.append(kind)
+    return kinds
+
+
+def page_has_legend_group(groups):
+    """本页模型到底有没有给出任何一个（框合法的）图例类组。"""
+    return any(isinstance(g, dict) and g.get("kind") in SYMBOL_GROUP_KINDS
+               and _valid_box(g.get("box_2d"))
+               for g in (groups if isinstance(groups, list) else []))
+
+
+def _owner_index(symbol):
+    """symbol 的 owner 下标（合法的非 bool int 才算），否则 None。"""
+    if not isinstance(symbol, dict):
+        return None
+    ti = symbol.get("text_index")
+    if isinstance(ti, bool) or not isinstance(ti, int) or ti < 0:
+        return None
+    return ti
+
+
+def _owner_item(symbol, items):
+    """symbol 的 owner 文字项（items 缺席或下标越界 → None）。"""
+    ti = _owner_index(symbol)
+    if ti is None or not isinstance(items, (list, tuple)) or ti >= len(items):
+        return None
+    item = items[ti]
+    return item if isinstance(item, dict) else None
+
+
+def _kinds_text(kinds):
+    return "/".join(str(k) for k in kinds) if kinds else "任何分组之外"
+
+
+# ---------------------------------------------------------------- 硬闸（过滤）
+
+def claimed_group_kind(symbol, groups):
+    """模型自称的 group_index 指向的 kind —— 只用于审计与剥离理由。"""
+    if not isinstance(symbol, dict) or not isinstance(groups, list):
+        return None
+    gi = symbol.get("claimed_group_index")
+    if gi is None:
+        gi = symbol.get("group_index")
+    if isinstance(gi, bool) or not isinstance(gi, int) \
+            or not 0 <= gi < len(groups):
+        return None
+    group = groups[gi]
+    return group.get("kind") if isinstance(group, dict) else None
+
+
+def symbol_group_verdict(symbol, groups, items=None):
+    """组内硬闸的唯一判据 → (是否放行, 剥离理由).
+
+    几何为准（见模块 docstring 第 2 条）：框中心落在图例类组里就放行；落在别的
+    组里就剥掉（模型自称 group_index 是什么都不算数）；一个组都没落进去时才退回
+    owner 文字的位置。理由字符串是给用户看「为什么平面图上那个没显示」的，
+    所以必须写清楚它**实际**落在哪个 kind 的组里。
+    """
+    box = symbol.get("box_2d") if isinstance(symbol, dict) else None
+    kinds = containing_group_kinds(box, groups)
+    if any(k in SYMBOL_GROUP_KINDS for k in kinds):
+        return True, None
+
+    prefix = "" if page_has_legend_group(groups) else "本页没有任何图例类组；"
+    if kinds:
+        # 框中心确实落在某个组里，只是那个组不是图例类 —— 这正是「平面图里的
+        # marker」：模型可以把 group_index 填成 legend，几何不会骗人。
+        claimed = claimed_group_kind(symbol, groups)
+        if claimed in SYMBOL_GROUP_KINDS:
+            return False, (
+                f"{prefix}模型声称属于图例组(group_index → {claimed})，框中心"
+                f"几何却落在 {_kinds_text(kinds)} 组内 — 组内校验剥离（几何为准）")
+        return False, (
+            f"{prefix}框中心几何落在 {_kinds_text(kinds)} 组内，不是 "
+            "legend/schedule/note_cluster — 组内校验剥离（几何为准）")
+
+    # 框中心不落在任何分组框里：模型的组框并不铺满整页，这时没有几何反证，
+    # 退回用 owner 文字的位置判断（符号一定挨着它的 owner 文字）。
+    owner = _owner_item(symbol, items)
+    if owner is None:
+        return False, (
+            f"{prefix}框中心不在任何分组框内，也没有 owner 文字可兜底 — "
+            "组内校验剥离（几何为准）")
+    owner_kinds = containing_group_kinds(owner.get("box_2d"), groups)
+    if any(k in SYMBOL_GROUP_KINDS for k in owner_kinds):
+        return True, None
+    return False, (
+        f"{prefix}框中心不在任何分组框内；退回 owner 文字位置，owner 落在 "
+        f"{_kinds_text(owner_kinds)} — 组内校验剥离（几何为准）")
+
+
+def symbol_in_allowed_group(symbol, groups, items=None):
+    """框中心是否几何落在图例类组内（owner 兜底见 symbol_group_verdict）。"""
+    if not isinstance(symbol, dict) or not isinstance(groups, list):
+        return False
+    return symbol_group_verdict(symbol, groups, items)[0]
+
+
+# ------------------------------------------------- 图例编码标记（不是文字）
+
+# 「数字在前」的编码形态（4CL / 6DMP / 3GP）—— steps/text/clean.py 的
+# _CODE_RE 只认「字母在前」（F-04 / A12b），正是这条漏洞让 "4CL" 这种编码
+# 以独立 fence 文字项的身份漏进了文字层。
+_MARKER_SHAPE_RE = _re.compile(
+    r"^(?:[A-Za-z]{0,3}[-.]?\d{1,4}[A-Za-z]?|[A-Za-z]{1,3}|\d{1,4}[A-Za-z]{1,3})$")
+
+
+def marker_code_indices(items, groups, symbols=None):
+    """哪些"文字项"其实是图例编码标记，不是独立的 fence 文字.
+
+    判据（1 必须成立，2 或 3 任一成立）：
+      1. 整条文字就是**一个 token**，且形状像编码（_MARKER_SHAPE_RE）；
+      2. 这个 token 等于**某个已发布 symbol 的 value** —— 那正是步骤② 从图例
+         样例里读出来的短码（"4CL" / "6DMP"）。语义上的对应关系就在这里：
+         图纸上每处装这种围栏的地方都印一个同样的编码标记，它是"图例那一行的
+         实例"，不是一段独立的围栏说明；
+      3. 或者它等于某个**图例行的首个 token**（图例写成
+         "4CL  4'-0\" TALL VINYL CHAIN LINK FENCING" 的那种排法）。
+    两条并存是因为两种排版都真实存在：drawings_volume_4_binder P4 的图例行把
+    编码写在描述前面（走 3），P5 的编码是独立一条、描述行不含它（走 2）。
+
+    实测：P4 24 条 / P5 19 条被标出（画成文字框时就成了"平面图上的 symbol 被
+    框成文字"），taylor_3_12 与 rapid_city 0 条 —— 判据不误伤。
+
+    刻意**只标记、不删除**：``store.sig_of`` 把每个 item 的 (text, box_2d) 都算进
+    付费缓存签名，删一条 item 会让整页的步骤② 重新付费，还会让 union index 整体
+    错位（symbol 的 text_index、前端选中态、以后的箭头模块全锚在那个下标上）。
+    标记不进签名，零成本、可回退。
+
+    返回 items 下标的 set。
+    """
+    items = items if isinstance(items, list) else []
+    groups = groups if isinstance(groups, list) else []
+    codes = set()
+    for symbol in (symbols if isinstance(symbols, list) else []):
+        if not isinstance(symbol, dict):
+            continue
+        value = str(symbol.get("value") or "").strip()
+        if value and _MARKER_SHAPE_RE.match(value):
+            codes.add(value.upper())
+    legend_boxes = [g["box_2d"] for g in groups
+                    if isinstance(g, dict) and g.get("kind") in SYMBOL_GROUP_KINDS
+                    and isinstance(g.get("box_2d"), (list, tuple))
+                    and len(g["box_2d"]) == 4]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        tokens = str(item.get("text") or "").split()
+        box = item.get("box_2d")
+        if len(tokens) < 2 or not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue          # 单 token 的行不能当"图例行"，否则会自己认自己
+        if legend_boxes and any(_center_in(box, b) for b in legend_boxes) \
+                and _MARKER_SHAPE_RE.match(tokens[0]):
+            codes.add(tokens[0].upper())
+    if not codes:
+        return set()
+    out = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        tokens = str(item.get("text") or "").split()
+        if len(tokens) != 1:
+            continue
+        if tokens[0].upper() in codes and _MARKER_SHAPE_RE.match(tokens[0]):
+            out.add(index)
+    return out
+
+
+# ------------------------------------------------------------ 确定性去重
+
+def _dup_key(box):
+    """量化后的框身份：每个坐标 round 到整数。"""
+    return tuple(int(round(v)) for v in box)
+
+
+def _owner_overlap(symbol, items):
+    """owner 文字框与样例框的 inter/min(area)（owner 未知 → None）。"""
+    owner = _owner_item(symbol, items)
+    if owner is None or not _valid_box(owner.get("box_2d")) \
+            or not _valid_box(symbol.get("box_2d")):
+        return None
+    return _bbox_overlap_ratio(list(symbol["box_2d"]),
+                               list(owner["box_2d"]))
+
+
+def _dup_rank(symbol, order, items):
+    """去重优先级（越小越优先）—— 规则见模块 docstring 第 3 条。"""
+    overlap = _owner_overlap(symbol, items)
+    # ①：重叠度高 = 这个「文字」就是框里的编码本身，排到后面
+    high = 1 if (overlap is not None and overlap > DUP_OVERLAP_MAX) else 0
+    owner = _owner_item(symbol, items)
+    text = (owner or {}).get("text") or ""
+    ti = _owner_index(symbol)
+    # ④/⑤ 只是稳定性 tiebreak（不是政策）：同框同主人时，已发布的 page 条目
+    # 优先于补扫条目，最后按出现顺序，保证同一份输入永远得到同一个结果。
+    src = 0 if symbol.get("source", SOURCE_PAGE) == SOURCE_PAGE else 1
+    return (high, -len(text), (ti if ti is not None else 1 << 30), src, order)
+
+
+def dedupe_symbols(symbols, items=None):
+    """同一个框只发布一条 → (kept, dropped)．纯函数、确定性、可单测.
+
+    kept 保持输入顺序（前端画层顺序不无谓抖动）；每组留哪一条完全由 _dup_rank
+    决定，与输入顺序无关。dropped 每条带 reason。
+    """
+    buckets = {}
+    order = []
+    rows = list(symbols or [])
+    for index, symbol in enumerate(rows):
+        box = symbol.get("box_2d") if isinstance(symbol, dict) else None
+        # 框不合法的进不了发布结果（上游已拦），这里只保证不因为它崩掉。
+        key = _dup_key(box) if _valid_box(box) else ("invalid", index)
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(index)
+    keep_index, dropped = set(), []
+    for key in order:
+        members = buckets[key]
+        if len(members) == 1:
+            keep_index.add(members[0])
+            continue
+        ranked = sorted(members, key=lambda i: _dup_rank(rows[i], i, items))
+        winner = ranked[0]
+        keep_index.add(winner)
+        win_ti = _owner_index(rows[winner])
+        for loser in ranked[1:]:
+            dropped.append({
+                **rows[loser],
+                "reason": ("与另一个 symbol 框重复（同一个样例框被配给了多个"
+                           f"文字），已保留描述行那条(text_index={win_ti})"),
+            })
+    return [rows[i] for i in range(len(rows)) if i in keep_index], dropped
+
+
+# ------------------------------------------------------------ 发布判定（唯一）
+
+def _published_shape(symbol, source):
+    """发布用的浅拷贝：group_index 降级成审计字段 + 打来源标签。"""
+    out = dict(symbol)
+    claimed = out.pop("group_index", None)
+    if claimed is not None and "claimed_group_index" not in out:
+        out["claimed_group_index"] = claimed
+    if source is not None:
+        out.setdefault("source", source)
+    return out
+
+
+def classify_symbols(symbols, groups, item_count, items=None,
+                     source=SOURCE_PAGE):
+    """三条硬闸的唯一实现 → (kept, dropped)．
+
+    filter_owned_group_symbols / compute_page_symbols / merge_sweep /
+    symbols_dropped_view 全部走这一处，避免「发布」和「解释为什么没发布」两套
+    口径漂移。``items`` 给了才能做 owner 兜底与去重优先级（缺席时退化成
+    「按 text_index 稳定保留一条」，仍然确定）。
+    """
+    owned = []
+    dropped = []
+    for symbol in symbols or []:
+        if not isinstance(symbol, dict):
+            continue
+        text_index = symbol.get("text_index")
+        if isinstance(text_index, bool) or not isinstance(text_index, int) \
+                or not 0 <= text_index < item_count:
+            dropped.append({**symbol,
+                            "reason": "无有效归属文字(text_index) — "
+                                      "硬性 owner 校验剥离"})
+            continue
+        ok, reason = symbol_group_verdict(symbol, groups, items)
+        if not ok:
+            dropped.append({**symbol, "reason": reason})
+            continue
+        owned.append(_published_shape(symbol, source))
+    kept, dup_dropped = dedupe_symbols(owned, items)
+    return kept, dropped + dup_dropped
+
+
+def filter_owned_group_symbols(symbols, groups, item_count, items=None,
+                               source=SOURCE_PAGE):
+    """Keep only symbols with a valid owner, an allowed group and no dupe."""
+    return classify_symbols(symbols, groups, item_count, items, source)[0]
+
+
+# ------------------------------------------------------------ 付费响应严校验
+
+def _require_group_symbol_lists(payload):
+    """Validate the paid response's top-level transport contract.
+
+    Explicit empty arrays are a complete, cacheable answer.  Missing keys or
+    non-array values are not equivalent to that answer and must be retried.
+    """
+    if not isinstance(payload, dict):
+        raise RuntimeError("group+symbol response must be a JSON object")
+    missing = [key for key in ("groups", "symbols") if key not in payload]
+    if missing:
+        raise RuntimeError(
+            "group+symbol response missing required key(s): "
+            + ", ".join(missing))
+    for key in ("groups", "symbols"):
+        if not isinstance(payload[key], list):
+            raise RuntimeError(f"group+symbol response {key} must be an array")
+    return payload["groups"], payload["symbols"]
+
+
+def _parse_group_symbol_response(text):
+    """Strictly parse one schema-constrained response.
+
+    Unlike the legacy tolerant parser, this rejects truncated JSON and
+    trailing partial structures instead of turning them into false empty
+    detections that could then be cached permanently.
+    """
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) < 3 or lines[-1].strip() != "```":
+            raise RuntimeError("group+symbol response has a truncated JSON fence")
+        raw = "\n".join(lines[1:-1]).strip()
+    try:
+        payload = _json.loads(raw)
+    except (TypeError, _json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "group+symbol response is invalid or truncated JSON") from exc
+    _require_group_symbol_lists(payload)
+    return payload
+
+
+def _coerce_group_symbol_rows(raw_groups, raw_symbols, item_count):
+    """Row-by-row strict validation → the exact shape that gets cached as raw.
+
+    Any protocol violation raises so the caller retries: a half-understood
+    answer must never be persisted as if the page had nothing.  Out-of-range
+    boxes are rejected outright (``_coerce_box`` never clamps — clamping can
+    manufacture a plausible box at an unrelated page edge).
+    """
+    groups, syms = [], []
+    for row_index, g in enumerate(raw_groups):
+        if not isinstance(g, dict):
+            raise RuntimeError(
+                f"group+symbol group row {row_index} must be an object")
+        missing = [key for key in ("box_2d", "kind") if key not in g]
+        if missing:
+            raise RuntimeError(
+                f"group+symbol group row {row_index} missing required "
+                f"key(s): {', '.join(missing)}")
+        box = _coerce_box(g["box_2d"])
+        if box is None:
+            raise RuntimeError(
+                f"group+symbol group row {row_index} has an invalid box_2d")
+        if not isinstance(g["kind"], str):
+            raise RuntimeError(
+                f"group+symbol group row {row_index} has an invalid kind")
+        kind = g["kind"].strip().lower()
+        if kind not in GROUP_KINDS:
+            raise RuntimeError(
+                f"group+symbol group row {row_index} has an invalid kind")
+        # A view_type volunteered here has no classifier version / model
+        # provenance, so it is validated (a malformed answer still means
+        # retry) but deliberately NOT kept: steps.views owns that field.
+        if "view_type" in g:
+            if not isinstance(g["view_type"], str):
+                raise RuntimeError(
+                    f"group+symbol group row {row_index} has an invalid "
+                    "view_type")
+            if g["view_type"].strip().lower() not in VIEW_TYPES:
+                raise RuntimeError(
+                    f"group+symbol group row {row_index} has an invalid "
+                    "view_type")
+        groups.append({"box_2d": box, "kind": kind})
+    for row_index, rec in enumerate(raw_symbols):
+        if not isinstance(rec, dict):
+            raise RuntimeError(
+                f"group+symbol symbol row {row_index} must be an object")
+        required = ("text_index", "box_2d", "category", "value",
+                    "group_index")
+        missing = [key for key in required if key not in rec]
+        if missing:
+            raise RuntimeError(
+                f"group+symbol symbol row {row_index} missing required "
+                f"key(s): {', '.join(missing)}")
+        box = _coerce_box(rec["box_2d"])
+        if box is None:
+            raise RuntimeError(
+                f"group+symbol symbol row {row_index} has an invalid box_2d")
+        if not isinstance(rec["category"], str):
+            raise RuntimeError(
+                f"group+symbol symbol row {row_index} has an invalid category")
+        cat = rec["category"].strip().lower()
+        if cat not in ("line", "shape"):
+            raise RuntimeError(
+                f"group+symbol symbol row {row_index} has an invalid category")
+        if not isinstance(rec["value"], str):
+            raise RuntimeError(
+                f"group+symbol symbol row {row_index} has an invalid value")
+        val = rec["value"].strip()
+        ti = rec["text_index"]
+        if isinstance(ti, bool) or not isinstance(ti, int) \
+                or not 0 <= ti < item_count:
+            raise RuntimeError(
+                f"group+symbol symbol row {row_index} has an invalid "
+                "text_index")
+        gi = rec["group_index"]
+        if isinstance(gi, bool) or not isinstance(gi, int) \
+                or not 0 <= gi < len(groups):
+            raise RuntimeError(
+                f"group+symbol symbol row {row_index} has an invalid "
+                "group_index")
+        syms.append({"box_2d": box,
+                     "category": cat,
+                     "value": val,
+                     "type": cat + (f" {val}" if val else ""),  # display
+                     "text_index": ti,
+                     "group_index": gi})
+    return groups, syms
+
+
+def parse_group_symbol_payload(text, item_count):
+    """One response text → {"groups", "symbols"}，全部严校验都在这里.
+
+    单独导出是为了让离线测试能不花钱地覆盖整条校验链（截断 JSON / 缺键 /
+    越界 text_index / 坏 box），生产路径 vlm_find_group_symbols 走同一条。
+    """
+    parsed = _parse_group_symbol_response(text)
+    raw_groups, raw_symbols = _require_group_symbol_lists(parsed)
+    groups, syms = _coerce_group_symbol_rows(
+        raw_groups, raw_symbols, item_count)
+    return {"groups": groups, "symbols": syms}
+
+
+# ---------------------------------------------------------------- 付费推理
+
+def vlm_find_group_symbols(pdf_path, page_index, items, model=None,
+                           timeout_ms=300_000):
+    """ONE inference → page groups + legend-area sample symbols.
+    Returns {"groups": [...], "symbols": [...], "usage", "elapsed"}."""
+    img = render_pdf_page(pdf_path, page_index)
+    data, mime = _encode_image_for_gemini(img)
+    part = _genai_types.Part.from_bytes(data=data, mime_type=mime)
+    payload = _json.dumps(
+        [{"index": i, "text": it.get("text", ""), "box_2d": it.get("box_2d")}
+         for i, it in enumerate(items)], ensure_ascii=False)
+    t0 = _time.perf_counter()
+    resp = gen_json(resolve_model(model),
+                    [part, GROUP_SYMBOL_PROMPT + "\n\nFENCE TEXT ITEMS:\n" + payload],
+                    timeout_ms=timeout_ms,
+                    response_json_schema=GROUP_SYMBOL_RESPONSE_SCHEMA)
+    elapsed = _time.perf_counter() - t0
+    parsed = parse_group_symbol_payload(resp.text or "", len(items))
+    return {"groups": parsed["groups"], "symbols": parsed["symbols"],
+            "usage": usage_from_response(resp), "elapsed": round(elapsed, 1)}
+
+
+# ---------------------------------------------------------------- 缓存判定
+
+def can_reuse_raw(entry, sig):
+    """Whether the paid group+symbol response is valid for this item set.
+
+    Deliberately does NOT look at ``v``: bumping SYMBOL_VERSION must be a
+    free re-filter of the stored raw, never a new paid call.  SYMBOL_PROMPT_V
+    participates, otherwise merely bumping the prompt would serve stale raw.
+    """
+    raw = (entry or {}).get("raw")
+    return bool(
+        entry
+        and entry.get("sig") == sig
+        and entry.get("pv") == SYMBOL_PROMPT_V
+        and entry.get("model") == MODEL_NAME
+        and isinstance(raw, dict)
+        and isinstance(raw.get("symbols"), list)
+        and isinstance(raw.get("groups"), list)
+    )
+
+
+def sweep_version():
+    """步骤②b 的版本号；补扫模块缺席时返回 None（该字段不参与当期判定）.
+
+    延迟 import 是有意的：steps.legend_sweep 复用本模块的硬闸，模块级互相
+    import 会在半初始化状态下抛 ImportError，被 except 吞掉后会**静默**关掉
+    sweep_v 校验。函数内 import 时两个模块都已装载完毕，不会出现这种情况。
+    """
+    try:
+        from steps.legend_sweep import LEGEND_SWEEP_VERSION
+    except ImportError:
+        return None
+    return LEGEND_SWEEP_VERSION
+
+
+def has_current_symbols(entry, sig):
+    """Whether detection + publication filtering are current for this page.
+
+    补扫（步骤②b）也算发布链的一环：没跑过补扫的页 = 不当期，会被作业重跑
+    （导入进来的旧缓存自然也会补跑一次 —— 补扫是裁剪重渲染，不重付步骤②）。
+    """
+    if not (can_reuse_raw(entry, sig)
+            and entry.get("v") == SYMBOL_VERSION
+            and isinstance(entry.get("result"), dict)):
+        return False
+    version = sweep_version()
+    return version is None or entry.get("sweep_v") == version
+
+
+# ---------------------------------------------------------------- 编排
+
+def compute_page_symbols(pdf_path, page_index, items, cached_entry, sig):
+    """The one symbol pipeline the app and the batch share.
+    Returns (cache_entry, fresh_vlm): entry = {sig, v, pv, model, raw, result}.
+    `raw` is the UNFILTERED paid VLM output — kept so future algorithm
+    versions re-filter for free.  Reuse order: same-sig raw; else a fresh
+    call.  Owner discipline: a symbol EXISTS only because a step-1 fence
+    text in a legend-context group owns it — no owner text, no symbol."""
+    # Raw format: {"groups": [...], "symbols": [...]} from ONE inference.
+    raw = None
+    if can_reuse_raw(cached_entry, sig):
+        raw = cached_entry["raw"]
+    fresh = raw is None
+    usage = elapsed = None
+    if fresh:
+        r = vlm_find_group_symbols(pdf_path, page_index, items)
+        groups, symbols = _require_group_symbol_lists(r)
+        raw = {"groups": groups, "symbols": symbols}
+        usage, elapsed = r.get("usage"), r.get("elapsed")
+    groups = _json.loads(_json.dumps(raw["groups"]))
+    syms = _json.loads(_json.dumps(raw["symbols"]))
+    for group in groups:
+        # Imported legacy raw may carry a view_type from the symbol call.
+        # steps.views is the only source of a trusted projection type.
+        if isinstance(group, dict):
+            group.pop("view_type", None)
+            group.pop("view_type_reason", None)
+    # Hard invariant: every published symbol has a valid step-1 owner, sits
+    # geometrically inside a legend-context group from the same inference, and
+    # is the only publication of its box.  `items` participates (owner text +
+    # owner box) — it is what makes the geometric fallback and the dedupe
+    # ranking possible.
+    kept = filter_owned_group_symbols(syms, groups, len(items), items,
+                                      SOURCE_PAGE)
+    result = {"symbols": kept, "groups": groups}
+    if usage:
+        result["usage"] = usage
+    if elapsed is not None:
+        result["elapsed"] = elapsed
+    return {"sig": sig, "v": SYMBOL_VERSION, "pv": SYMBOL_PROMPT_V,
+            "model": resolve_model(None),
+            "raw": raw, "result": result}, fresh
+
+
+# ------------------------------------------------- 步骤②b 补扫结果合并入口
+
+def _sweep_candidates(added, item_count):
+    """裁剪补扫返回的符号 → 发布用的行（宽松：坏行跳过而不是抛）.
+
+    与步骤② 的付费响应不同，这里坏行只能跳过：补扫是**补**召回的，一行畸形
+    绝不能把这一页已经发布好的符号连坐掉。跳过的条数会记进 entry['sweep']。
+    """
+    rows, skipped = [], 0
+    for rec in (added if isinstance(added, list) else []):
+        if not isinstance(rec, dict):
+            skipped += 1
+            continue
+        box = _coerce_box(rec.get("box_2d"))
+        cat = rec.get("category")
+        cat = cat.strip().lower() if isinstance(cat, str) else None
+        ti = rec.get("text_index")
+        val = rec.get("value")
+        val = val.strip() if isinstance(val, str) else ""
+        if box is None or cat not in ("line", "shape") \
+                or isinstance(ti, bool) or not isinstance(ti, int) \
+                or not 0 <= ti < item_count:
+            skipped += 1
+            continue
+        row = {"box_2d": box, "category": cat, "value": val,
+               "type": cat + (f" {val}" if val else ""),   # display
+               "text_index": ti, "source": SOURCE_SWEEP}
+        # 补扫自己声称的归属同样只是审计信息（几何闸仍然说了算）
+        claimed = rec.get("claimed_group_index")
+        if isinstance(claimed, bool) or not isinstance(claimed, int):
+            claimed = rec.get("group_index")
+        if isinstance(claimed, int) and not isinstance(claimed, bool):
+            row["claimed_group_index"] = claimed
+        block = rec.get("block_index")
+        if isinstance(block, int) and not isinstance(block, bool):
+            row["block_index"] = block      # 来自哪个图例块（溯源）
+        rows.append(row)
+    return rows, skipped
+
+
+def _sweep_gate_groups(groups, sweep):
+    """给补扫符号用的取景框 = 页面组 + 每个补扫块的 crop_box.
+
+    steps.legend_sweep 的裁剪窗是图例组框**外扩 SWEEP_PAD** 之后的框，所以补扫
+    找到的样例可能落在原组框外一点点（图例块边上的样例很常见）。crop_box 本身
+    就是从图例类组推出来的图例区域，把它当成同 kind 的组参与几何判定，是几何
+    闸对补扫的正确取景 —— 而不是放松「几何为准」这条规则。
+    追加在末尾：原有 group_index（审计用）下标不变。
+    """
+    blocks = sweep.get("blocks") if isinstance(sweep, dict) else None
+    extra = []
+    for block in (blocks if isinstance(blocks, list) else []):
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("kind")
+        crop = block.get("crop_box")
+        if kind in SYMBOL_GROUP_KINDS and _valid_box(crop):
+            extra.append({"kind": kind, "box_2d": list(crop)})
+    return list(groups) + extra if extra else groups
+
+
+def _sweep_block_trace(blocks):
+    """blocks 落痕压成一块一行的小结.
+
+    原样存整份 blocks 会把每个符号在 symbols.json 里存两遍（found 里一份、
+    result.symbols 里一份），留下的应该是「问了哪块、问了几行、找到几个」。
+    """
+    if isinstance(blocks, int) and not isinstance(blocks, bool):
+        return blocks
+    rows = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        rows.append({"group_index": block.get("group_index"),
+                     "kind": block.get("kind"),
+                     "crop_box": block.get("crop_box"),
+                     "asked": len(block.get("asked") or []),
+                     "found": len(block.get("found") or []),
+                     "elapsed": block.get("elapsed")})
+    return rows
+
+
+def _symbol_ids(symbols):
+    """发布身份序列（框 + 主人）—— 判「符号集有没有真的变化」用.
+
+    刻意不含 source：给旧条目补一个 source="page" 标签不是内容变化，不该白白
+    作废已经算好的 placements。
+    """
+    return [(tuple(s.get("box_2d") or ()), s.get("text_index"))
+            for s in symbols or [] if isinstance(s, dict)]
+
+
+def merge_sweep(entry, items, sweep):
+    """把 legend_sweep 的 added 符号并进 entry['result']['symbols'].
+
+    刻意**不**塞进 compute_page_symbols：那一步必须保持「一次付费推理 + 纯过滤」
+    的语义（同 sig 的 raw 免费重过滤）。补扫是独立的一步、独立的落痕、独立的
+    版本号。
+
+    并进来的符号一样要过 owner 闸 + 组内几何闸 + 去重（去重会把「补扫又找到了
+    页面推理已经发布过的那个框」收敛成一条）；每条打 source="sweep"，步骤②
+    原生的打 source="page"，前端/调试可区分。几何闸对补扫符号额外承认
+    ``sweep["blocks"][].crop_box`` 这个取景框（见 _sweep_gate_groups）。
+
+    ``sweep`` = steps.legend_sweep.sweep_page 的返回值
+    {version, model, blocks, added, skipped, errors, ...}；补扫这一步没跑
+    （sweep_needed 说这页无事可做）时传 ``{}`` 也要调一次 —— 那才算「这页补扫
+    过了」，否则 has_current_symbols 会一直判它不当期。
+
+    entry['sweep'] = {version, model, blocks, errors, skipped} 落盘留痕，
+    entry['sweep_v'] 参与 has_current_symbols。
+
+    返回 entry 是否被改动过（symbols 变了 **或** 落痕变了）—— 调用方可以直接
+    拿它当 dirty 标志；同一份 sweep 再并一次返回 False（幂等）。
+    """
+    if not isinstance(entry, dict):
+        return False
+    result = entry.get("result")
+    if not isinstance(result, dict):
+        return False
+    sweep = sweep if isinstance(sweep, dict) else {}
+    items = items if isinstance(items, list) else []
+    groups = result.get("groups") or []
+
+    before = [s for s in (result.get("symbols") or []) if isinstance(s, dict)]
+    existing = []
+    for symbol in before:
+        row = dict(symbol)
+        row.setdefault("source", SOURCE_PAGE)
+        existing.append(row)
+    added, skipped_rows = _sweep_candidates(
+        sweep.get("added") if "added" in sweep else sweep.get("symbols"),
+        len(items))
+    # 注意：这里刻意**不**做「补扫框替换页面框」。补扫只问「压根没配到样例」
+    # 的行（见 legend_sweep.sweep_needed），所以同一行不会同时有两个来源的框；
+    # 万一真撞上了，交给下面的同框去重按统一规则收敛，不要在这里另立一套优先级。
+    # source 已经在两边打好，classify 不再覆盖（source=None）。
+    # 取景框加上补扫块的 crop_box（见 _sweep_gate_groups）；它只参与几何判定，
+    # 绝不写进 result["groups"]（那是步骤② 的页面分区，不能被本步污染）。
+    kept, _dropped = classify_symbols(existing + added,
+                                      _sweep_gate_groups(groups, sweep),
+                                      len(items), items, None)
+
+    changed = _symbol_ids(kept) != _symbol_ids(before)
+    result["symbols"] = kept
+    if changed:
+        # 符号集变了 → 上一轮的放置结果作废，让步骤4 免费重算（否则新并进来的
+        # 符号永远拿不到 placements：has_current_placements 只看 plc_v）。
+        result.pop("plc_v", None)
+    # 版本以「这份补扫结果自己声称的版本」为准（并进来的若是旧版本结果，
+    # has_current_symbols 就该判它不当期、让作业重跑），没声称才用当前模块的。
+    version = sweep.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        version = sweep_version() or 0
+    stamp = {
+        "version": version,
+        "model": sweep.get("model"),
+        "blocks": _sweep_block_trace(sweep.get("blocks")),
+        "errors": list(sweep.get("errors") or []),
+        "skipped": list(sweep.get("skipped") or []),
+    }
+    if skipped_rows:
+        stamp["invalid_rows"] = skipped_rows
+    stamped = entry.get("sweep") != stamp \
+        or entry.get("sweep_v") != stamp["version"]
+    entry["sweep"] = stamp
+    entry["sweep_v"] = stamp["version"]
+    return bool(changed or stamped)
+
+
+# ---------------------------------------------------------------- 解释视图
+
+def symbols_dropped_view(entry, items=None):
+    """免费的解释视图：raw 里被硬闸剥离的符号 + 原因（不落盘、不调模型）.
+
+    entry = symbols.json 的单页缓存 {sig, v, pv, model, raw, result}；
+    身份用 (tuple(box_2d), text_index) —— 与发布结果同一个框、同一个主人
+    才算「留下来了」。前端「为什么这个符号没显示」直接读这里。
+
+    ``items``（步骤1 的 union items）给了才能复现 owner 兜底与去重的判据；
+    没给也一定给得出理由，只是措辞退化一档。
+    """
+    raw = (entry or {}).get("raw") or {}
+    result = (entry or {}).get("result") or {}
+    if not isinstance(raw, dict):
+        return None
+    groups = raw.get("groups") or []
+    published = [s for s in (result.get("symbols") or []) if isinstance(s, dict)]
+    kept_ids = {(tuple(s.get("box_2d") or ()), s.get("text_index"))
+                for s in published}
+    # 同框幸存者：用来区分「组内闸剥的」和「同框去重剥的」
+    kept_boxes = {}
+    for s in published:
+        box = s.get("box_2d")
+        if _valid_box(box):
+            kept_boxes.setdefault(_dup_key(box), s.get("text_index"))
+    dropped = []
+    for s in raw.get("symbols") or []:
+        if not isinstance(s, dict):
+            continue
+        key = (tuple(s.get("box_2d") or ()), s.get("text_index"))
+        if key in kept_ids:
+            continue
+        ti = s.get("text_index")
+        box = s.get("box_2d")
+        if isinstance(ti, bool) or not isinstance(ti, int) or ti < 0:
+            reason = "无有效归属文字(text_index) — 硬性 owner 校验剥离"
+        else:
+            ok, gate_reason = symbol_group_verdict(s, groups, items)
+            if not ok:
+                reason = gate_reason
+            elif _valid_box(box) and _dup_key(box) in kept_boxes:
+                reason = ("与另一个 symbol 框重复（同一个样例框被配给了多个"
+                          "文字），已保留描述行那条"
+                          f"(text_index={kept_boxes[_dup_key(box)]})")
+            else:
+                reason = "未通过当前 owner/组内/去重硬校验"
+        dropped.append({**s, "reason": reason})
+    return {"raw_symbols": raw.get("symbols") or [], "dropped": dropped}

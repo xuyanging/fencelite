@@ -1,0 +1,265 @@
+"""根据文字 callout 找箭头 / 引线（矢量几何，零模型调用）.
+
+实现方式是一个 Node 边车：算法本体是 pdf-command-visualizer 里那套矢量
+callout 检测（content stream 解析 → 顺序分段 → 引线拓扑恢复 → 末端框），
+以单文件 bundle 形式放在 tools/arrow_sidecar/。这里只负责取景、调用、回映射。
+
+为什么是一次性子进程而不是常驻服务：本机 2 vCPU / 可用内存 ~600 MB 且已在
+吃 swap；一页的峰值 RSS 120-280 MB，跑完退出就立刻归还，常驻反而要长期占住。
+
+取景（务必遵守）：
+  引线只在 **plan 视图**里找。一条从俯视图追到立面图 / 详图里的引线是错误归属。
+  plan 框来自步骤3 的分类（steps.views.plan_boxes）。**没有分类就 fail-closed**
+  —— 返回空结果，绝不退化成「整页都算 plan」，与步骤4 放置匹配的口径一致。
+
+坐标：进出都是页面帧 [ymin, xmin, ymax, xmax] / [y, x]，0-1000 闭区间，
+与文字框、symbol 框同帧。PDF 用户空间的往返换算在边车里，调用方不用关心。
+"""
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+import fitz
+
+from core.pdfio import FITZ_LOCK
+from steps.store import sig_of
+
+# 接缝总开关。ARROWS=1 可在不改代码的情况下打开。
+ENABLED = os.environ.get("ARROWS", "0") not in ("0", "", "false", "no", "off")
+
+# plan 取景开关。默认**关**：先让每个框都去找引线，把问题充分暴露出来；
+# 结果质量摸清之前，用取景先砍掉一半样本反而看不到问题。
+# ARROWS_PLAN_GATE=1 恢复「只在俯视图里找」的行为（含 fail-closed 语义）。
+PLAN_GATE = os.environ.get("ARROWS_PLAN_GATE", "0") not in ("0", "", "false", "no", "off")
+
+# 改箭头算法语义时 bump，让 arrows.json 重算。
+ARROWS_VERSION = 10
+
+_BASE_DIR = Path(__file__).resolve().parent.parent
+_SIDECAR = _BASE_DIR / "tools" / "arrow_sidecar" / "sidecar.mjs"
+_NODE = Path(os.environ.get(
+    "ARROWS_NODE", Path.home() / ".local" / "opt" / "node" / "bin" / "node"))
+
+# 单页超时。重页实测 ~11 s（整份 22 MB PDF），留足余量。
+_TIMEOUT = int(os.environ.get("ARROWS_TIMEOUT", "600"))
+# 逐级加堆。绝大多数页 384 MB 够用（实测轻页峰值 ~120 MB）；重页会 OOM，
+# 于是加到 768（实测 rapid_city P27 165,913 ops 需要 ~595 MB RSS），仍不够再到
+# 1536。宁可为个别页多花一次解析，也不接受「静默无结果」——空结果和没算过
+# 在下游是完全不同的两件事。
+_HEAP_LADDER = [int(v) for v in
+                os.environ.get("ARROWS_HEAP_LADDER", "384,768,1536").split(",")]
+# 超预算页的放宽档：默认预算是 1 GiB 主机档，只在重试时放宽。
+_BUDGET_RETRY = {"maxSceneOps": 1_000_000, "maxPathSegments": 8_000_000,
+                 "maxDecodedBytes": 128 * 1024 * 1024,
+                 "maxSourceLength": 128 * 1024 * 1024,
+                 "maxSegmentsPerPath": 400_000}
+
+
+def arrows_signature(items, revision, extra_anchors=None):
+    """arrows.json 的缓存签名：两类锚 + PDF 身份 + 算法版本。
+
+    extra_anchors 是 [(key, box_2d), ...]，即 shape 样例矢量匹配出来的放置。
+    它必须进签名：放置变了而文字没变时，箭头结果同样要重算。
+    """
+    base = sig_of(items, revision)
+    if extra_anchors:
+        digest = hashlib.sha1(json.dumps(
+            [[str(k), list(b)] for k, b in extra_anchors],
+            sort_keys=True).encode()).hexdigest()[:12]
+        base = f"{base}+{digest}"
+    return f"{base}|v{ARROWS_VERSION}"
+
+
+def has_current_arrows(entry, sig):
+    return bool(isinstance(entry, dict) and entry.get("sig") == sig
+                and isinstance(entry.get("items"), dict))
+
+
+def _box_inside_any(box, regions):
+    """页面帧的框是否完整落在任一取景框内（同帧、同为 [y0,x0,y1,x1]）。"""
+    if not (isinstance(box, (list, tuple)) and len(box) == 4):
+        return False
+    y0, x0, y1, x1 = box
+    return any(y0 >= r[0] and x0 >= r[1] and y1 <= r[2] and x1 <= r[3]
+               for r in regions)
+
+
+def sidecar_available():
+    return _SIDECAR.exists() and _NODE.exists()
+
+
+def find_page_arrows(pdf_path, page_index, items, *, plan_regions=None,
+                     extra_anchors=None, dbg=None):
+    """一页里为每个文字锚找箭头 / 引线。
+
+    参数
+      pdf_path      : pathlib.Path，源 PDF
+      page_index    : 0-based 页号
+      items         : steps.store.items_of(rec)，下标 = union index
+      plan_regions  : [[ymin, xmin, ymax, xmax], ...] plan 视图取景框（页面帧）。
+                      空 / None → fail-closed，直接返回 {}。
+      extra_anchors : [(key, box_2d), ...] 第二类锚 —— shape 样例矢量匹配出来的
+                      放置。key 是不透明字符串（约定 "s<symbol>:<placement>"），
+                      与文字锚的 int union index 分处两个键空间，不会相撞。
+      dbg           : steps.debug.DebugSink 或 None
+
+    返回
+      {union_index | key: {...}} —— 只包含真的找到箭头的锚。
+      int 键 = 文字锚的 union index；str 键 = extra_anchors 传进来的 key。
+    """
+    if not items:
+        return {}
+    # 取景开启时才 fail-closed（与 steps.views.plan_boxes 的下游约定一致：
+    # 分类缺失就一个结果都不给）。关闭时不看 plan，任何框都去找。
+    if PLAN_GATE and not plan_regions:
+        if dbg:
+            dbg.note("arrows: no plan regions — fail-closed, skipped page")
+        return {}
+    # 取景判断先在这里做：纯坐标比较，零成本。落在 plan 外的锚本来就拿不到
+    # 箭头，没必要为它们启动边车、解析整页、再跑一遍全页检测——实测一页要
+    # 14-24 s。真实图纸里多数文字锚在标题栏 / 明细表 / 图例里，一页 12 个锚
+    # 常常只有 1 个在俯视图内，整页一个都没有也很常见。
+    anchors = [(index, it.get("box_2d")) for index, it in enumerate(items)]
+    anchors += [(key, box) for key, box in (extra_anchors or [])]
+    if PLAN_GATE:
+        inside = [(key, box) for key, box in anchors
+                  if _box_inside_any(box, plan_regions)]
+        if not inside:
+            if dbg:
+                dbg.note(f"arrows: all {len(anchors)} anchors outside plan "
+                         "views, sidecar not started")
+            return {}
+    else:
+        inside = anchors
+
+    if not sidecar_available():
+        raise RuntimeError(
+            f"arrow sidecar missing: node={_NODE} exists={_NODE.exists()} "
+            f"sidecar={_SIDECAR} exists={_SIDECAR.exists()}")
+
+    # 先抽单页再交给边车。整份文档解析是这条链路上唯一的内存悬崖：paducah 的
+    # 169 MB 源文件会让边车堆爆（实测 --max-old-space-size=384 仍 OOM），而单页
+    # 通常几百 KB。insert_pdf 保留该页的 CropBox / Rotate / UserUnit，
+    # 所以页面帧与整份加载完全一致（见 tools/arrow_sidecar 的等价性验证）。
+    with tempfile.TemporaryDirectory(prefix="arrows-") as work:
+        one = Path(work) / "page.pdf"
+        with FITZ_LOCK:
+            src = fitz.open(pdf_path)
+            try:
+                if not 0 <= int(page_index) < src.page_count:
+                    raise ValueError(
+                        f"page {page_index} out of range (total {src.page_count})")
+                dst = fitz.open()
+                try:
+                    dst.insert_pdf(src, from_page=int(page_index),
+                                   to_page=int(page_index))
+                    dst.save(one)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+
+        job = {
+            "pdf": str(one),
+            "page": 1,                        # 单页文件，边车用 1-based
+            # 只发 plan 内的锚；边车返回的 index 是这个子集的下标，
+            # 下面再映射回 union index。
+            "boxes": [list(box) for _key, box in inside],
+            # 放置锚（"s<symbol>:<placement>" 键）与文字锚的末端语义不同，
+            # 见边车里 arrowheadOnly 的说明。
+            "anchor_kinds": ["placement" if isinstance(key, str) else "text"
+                             for key, _box in inside],
+            # 取景关闭时不传区域：边车对空列表的语义就是「不过滤」。
+            "plan_regions": ([list(box) for box in plan_regions]
+                             if PLAN_GATE else []),
+        }
+        payload = None
+        last = None
+        for attempt, heap in enumerate(_HEAP_LADDER):
+            # 上一轮是「超预算」而不是 OOM 时，放宽预算再试；否则只加堆。
+            if last == "PAGE_TOO_LARGE":
+                job["budget"] = _BUDGET_RETRY
+            proc = subprocess.run(
+                [str(_NODE), f"--max-old-space-size={heap}",
+                 "--optimize-for-size", str(_SIDECAR)],
+                input=json.dumps(job), capture_output=True, text=True,
+                timeout=_TIMEOUT, check=False,
+            )
+            if proc.returncode == 0:
+                try:
+                    parsed = json.loads(proc.stdout)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"arrow sidecar bad output: {exc}; "
+                        f"stdout={proc.stdout[:300]!r}") from exc
+                if parsed.get("ok"):
+                    payload = parsed
+                    break
+                last = parsed.get("code")
+                if last != "PAGE_TOO_LARGE":
+                    raise RuntimeError(
+                        f"arrow sidecar {last}: {parsed.get('error')}")
+                if dbg:
+                    dbg.note(f"arrows: over budget at heap={heap}, widening")
+                continue
+            oom = (proc.returncode in (134, -6)
+                   or "heap out of memory" in proc.stderr.lower())
+            if not oom:
+                raise RuntimeError(
+                    f"arrow sidecar exit {proc.returncode}: "
+                    f"{proc.stderr.strip()[:400]}")
+            last = "OOM"
+            if dbg:
+                dbg.note(f"arrows: OOM at heap={heap} MB, retrying higher")
+        if payload is None:
+            # 走完梯子仍算不出来。这必须是一个显式失败，让上层记警告并把这页
+            # 标成未完成 —— 绝不能写一个空结果冒充「这页没有引线」。
+            raise RuntimeError(
+                f"arrow sidecar exhausted heap ladder {_HEAP_LADDER} "
+                f"(last={last})")
+        if dbg:
+            dbg.note("arrows: " + json.dumps(payload.get("page", {})))
+
+    out = {}
+    resolved = set()
+    for row in payload.get("results", []):
+        if not row.get("has_leader"):
+            continue
+        index = inside[int(row["index"])][0]   # 子集下标 → union index / 放置 key
+        resolved.add(index)
+        targets = row.get("targets") or []
+        out[index] = {
+            # 真实绘制的引线 / 箭头笔画（页面帧折线），供前端按 callout 上色。
+            "leader_strokes": row.get("leader_strokes") or [],
+            "arrow_strokes": row.get("arrow_strokes") or [],
+            # 每个末端一视同仁：n 条引线就有 n 个完整条目。
+            "targets": [{"tip": t["tip"], "box_2d": t["box_2d"],
+                         "terminal_kind": t["terminal_kind"]} for t in targets],
+            "confidence": "high" if row.get("source") == "automatic" else "medium",
+            "note": f"{row.get('source')} · {row.get('leader_count')} leader"
+                    f" · {len(targets)} target",
+        }
+
+    # 放置锚的兜底：边车靠「文字与引线绘制顺序相邻」做簇形成，对编号标记
+    # （圆圈里一个数字）在 combined_bid P20 上 12 个放置全部失败。放置锚有
+    # 强得多的先验可用 —— 它就是一个已知的标记，引线从它的外框出发、另一端
+    # 有箭头 —— 所以对边车没解出来的放置锚再用纯几何找一遍（steps/leaders.py）。
+    # 只补放置锚：文字锚没有「外框」这个锚点，同样的规则在文字上会乱连。
+    todo = [(key, box) for key, box in inside
+            if isinstance(key, str) and key not in resolved]
+    if todo:
+        from steps import leaders          # 局部 import：与边车解耦
+        try:
+            geo = leaders.marker_leaders(pdf_path, page_index, todo)
+        except Exception as exc:           # noqa: BLE001
+            if dbg:
+                dbg.note(f"arrows: geometric pass failed: {exc}")
+            geo = {}
+        if dbg and geo:
+            dbg.note(f"arrows: geometric pass recovered {len(geo)}/{len(todo)} "
+                     "placement anchors the sidecar missed")
+        out.update(geo)
+    return out
