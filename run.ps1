@@ -36,6 +36,10 @@ if (-not $Listen) {
 $env:FENCE_LITE_PORT = "$Port"
 $env:FENCE_LITE_HOST = $Listen
 $env:PYTHONUTF8 = '1'          # 被管道/编辑器捕获时 Python 会退回 gbk，中文全乱码
+# 客户流程固定包含引线与线型。webapp.py 也会 fail-fast 验证，避免任何一次
+# 手工启动把四阶段结果误报成完整 Done。
+$env:ARROWS = '1'
+$env:LINETYPES = '1'
 
 & (Join-Path $PSScriptRoot 'stop.ps1') -Port $Port -NoPause
 

@@ -1463,6 +1463,9 @@ def img(slug, page):
 
 
 if __name__ == "__main__":
+    # Same fail-closed contract as wsgi.py. Keep it outside the resume try:
+    # an incomplete pipeline must prevent the web service from starting.
+    job.require_full_pipeline_ready(probe=True)
     # Resume jobs interrupted by a previous server stop from their per-page
     # identity-checked checkpoints.  Explicit user cancellations stay stopped.
     try:

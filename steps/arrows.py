@@ -182,6 +182,30 @@ def sidecar_available():
     return _SIDECAR.exists() and _NODE.exists()
 
 
+def sidecar_probe(timeout=15):
+    """Prove the configured Node executable can actually be launched.
+
+    ``sidecar_available`` intentionally stays a cheap filesystem check because
+    it is used while assembling API status. Service startup calls this probe
+    once so a stale/non-executable Node path fails before any paid PDF stages
+    begin instead of failing on the first arrow page.
+    """
+    if not sidecar_available():
+        raise RuntimeError(
+            f"arrow sidecar missing: node={_NODE} sidecar={_SIDECAR}")
+    try:
+        proc = subprocess.run(
+            [str(_NODE), "--version"], capture_output=True, text=True,
+            timeout=max(1, int(timeout)), check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"arrow Node probe failed: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "no output").strip()
+        raise RuntimeError(
+            f"arrow Node probe exited {proc.returncode}: {detail}")
+    return (proc.stdout or proc.stderr or "node available").strip()
+
+
 def page_geometry_status(pdf_path, page_index):
     """Classify pages whose drawing is only a large embedded raster image.
 

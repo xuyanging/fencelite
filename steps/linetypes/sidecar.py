@@ -92,6 +92,38 @@ def all_sidecar_available():
             and _ENGINE_DIR.is_dir())
 
 
+def sidecar_probe(timeout=20):
+    """Prove the isolated interpreter and required algorithm deps import.
+
+    File existence alone cannot distinguish a healthy venv from one that was
+    copied without its packages. This startup-only subprocess uses the same
+    cleared ``PYTHONPATH`` contract as real line-type jobs and catches that
+    failure before text/symbol model calls spend time or money.
+    """
+    if not sidecar_available():
+        raise RuntimeError(
+            f"linetype sidecar missing: python={_PYTHON} runner={_RUNNER} "
+            f"engine={_ENGINE_DIR}")
+    probe = (
+        "import fitz,numpy,pypdf,scipy;"
+        "print(fitz.__version__,numpy.__version__,"
+        "pypdf.__version__,scipy.__version__)"
+    )
+    try:
+        proc = subprocess.run(
+            [str(_PYTHON), "-B", "-c", probe],
+            capture_output=True, text=True,
+            timeout=max(1, int(timeout)), check=False,
+            env={**os.environ, "PYTHONPATH": "", "PYTHONUTF8": "1"})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"linetype Python probe failed: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "no output").strip()
+        raise RuntimeError(
+            f"linetype Python probe exited {proc.returncode}: {detail}")
+    return (proc.stdout or "linetype dependencies available").strip()
+
+
 def all_geometry_digest():
     """Content identity of the optional full-geometry producer.
 

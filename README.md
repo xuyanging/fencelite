@@ -166,8 +166,10 @@ fence_lite/
 ```
 
 - 端口 **5060**（5051 是服务器上的生产，5055 是本机 fence_takeoff_web，别撞）。
-- `.env` 里放 `GEMINI_API_KEY=...`。`core/config.py` 在 import 时就读它，**缺了直接抛异常**，
-  不会等到第一次调用才报错。
+- 从 `.env.example` 复制 `.env` 并填写 API key。`ARROWS=1` 与 `LINETYPES=1`
+  是完整客户流程的硬要求；标准入口会在监听端口和付费处理前验证两项开关、Node
+  边车、普通/legend/调试线型边车及隔离 Python 依赖，缺任何一项都拒绝启动，
+  不再把四阶段结果显示为完整 Done。
 - 依赖**借用** `C:\Users\Administrator\fence_detector\venv`（同一套 flask + PyMuPDF + google-genai +
   Pillow，不要再建一个 venv）。`run.ps1` 里可用 `FENCE_PYTHON` 覆盖解释器。
 - 手工跑脚本 / 测试：

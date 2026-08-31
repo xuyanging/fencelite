@@ -362,15 +362,23 @@ class TestStageProgress(JobTestBase):
 
 # --------------------------------------------------------- pipeline wiring --
 class _FakeStages:
-    """把四个阶段函数换成假实现，记录调用顺序与收到的 should_cancel。"""
+    """把六个阶段函数换成假实现，记录调用顺序与收到的 should_cancel。"""
 
     def __init__(self, case, text=None, on_text=None):
         self.calls = []
         self.text_warnings = text or []
         self.on_text = on_text
         for name in ("_stage_text", "_stage_symbols", "_stage_views",
-                     "_stage_placements"):
+                     "_stage_placements", "_stage_arrows",
+                     "_stage_linetypes"):
             p = mock.patch.object(job, name, self._make(name))
+            p.start()
+            case.addCleanup(p.stop)
+        for owner, name, value in (
+                (job.arrows, "ENABLED", True),
+                (job.linetypes, "ENABLED", True),
+                (job, "require_full_pipeline_ready", mock.Mock(return_value=True))):
+            p = mock.patch.object(owner, name, value)
             p.start()
             case.addCleanup(p.stop)
 
@@ -387,11 +395,55 @@ class _FakeStages:
 
 class TestPipeline(JobTestBase):
 
-    def test_fence_mode_runs_four_stages_in_order(self):
+    def test_preflight_rejects_every_partial_toggle_combination(self):
+        cases = ((False, False), (True, False), (False, True))
+        for arrow_on, line_on in cases:
+            with self.subTest(arrows=arrow_on, linetypes=line_on), \
+                    mock.patch.object(job.arrows, "ENABLED", arrow_on), \
+                    mock.patch.object(job.linetypes, "ENABLED", line_on), \
+                    mock.patch.object(job.arrows, "sidecar_available",
+                                      return_value=True), \
+                    mock.patch.object(job.linetypes, "sidecar_available",
+                                      return_value=True), \
+                    mock.patch.object(job.legend_linetypes,
+                                      "sidecar_available", return_value=True), \
+                    mock.patch.object(job.linetypes.sidecar,
+                                      "all_sidecar_available",
+                                      return_value=True), \
+                    mock.patch.object(job.linetypes.sidecar, "dep_versions",
+                                      return_value={}):
+                with self.assertRaisesRegex(
+                        RuntimeError, "Full fence pipeline is not ready"):
+                    job.require_full_pipeline_ready()
+
+    def test_preflight_probes_complete_runtime(self):
+        with mock.patch.object(job.arrows, "ENABLED", True), \
+                mock.patch.object(job.linetypes, "ENABLED", True), \
+                mock.patch.object(job.arrows, "sidecar_available",
+                                  return_value=True), \
+                mock.patch.object(job.arrows, "sidecar_probe") as arrow_probe, \
+                mock.patch.object(job.linetypes, "sidecar_available",
+                                  return_value=True), \
+                mock.patch.object(job.legend_linetypes,
+                                  "sidecar_available", return_value=True), \
+                mock.patch.object(job.linetypes.sidecar,
+                                  "all_sidecar_available", return_value=True), \
+                mock.patch.object(job.linetypes.sidecar, "dep_versions",
+                                  return_value={"numpy": "2"}), \
+                mock.patch.object(job.linetypes.sidecar,
+                                  "sidecar_probe") as line_probe:
+            self.assertTrue(job.require_full_pipeline_ready(probe=True))
+        arrow_probe.assert_called_once_with()
+        line_probe.assert_called_once_with()
+
+    def test_fence_mode_runs_six_stages_in_order(self):
         fake = _FakeStages(self)
         job._run_pipeline("alpha", None, lambda: False)
         self.assertEqual(fake.calls, ["_stage_text", "_stage_symbols",
-                                      "_stage_views", "_stage_placements"])
+                                      "_stage_views", "_stage_placements",
+                                      "_stage_arrows", "_stage_linetypes"])
+        self.assertEqual(job.JOBS["alpha"]["completed_stages"],
+                         list(job.FULL_PIPELINE_STAGES))
         self.assertEqual(job.JOBS["alpha"]["stage"], "done")
         self.assertEqual(job.JOBS["alpha"]["progress"], 1.0)
 
@@ -430,7 +482,8 @@ class TestPipeline(JobTestBase):
                 mock.patch.object(job, "_stage_arrows") as arrow_stage, \
                 mock.patch.object(job, "_stage_linetypes",
                                   side_effect=line_stage) as line_types:
-            job._run_pipeline("alpha", None, lambda: False)
+            job._run_pipeline("alpha", None, lambda: False,
+                              allow_partial=True)
 
         self.assertEqual(fake.calls, ["_stage_text", "_stage_symbols",
                                       "_stage_views", "_stage_placements"])
@@ -652,7 +705,9 @@ class TestRun(JobTestBase):
                          (True, True, "done", None))
         self.assertEqual(st["outcome"], "success")
         self.assertTrue(st["results_available"])
-        self.assertEqual(len(fake.calls), 4)
+        self.assertEqual(fake.calls, ["_stage_text", "_stage_symbols",
+                                      "_stage_views", "_stage_placements",
+                                      "_stage_arrows", "_stage_linetypes"])
         res = store.load_json(store.results_path(slug), None)
         self.assertEqual(res["llm_summary"], job._ZERO_LLM)
         self.assertIsInstance(res["wall_seconds"], float)
@@ -672,6 +727,18 @@ class TestRun(JobTestBase):
         self.assertTrue(st["results_available"])
         self.assertEqual(st["warnings"],
                          ["P3 image scan still incomplete"])
+
+    def test_missing_required_stage_can_never_finish_as_success(self):
+        slug = job.create_project(b"x", "incomplete.pdf")
+        self.write_results(slug)
+        job._set(slug, started=job.time.time(),
+                 required_stages=list(job.FULL_PIPELINE_STAGES),
+                 completed_stages=list(job.FULL_PIPELINE_STAGES[:-1]))
+        job._finish(slug, ok=True, summary=job._ZERO_LLM)
+        st = job.JOBS[slug]
+        self.assertEqual((st["done"], st["ok"], st["outcome"], st["stage"]),
+                         (True, False, "failed", "error"))
+        self.assertIn("linetypes", st["error"])
 
     def test_cancel_during_text_stage_publishes_nothing(self):
         slug = job.create_project(b"x", "cancel.pdf")

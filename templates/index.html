@@ -524,8 +524,8 @@ svg polyline.scope-focus{stroke-width:3.2;opacity:1;filter:drop-shadow(0 0 2px r
     <div>Detection target for every selected PDF — change it to doors / trees / hydrants, etc.</div>
     <textarea id="upTarget" spellcheck="false"></textarea>
     <div class="note">
-      default target = Find fence-related text — runs all four steps: text → Legend sample symbols → View classification →
-      in-plan symbol matching.<b>Change the target to anything else and only the text step runs</b> —
+      default target = Find fence-related text — runs all six steps: text → Legend sample symbols → View classification →
+      in-plan symbol matching → Arrows &amp; leaders → Line types. <b>Change the target to anything else and only the text step runs</b> —
       Legend symbols and in-plan placement are fence-specific logic; they do not apply to an arbitrary target and are skipped automatically.
     </div>
     <div class="upload-status" id="upErr" aria-live="polite"></div>
@@ -542,7 +542,7 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const STAGE_CN={queued:'Queued',text:'Step 1 · Find text',symbols:'Step 2 · Legend sample symbols',
   views:'Step 3 · View classification',placements:'Step 4 · in-plan symbol matching',
-  arrows:'Extra · Arrows & leaders',linetypes:'Extra · Line types',done:'Done',error:'failed',cancelled:'Cancelled',
+  arrows:'Step 5 · Arrows & leaders',linetypes:'Step 6 · Line types',done:'Done',error:'failed',cancelled:'Cancelled',
   interrupted:'Interrupted (service restart)'};
 
 let PRESET='';                 // 预置检测目标

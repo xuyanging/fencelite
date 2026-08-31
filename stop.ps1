@@ -38,8 +38,14 @@ foreach ($processId in Get-ListenerPids $Port) {
     if (-not [int]::TryParse("$processId", [ref]$id)) { continue }
     if ($id -le 4) { continue }        # 0/4 是系统进程，永远不动
     try {
-        Stop-Process -Id $id -Force -ErrorAction Stop
-        Write-Host "Stopped PID $id (port $Port)."
+        # /T is essential: arrow/line-type workers are child process trees.
+        # Killing only the listening Python PID can leave Node/Python sidecars
+        # alive with an old PDF and an inherited pipe.
+        & taskkill.exe /PID $id /T /F | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "taskkill exited with code $LASTEXITCODE"
+        }
+        Write-Host "Stopped PID $id and its process tree (port $Port)."
         $killed++
     } catch {
         Write-Host "Could not stop PID ${id}: $($_.Exception.Message)"

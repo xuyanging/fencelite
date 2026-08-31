@@ -152,6 +152,64 @@ class JobStartError(RuntimeError):
     """
 
 
+FULL_PIPELINE_STAGES = (
+    "text", "symbols", "views", "placements", "arrows", "linetypes")
+
+
+def full_pipeline_issues(*, probe=False):
+    """Return every reason the customer-facing fence pipeline is incomplete.
+
+    ARROWS/LINETYPES are retained as explicit maintenance switches, but a web
+    service must never silently turn them into a four-stage "success". The
+    cheap checks also cover both supervised legend matching and the on-demand
+    all-line-types debug producer because those are part of the shipped UI.
+    ``probe=True`` additionally launches each configured interpreter once.
+    """
+    issues = []
+    if not arrows.ENABLED:
+        issues.append("ARROWS=1 is required")
+    if not linetypes.ENABLED:
+        issues.append("LINETYPES=1 is required")
+
+    if arrows.ENABLED:
+        if not arrows.sidecar_available():
+            issues.append("arrow Node sidecar is unavailable")
+        elif probe:
+            try:
+                arrows.sidecar_probe()
+            except Exception as exc:                           # noqa: BLE001
+                issues.append(str(exc))
+
+    if linetypes.ENABLED:
+        if not linetypes.sidecar_available():
+            issues.append("ordinary line-type sidecar is unavailable")
+        if not legend_linetypes.sidecar_available():
+            issues.append("legend line-type sidecar is unavailable")
+        if not linetypes.sidecar.all_sidecar_available():
+            issues.append("all-line-types debug sidecar is unavailable")
+        missing = sorted(name for name, version
+                         in linetypes.sidecar.dep_versions().items()
+                         if version == "missing")
+        if missing:
+            issues.append("line-type dependencies missing: "
+                          + ", ".join(missing))
+        elif linetypes.sidecar_available() and probe:
+            try:
+                linetypes.sidecar.sidecar_probe()
+            except Exception as exc:                           # noqa: BLE001
+                issues.append(str(exc))
+    return issues
+
+
+def require_full_pipeline_ready(*, probe=False):
+    """Fail closed unless all six customer-facing stages can run."""
+    issues = full_pipeline_issues(probe=probe)
+    if issues:
+        raise RuntimeError(
+            "Full fence pipeline is not ready: " + "; ".join(issues))
+    return True
+
+
 # ---------------------------------------------------------------- job state --
 JOBS = {}                       # slug -> status dict
 _JOBS_LOCK = threading.Lock()
@@ -421,6 +479,18 @@ def _warn(slug, messages):
     _persist_job(slug)
 
 
+def _mark_stage_completed(slug, stage):
+    """Persist an auditable stage receipt without duplicating entries."""
+    with _JOBS_LOCK:
+        job = JOBS.setdefault(slug, {"slug": slug})
+        completed = list(job.get("completed_stages") or [])
+        if stage not in completed:
+            completed.append(stage)
+        job["completed_stages"] = completed
+        job["updated_at"] = time.time()
+    _persist_job(slug)
+
+
 def get_job(slug):
     """Public status for one slug, merged with the LIVE cumulative cost/time
     while this slug's run is in flight (so the UI sees it grow in real time)."""
@@ -476,7 +546,15 @@ def _wall_now(slug):
 def _finish(slug, ok, summary, error=None):
     total = _merge_llm(_running_state(slug).get("base"), summary)
     with _JOBS_LOCK:
-        warnings = list((JOBS.get(slug) or {}).get("warnings") or [])
+        current = JOBS.get(slug) or {}
+        warnings = list(current.get("warnings") or [])
+        required = list(current.get("required_stages") or [])
+        completed = set(current.get("completed_stages") or [])
+    missing = [stage for stage in required if stage not in completed]
+    if ok and missing:
+        ok = False
+        error = ("Pipeline invariant failed; required stages did not finish: "
+                 + ", ".join(missing))
     # ``ok`` remains the backwards-compatible "pipeline did not crash" bit.
     # ``outcome`` tells the UI whether every requested source actually
     # completed.  This lets useful partial results remain viewable without
@@ -2588,6 +2666,9 @@ def _start_job_claimed(slug, target=None, model=None, _resume=False):
              done=False, ok=None, error=None, cancelled=False,
              outcome=None, results_available=False, repairing=None,
              cancel_requested=False, warnings=[], heartbeat_at=time.time(),
+             required_stages=list(FULL_PIPELINE_STAGES if is_default
+                                  else ("text",)),
+             completed_stages=[],
              started=time.time(), finished=None,
              llm=(base_llm or None), wall_seconds=(base_wall or None),
              model=(model or MODEL_NAME),
@@ -2776,7 +2857,7 @@ def _stage_progress(slug, lo, hi):
     return cb
 
 
-def _run_pipeline(slug, target, should_cancel=None):
+def _run_pipeline(slug, target, should_cancel=None, *, allow_partial=False):
     """text → symbols → views → placements（fence 目标），custom 目标只跑 text.
 
     每阶段的 wall 时间打成 ``[timing] <name> = Xs``（排查主耗时用），阶段边界
@@ -2804,6 +2885,12 @@ def _run_pipeline(slug, target, should_cancel=None):
               flush=True)
 
     is_default = is_default_target(target)
+    # Check before text/VLM work: a disabled or missing local stage must never
+    # spend money and then publish a misleading clean Done card. The private
+    # override exists only for focused maintenance/unit tests of an individual
+    # stage combination; production entry points never pass it.
+    if is_default and not allow_partial:
+        require_full_pipeline_ready()
     text_hi = 0.55 if is_default else 1.0
     _set(slug, stage="text", progress=0.0, stage_done=0, stage_total=0,
          stage_unit="percent",
@@ -2813,6 +2900,7 @@ def _run_pipeline(slug, target, should_cancel=None):
         on_progress=_stage_progress(slug, 0.0, text_hi), should_cancel=sc)))
     guard()
     _snapshot(slug)
+    _mark_stage_completed(slug, "text")
     if not is_default:
         # custom target: the fence-specific symbol/view/placement steps do not
         # apply to an arbitrary detection target.
@@ -2827,6 +2915,7 @@ def _run_pipeline(slug, target, should_cancel=None):
         slug, on_progress=_stage_progress(slug, 0.55, 0.80), should_cancel=sc)))
     guard()
     _snapshot(slug)
+    _mark_stage_completed(slug, "symbols")
 
     _set(slug, stage="views", detail="View classification (VLM)…",
          progress=0.80, stage_done=0, stage_total=0, stage_unit="sheets")
@@ -2834,6 +2923,7 @@ def _run_pipeline(slug, target, should_cancel=None):
         slug, on_progress=_stage_progress(slug, 0.80, 0.92), should_cancel=sc)))
     guard()
     _snapshot(slug)
+    _mark_stage_completed(slug, "views")
 
     # Legend line samples are independent from arrows.  When only LINETYPES is
     # on, reserve the same final 2% slice that line types already occupied in
@@ -2848,6 +2938,7 @@ def _run_pipeline(slug, target, should_cancel=None):
         slug, on_progress=_stage_progress(slug, 0.92, plc_hi),
         should_cancel=sc)))
     guard()
+    _mark_stage_completed(slug, "placements")
 
     linetype_lo = plc_hi
     if arrows.ENABLED:
@@ -2861,6 +2952,7 @@ def _run_pipeline(slug, target, should_cancel=None):
             should_cancel=sc)))
         guard()
         _snapshot(slug)
+        _mark_stage_completed(slug, "arrows")
         linetype_lo = arw_hi
 
     if linetypes.ENABLED:
@@ -2874,6 +2966,7 @@ def _run_pipeline(slug, target, should_cancel=None):
             should_cancel=sc)))
         guard()
         _snapshot(slug)
+        _mark_stage_completed(slug, "linetypes")
 
     _set(slug, stage="done", detail="Done", progress=1.0,
          stage_done=0, stage_total=0, stage_unit=None)

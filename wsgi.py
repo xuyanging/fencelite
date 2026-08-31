@@ -11,6 +11,10 @@ job._PROC_LOCK 也是进程级串行闸，多 worker 会让两者各算各的。
 import job
 from webapp import app  # noqa: F401  (gunicorn 按名字找 app)
 
+# Fail before the HTTP socket becomes usable. Otherwise ARROWS/LINETYPES=0
+# produces a clean Done card after only text/symbol/view/placement stages.
+job.require_full_pipeline_ready(probe=True)
+
 try:
     job.resume_interrupted()
 except Exception as exc:                                        # noqa: BLE001
