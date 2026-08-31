@@ -2577,7 +2577,7 @@ def materialize_all_linetypes_from_legend(slug, page, sig):
 def _stage_linetypes(slug, on_progress=None, should_cancel=None):
     """Run arrow-bound and supervised-legend line matching together.
 
-    页级并发由 ``LINETYPE_PAGE_WORKERS`` 控制（生产前台为 2）；每个线程等待一个
+    页级并发由 ``LINETYPE_PAGE_WORKERS`` 控制（生产前台为 3）；每个线程等待一个
     单页边车，边车内部再按 ``LINETYPE_CPU_BUDGET`` 使用 worker 预算（生产前台 4，
     低优先级 refresh 2）。每页独立缓存，并受跨进程页锁与共享 heavy slot 保护。
     """

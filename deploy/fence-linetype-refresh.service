@@ -20,7 +20,7 @@ Environment=LINETYPE_TIMEOUT=600
 Environment=LINETYPE_DENSE_TIMEOUT=3600
 Environment=LINETYPE_DENSE_PATHS=40000
 Environment=LINETYPE_CPU_BUDGET=2
-Environment=HEAVY_SIDECAR_SLOTS=2
+Environment=HEAVY_SIDECAR_SLOTS=3
 Environment=LINETYPE_REFRESH_WORKERS=1
 ExecStart=/home/ubuntu/fence_lite/venv/bin/python -B /home/ubuntu/fence_lite/tools/refresh_stale_linetypes.py --once
 

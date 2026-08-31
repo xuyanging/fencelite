@@ -295,21 +295,21 @@ venv/bin/python tools/check_rerun_cost.py <slug>
 |---|---|---|---|
 | `MAX_PARALLEL_JOBS` | 按 CPU/内存推导（本机 2） | 同时处理多少份 PDF；其余保持 queued | 多份大图同时渲染/聚类会抬高内存峰值 |
 | `GEMINI_MAX_CONCURRENCY` | 8 | 所有 PDF、Web/维护进程合计的 Gemini 在途调用上限 | 429 / 配额；必须让所有进程使用同一个值 |
-| `HEAVY_SIDECAR_SLOTS` | 按页级 worker 推导（生产显式 2） | 箭头与线型边车共享的跨进程总槽位 | CPU/内存超订；Web 与 refresh 必须使用同一个值 |
+| `HEAVY_SIDECAR_SLOTS` | 按页级 worker 推导（生产显式 3） | 箭头与线型边车共享的跨进程总槽位 | CPU/内存超订；Web 与 refresh 必须使用同一个值 |
 | `TEXT_WORKERS` | 8 | 步骤1 整页 VLM 扫描，页级并行（线程） | 429 / 配额；每个 worker 都要先渲染一页，而渲染在 `FITZ_LOCK` 里**串行** |
 | `SCAN_ALL_PAGES` | 1 | 每页 Pro + Flash 取并集，避免混合 CAD 页假阴性 | 步骤1调用量增加；设 0 会重新漏掉纯 path 字样 |
 | `VEC_WORKERS` | `min(cpu, 6)` | 矢量文字层抽取，页级并行（**进程**，MuPDF 非线程安全） | 内存（大图纸每页几十 MB）；页数 < `VEC_MIN_PARALLEL`(24) 时自动退回单进程 |
 | `JUDGE_WORKERS` | 4 | 文字判词分块并行（纯网络） | 429；判词是最便宜的一档，没必要拉太高 |
 | `SYMBOLS_WORKERS` | 8 | 步骤2 页级并行 | 429 + `FITZ_LOCK` 渲染串行 |
 | `VIEW_WORKERS` | 6 | 步骤3 页级并行 | 同上 |
-| `LINETYPE_PAGE_WORKERS` | 按 CPU 推导（生产显式 2） | 步骤6同时运行多少个单页边车 | 与页内 CPU budget 相乘后超订，且每页几何内存峰值不小 |
+| `LINETYPE_PAGE_WORKERS` | 按 CPU 推导（生产显式 3） | 步骤6同时运行多少个单页边车 | 与页内 CPU budget 相乘后超订，且每页几何内存峰值不小 |
 | `LINETYPE_CPU_BUDGET` | 按 CPU 推导（生产前台 4；refresh 2） | 单页边车内部引擎的 worker 预算 | 高于甜点位通常不再提速，还会和其他页抢核 |
 | `LINETYPE_TIMEOUT` | 600 | 普通线型页硬上限（秒） | 过低会丢密页线型 |
 | `LINETYPE_DENSE_TIMEOUT` | 3600 | >=40k vector paths 密页上限 | 过高会让异常密页长时间占队列 |
 
-当前生产前台是 **2 页并发 × 每页 budget 4**；低优先级
+当前生产前台是 **3 页并发 × 每页 budget 4**；低优先级
 `fence-linetype-refresh.service` 是 **1 页并发 × 每页 budget 2**。两者共享
-`HEAVY_SIDECAR_SLOTS=2`，refresh 发现前台上传 / 重跑时不会再提交新页。
+`HEAVY_SIDECAR_SLOTS=3`，refresh 发现前台上传 / 重跑时不会再提交新页。
 
 真正的瓶颈通常**不是** Gemini 而是渲染：`core.pdfio.FITZ_LOCK` 是进程级 RLock，
 所有 `fitz` 调用点都必须持它（MuPDF 在同一进程里不是线程安全的，就算各自开
