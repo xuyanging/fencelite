@@ -42,6 +42,11 @@ SYMBOL_VERSION = 19
 VIEW_VERSION = 1
 
 # 本地 shape 放置匹配 + plan 视图过滤。纯几何、零模型调用，bump 免费重算。
+#   5（本版）：编号/字母是 symbol 身份，不能只比外框。原生 PDF 文字继续按
+#     字符内容精确匹配；没有文字层的 CAD 轮廓字，把封闭外框内部的小线段/小
+#     闭合图元纳入强制模板，并用一对一的位置、长度、方向相似度验证。伸出外框
+#     的引线、表格线及背景 path 不进入身份模板。修复 hexagon-5 匹配所有六边形，
+#     以及 koch P7 的 circle-C/F 退化成同一个圆圈模板的问题。
 #   3（本版）：放置框补上标记的外圈（core/symbolmatch.py 的 _enclosing_outline）。
 #     发布的框原来是「实际匹配上的图元的并集」，而编号标记（圆圈里一个数字）
 #     常常只匹配上里面的数字、圈没进去 —— 实测 combined_bid P20 七个符号的
@@ -59,4 +64,4 @@ VIEW_VERSION = 1
 #     吸附成真实闭合 shape，且已识别的 fence 行左侧有同行原生 PDF
 #     文字 N.k 时，才派生该行的 shape symbol。样例框继承 N.0 尺寸，
 #     精确 glyph 框单独留痕，然后照常走全页矢量匹配、plan 过滤和后续链。
-PLACEMENT_VERSION = 4
+PLACEMENT_VERSION = 5
