@@ -1101,6 +1101,164 @@ class TestLinetypeCompletionBounds(JobTestBase):
         self.assertTrue(job._linetype_page_lock_path(
             self.slug, 1).is_file())
 
+    def test_materialize_all_valid_cache_skips_heavy_slot_and_sidecar(self):
+        main = dict(self.success)
+        cached = {"cache": "raw"}
+        canonical = {"cache": "validated"}
+
+        with mock.patch.object(job.linetypes, "load_page",
+                               return_value=main) as load_main, \
+                mock.patch.object(job.linetypes, "load_all_page",
+                                  return_value=cached) as load_all, \
+                mock.patch.object(job.linetypes, "validated_all_page",
+                                  return_value=canonical) as validate, \
+                mock.patch.object(job, "_slot_pool") as slot_pool, \
+                mock.patch.object(
+                    job.linetypes,
+                    "compute_all_page_geometry") as compute, \
+                mock.patch.object(job.linetypes, "save_all_page") as save:
+            result = job.materialize_all_linetypes(
+                self.slug, 1, self.sig)
+
+        self.assertIs(result, canonical)
+        load_main.assert_called_once_with(self.slug, 1)
+        load_all.assert_called_once_with(self.slug, 1)
+        validate.assert_called_once_with(cached, main, self.sig)
+        slot_pool.assert_not_called()
+        compute.assert_not_called()
+        save.assert_not_called()
+
+    def test_materialize_all_missing_cache_computes_verifies_and_saves(self):
+        main = dict(self.success)
+        generated = {"geometry": "fresh"}
+        canonical = {"geometry": "verified"}
+        heavy_pool = mock.Mock()
+        heavy_pool.slot.return_value = mock.MagicMock()
+
+        with mock.patch.object(job.linetypes, "load_page",
+                               side_effect=[main, main]) as load_main, \
+                mock.patch.object(job.linetypes, "load_all_page",
+                                  return_value=None), \
+                mock.patch.object(job.linetypes, "validated_all_page",
+                                  return_value=None), \
+                mock.patch.object(job, "_slot_pool",
+                                  return_value=heavy_pool) as slot_pool, \
+                mock.patch.object(
+                    job.linetypes, "compute_all_page_geometry",
+                    return_value=generated) as compute, \
+                mock.patch.object(
+                    job.linetypes, "verify_all_page_geometry",
+                    return_value=canonical) as verify, \
+                mock.patch.object(job.linetypes,
+                                  "save_all_page") as save:
+            result = job.materialize_all_linetypes(
+                self.slug, 1, self.sig)
+
+        self.assertIs(result, canonical)
+        self.assertEqual(load_main.call_count, 2)
+        slot_pool.assert_called_once_with(
+            "heavy-sidecar", job.HEAVY_SIDECAR_SLOTS)
+        heavy_pool.slot.assert_called_once_with()
+        compute.assert_called_once_with(
+            job.pdf_path(self.slug), 1, main, timeout=job.LINETYPE_TIMEOUT)
+        verify.assert_called_once_with(main, generated)
+        save.assert_called_once_with(self.slug, 1, canonical)
+
+    def test_materialize_all_discards_result_if_main_changes_during_compute(
+            self):
+        main = dict(self.success)
+        replacement = {**main, "sig": f"{self.sig}-replacement"}
+        generated = {"geometry": "fresh"}
+        heavy_pool = mock.Mock()
+        heavy_pool.slot.return_value = mock.MagicMock()
+
+        with mock.patch.object(job.linetypes, "load_page",
+                               side_effect=[main, replacement]), \
+                mock.patch.object(job.linetypes, "load_all_page",
+                                  return_value=None), \
+                mock.patch.object(job.linetypes, "validated_all_page",
+                                  return_value=None), \
+                mock.patch.object(job, "_slot_pool",
+                                  return_value=heavy_pool), \
+                mock.patch.object(
+                    job.linetypes, "compute_all_page_geometry",
+                    return_value=generated) as compute, \
+                mock.patch.object(
+                    job.linetypes, "verify_all_page_geometry") as verify, \
+                mock.patch.object(job.linetypes,
+                                  "save_all_page") as save:
+            with self.assertRaisesRegex(
+                    RuntimeError, "changed during generation"):
+                job.materialize_all_linetypes(self.slug, 1, self.sig)
+
+        compute.assert_called_once()
+        verify.assert_not_called()
+        save.assert_not_called()
+
+    def test_materialize_all_same_page_callers_compute_once(self):
+        main = dict(self.success)
+        generated = {"geometry": "fresh"}
+        canonical = {"geometry": "verified"}
+        cached = {"entry": None}
+        entered = threading.Event()
+        release = threading.Event()
+        second_started = threading.Event()
+        heavy_pool = mock.Mock()
+        heavy_pool.slot.return_value = mock.MagicMock()
+
+        def load_all(_slug, _page):
+            return cached["entry"]
+
+        def validate(entry, _main, _sig):
+            return entry if entry is canonical else None
+
+        def compute(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError(
+                    "test did not release all-line-types compute")
+            return generated
+
+        def save(_slug, _page, entry):
+            cached["entry"] = entry
+
+        def second_call():
+            second_started.set()
+            return job.materialize_all_linetypes(
+                self.slug, 1, self.sig)
+
+        with mock.patch.object(job.linetypes, "load_page",
+                               return_value=main), \
+                mock.patch.object(job.linetypes, "load_all_page",
+                                  side_effect=load_all), \
+                mock.patch.object(job.linetypes, "validated_all_page",
+                                  side_effect=validate), \
+                mock.patch.object(job, "_slot_pool",
+                                  return_value=heavy_pool), \
+                mock.patch.object(
+                    job.linetypes, "compute_all_page_geometry",
+                    side_effect=compute) as run_compute, \
+                mock.patch.object(
+                    job.linetypes, "verify_all_page_geometry",
+                    return_value=canonical) as verify, \
+                mock.patch.object(job.linetypes, "save_all_page",
+                                  side_effect=save) as persist, \
+                ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                job.materialize_all_linetypes, self.slug, 1, self.sig)
+            self.assertTrue(entered.wait(2))
+            second = pool.submit(second_call)
+            self.assertTrue(second_started.wait(2))
+            release.set()
+            self.assertIs(first.result(timeout=2), canonical)
+            self.assertIs(second.result(timeout=2), canonical)
+
+        run_compute.assert_called_once()
+        verify.assert_called_once_with(main, generated)
+        persist.assert_called_once_with(self.slug, 1, canonical)
+        self.assertTrue(job._linetype_page_lock_path(
+            self.slug, 1).is_file())
+
 
 class TestRemoteModelTimeoutBounds(JobTestBase):
     """Remote stalls get one recall retry; local deterministic stalls do not."""

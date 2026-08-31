@@ -48,8 +48,32 @@ const makeNode = (tag) => {
     setAttribute(k, v) { this.attributes[k] = v; },
     getAttribute(k) { return this.attributes[k]; },
     removeAttribute(k) { delete this.attributes[k]; },
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(type, fn) {
+      this._listeners = this._listeners || new Map();
+      const key = String(type || "");
+      const list = this._listeners.get(key) || [];
+      if (typeof fn === "function" && !list.includes(fn)) list.push(fn);
+      this._listeners.set(key, list);
+    },
+    removeEventListener(type, fn) {
+      if (!this._listeners) return;
+      const key = String(type || "");
+      this._listeners.set(key,
+        (this._listeners.get(key) || []).filter((item) => item !== fn));
+    },
+    dispatchEvent(event) {
+      const e = event && typeof event === "object" ? event : {type: String(event || "")};
+      e.type = String(e.type || "");
+      if (!e.target) e.target = this;
+      e.currentTarget = this;
+      if (!e.preventDefault) e.preventDefault = () => { e.defaultPrevented = true; };
+      if (!e.stopPropagation) e.stopPropagation = () => {};
+      const propertyHandler = this[`on${e.type}`];
+      if (typeof propertyHandler === "function") propertyHandler.call(this, e);
+      for (const fn of [...((this._listeners && this._listeners.get(e.type)) || [])])
+        fn.call(this, e);
+      return !e.defaultPrevented;
+    },
     querySelector(sel) {
       this._qs = this._qs || new Map();
       const key = String(sel || "*");
@@ -854,6 +878,13 @@ for (const rel of urls) {
           // ALL_NODES 是 let 绑定，不挂在 global 对象上（同 PAGE），
           // 只能在同一个 context 里求值才能读到。
           const drawn = vm.runInContext("ALL_NODES.size", context);
+          const emptyTypes = JSON.parse(vm.runInContext(
+            "JSON.stringify([...ALL_NODES].filter(([,nodes])=>!nodes.length).map(([number])=>number))",
+            context));
+          const missingGeometry = emptyTypes.filter((number) => {
+            const type = types.find((t) => t.line_type_number === number);
+            return type && Number(type.segment_count || 0) > 0;
+          });
           const gAll = context.document.getElementById("gAll");
           const gResid = context.document.getElementById("gResid");
           const items = (context.document.getElementById("list").children || [])
@@ -867,6 +898,11 @@ for (const rel of urls) {
           const focus = vm.runInContext("ALL_FOCUS", context);
           const problems = [];
           if (drawn !== types.length) problems.push(`ALL_NODES ${drawn} != 类型数 ${types.length}`);
+          if (missingGeometry.length)
+            problems.push(`${missingGeometry.length} 个有线段的类型没有折线节点: ${missingGeometry.slice(0, 8).join(",")}`);
+          const recognized = Number((((payload.record || {}).linetypes || {}).page || {}).line_types);
+          if (recognized && types.length !== recognized)
+            problems.push(`全量接口 ${types.length} 型 != 主结果识别 ${recognized} 型`);
           if (!(gAll.children || []).length) problems.push("gAll 没有任何折线");
           if (all.residual && all.residual.op_count && !(gResid.children || []).length)
             problems.push("residual 有 op 但 gResid 空");
@@ -903,12 +939,21 @@ for (const rel of urls) {
           await context.ensureAllLinetypes();
           const liveState = vm.runInContext("ALL_LT_STATE", context);
           const liveDrawn = vm.runInContext("ALL_NODES.size", context);
+          const liveEmpty = JSON.parse(vm.runInContext(
+            "JSON.stringify([...ALL_NODES].filter(([,nodes])=>!nodes.length).map(([number])=>number))",
+            context));
+          const liveMissingGeometry = liveEmpty.filter((number) => {
+            const type = types.find((t) => t.line_type_number === number);
+            return type && Number(type.segment_count || 0) > 0;
+          });
           const liveNodes = (context.document.getElementById("gAll").children || []).length;
           const liveItems = (context.document.getElementById("list").children || [])
             .filter((n) => n.classList && n.classList.contains("al-item")).length;
           const liveProblems = [];
           if (liveState !== "ok") liveProblems.push(`点击后 ALL_LT_STATE=${liveState}`);
           if (liveDrawn !== types.length) liveProblems.push(`点击后 ALL_NODES ${liveDrawn} != ${types.length}`);
+          if (liveMissingGeometry.length)
+            liveProblems.push(`点击后 ${liveMissingGeometry.length} 个有线段的类型没有折线节点`);
           if (!liveNodes) liveProblems.push("点击后 gAll 空");
           if (liveItems !== types.length) liveProblems.push(`点击后列表 ${liveItems} != ${types.length}`);
           if (liveProblems.length) {
@@ -917,6 +962,100 @@ for (const rel of urls) {
           } else {
             console.log(`  OK   ${rel} 真实点击路径: 勾选后自动取数并画出 `
               + `${liveDrawn} 型 / ${liveNodes} 折线 / 列表 ${liveItems} 行`);
+          }
+
+          // ---- 真实 checkbox change 路径：隐藏不等于丢缓存 -----------
+          // 不直接调 syncLayers()/ensureAllLinetypes()；由页面在 LAYERS 循环里
+          // 注册的 change listener 决定是纯隐藏还是恢复绘制。
+          const toggleProblems = [];
+          const allInput = context.document.getElementById("tgAll").querySelector("input");
+          const residInput = context.document.getElementById("tgResid").querySelector("input");
+          const allGroup = context.document.getElementById("gAll");
+          const residGroup = context.document.getElementById("gResid");
+          const oldFetch = context.fetch;
+          const savedToggle = vm.runInContext(
+            "({all:ALL_LT,key:ALL_LT_KEY,state:ALL_LT_STATE,detail:ALL_LT_DETAIL,"
+            + "allChecked:$('tgAll').querySelector('input').checked,"
+            + "residChecked:$('tgResid').querySelector('input').checked})", context);
+          context.__toggleAllCache = savedToggle.all;
+          let toggleNetworkCalls = 0;
+          try {
+            // 已有缓存的开关路径不应碰网络；若碰了，返回显式失败
+            // 而不是真正重跑，让断言能稳定指出多余 GET/POST。
+            context.fetch = async () => {
+              toggleNetworkCalls += 1;
+              return {ok: false, status: 599,
+                json: async () => ({error: "unexpected toggle network request"})};
+            };
+            const change = (input, checked) => {
+              input.checked = checked;
+              input.dispatchEvent({type: "change"});
+            };
+
+            // 两个开关都打开：全部线型和 residual 各显示各自的层。
+            change(residInput, true);
+            change(allInput, true);
+            await Promise.resolve();
+            if (allGroup.style.display === "none" || !(allGroup.children || []).length)
+              toggleProblems.push("勾选 All line types 后 gAll 未显示/无几何");
+            if (all.residual && all.residual.op_count
+                && (residGroup.style.display === "none" || !(residGroup.children || []).length))
+              toggleProblems.push("勾选 residual 后 gResid 未显示/无几何");
+
+            const allNodeCount = (allGroup.children || []).length;
+            const residNodeCount = (residGroup.children || []).length;
+            change(allInput, false);
+            if (allGroup.style.display !== "none")
+              toggleProblems.push("取消 All line types 后 gAll 仍显示");
+            if (residGroup.style.display === "none")
+              toggleProblems.push("取消 All line types 误隐藏了独立 residual 层");
+            const hidden = vm.runInContext(
+              "({same:ALL_LT===__toggleAllCache,key:ALL_LT_KEY,state:ALL_LT_STATE,"
+              + "inflight:!!ALL_LT_INFLIGHT})", context);
+            if (!hidden.same || hidden.key !== savedToggle.key || hidden.state !== "ok")
+              toggleProblems.push("取消勾选后缓存/key/状态未保留");
+            if (hidden.inflight) toggleProblems.push("取消勾选启动了请求");
+
+            // 再次打开必须仅用内存 ALL_LT 重画，节点数不变且无网络。
+            change(allInput, true);
+            await Promise.resolve();
+            if (allGroup.style.display === "none"
+                || (allGroup.children || []).length !== allNodeCount)
+              toggleProblems.push("再次勾选未从缓存恢复 gAll");
+            const restored = vm.runInContext(
+              "({same:ALL_LT===__toggleAllCache,state:ALL_LT_STATE,"
+              + "inflight:!!ALL_LT_INFLIGHT})", context);
+            if (!restored.same || restored.state !== "ok" || restored.inflight)
+              toggleProblems.push("再次勾选改变了缓存/状态或启动请求");
+
+            // residual 是独立层：关它不得动 gAll，再开要恢复原节点。
+            change(residInput, false);
+            if (residGroup.style.display !== "none")
+              toggleProblems.push("取消 residual 后 gResid 仍显示");
+            if (allGroup.style.display === "none")
+              toggleProblems.push("取消 residual 误隐藏了 gAll");
+            change(residInput, true);
+            if (residGroup.style.display === "none"
+                || (residGroup.children || []).length !== residNodeCount)
+              toggleProblems.push("再次勾选 residual 未恢复原几何");
+            if (toggleNetworkCalls)
+              toggleProblems.push(`开关过程额外发出 ${toggleNetworkCalls} 次 GET/POST`);
+          } finally {
+            context.fetch = oldFetch;
+            context.__toggleSaved = savedToggle;
+            vm.runInContext(
+              "ALL_LT=__toggleSaved.all; ALL_LT_KEY=__toggleSaved.key;"
+              + "ALL_LT_STATE=__toggleSaved.state; ALL_LT_DETAIL=__toggleSaved.detail;"
+              + "$('tgAll').querySelector('input').checked=__toggleSaved.allChecked;"
+              + "$('tgResid').querySelector('input').checked=__toggleSaved.residChecked;"
+              + "drawAllLinetypes();syncLayers();", context,
+              {filename: "restore-all-toggle"});
+          }
+          if (toggleProblems.length) {
+            console.log(`  FAIL ${rel} All/residual 开关: ${toggleProblems.join("; ")}`);
+            failures += 1;
+          } else {
+            console.log(`  OK   ${rel} All/residual 开关: 隐藏保缓存，再开零请求，residual 独立`);
           }
         } catch (error) {
           const first = error && error.stack ? error.stack.split("\n")[0] : String(error);
@@ -933,6 +1072,165 @@ for (const rel of urls) {
     const shipped = (lt.line_types || []).filter((t) => t.polylines);
     console.log(`  OK   ${rel}: build() 通过  线型可见=${JSON.stringify(lt.visible || [])} `
       + `发出 ${shipped.length} 个 / ${shipped.reduce((n, t) => n + t.polylines.reduce((m, l) => m + Math.max(0, l.length - 1), 0), 0)} 段`);
+  }
+}
+
+// ---- All line types 缺失/过期时的自动生成状态机 -------------------------
+// 真实服务若已有 .all.json，只能覆盖 GET=ok 的快路径；若没有，冒烟测试
+// 又不应真的触发一次数分钟聚类。这里用可控 fetch 真正执行
+// GET not-run -> building -> POST ok，并验证重复点击不重入、切页后旧 POST 不回写。
+{
+  const problems = [];
+  const oldFetch = context.fetch;
+  const oldSetTimeout = context.setTimeout;
+  const oldClearTimeout = context.clearTimeout;
+  const saved = vm.runInContext(
+    "({cur:CUR,page:PAGE,epoch,all:ALL_LT,key:ALL_LT_KEY,state:ALL_LT_STATE,"
+    + "detail:ALL_LT_DETAIL,focus:ALL_FOCUS,filter:ALL_FILTER,"
+    + "checked:$('tgAll').querySelector('input').checked})", context);
+  const response = (body, ok = true, status = 200) => ({
+    ok, status, json: async () => body,
+  });
+  const full = {
+    state: "ok",
+    page: {path_ops: 2, owned_path_ops: 1},
+    types: [{
+      line_type_number: 901, signature_family: "synthetic_periodic",
+      recognition_source: "method1", op_count: 1, segment_count: 1,
+      member_count: 3, runs: [{run_id: "1"}], bound_by: [],
+      bbox: [100, 100, 200, 200], polylines: [[[100, 100], [200, 200]]],
+    }],
+    residual: {op_count: 1, polylines: [[[250, 250], [300, 300]]]},
+  };
+  try {
+    if (!saved.page) {
+      console.log("  SKIP All line types 自动生成: 没有可用页面");
+    } else {
+      context.__allAutoPage = saved.page;
+      vm.runInContext(
+        "PAGE=__allAutoPage; CUR={slug:'all_autobuild_probe',page:PAGE.page}; epoch+=1;"
+        + "ALL_LT=null; ALL_LT_KEY=''; ALL_LT_STATE='idle'; ALL_LT_DETAIL='';"
+        + "ALL_LT_INFLIGHT=null; ALL_FOCUS=null; ALL_FILTER='';"
+        + "$('tgAll').querySelector('input').checked=true; build(); renderList();",
+        context, {filename: "all-autobuild-setup"});
+
+      const calls = [], deadlines = [];
+      let releasePost;
+      let sawPost;
+      const postSeen = new Promise((resolve) => { sawPost = resolve; });
+      context.setTimeout = (_fn, ms) => { deadlines.push(ms); return deadlines.length; };
+      context.clearTimeout = () => {};
+      context.fetch = async (url, opt = {}) => {
+        const method = String(opt.method || "GET").toUpperCase();
+        calls.push({url: String(url), method});
+        if (method === "GET") return response({state: "not-run"});
+        sawPost();
+        return await new Promise((resolve) => {
+          releasePost = () => resolve(response(full));
+        });
+      };
+
+      const first = context.ensureAllLinetypes();
+      const reachedPost = await Promise.race([
+        postSeen.then(() => true),
+        new Promise((resolve) => globalThis.setTimeout(() => resolve(false), 2000)),
+      ]);
+      if (!reachedPost) {
+        problems.push("GET not-run 后没有自动 POST");
+      } else {
+        const during = vm.runInContext(
+          "({state:ALL_LT_STATE,inflight:!!ALL_LT_INFLIGHT})", context);
+        if (during.state !== "building")
+          problems.push(`POST 等待期状态=${during.state}，应为 building`);
+        if (!during.inflight) problems.push("POST 等待期没有 inflight token");
+        const duplicate = context.ensureAllLinetypes();
+        await Promise.resolve();
+        if (calls.length !== 2)
+          problems.push(`并发勾选发出了 ${calls.length} 次请求，应为 GET+POST`);
+        releasePost();
+        await Promise.all([first, duplicate]);
+      }
+      const built = vm.runInContext(
+        "({state:ALL_LT_STATE,count:ALL_NODES.size,"
+        + "empty:[...ALL_NODES].filter(([,nodes])=>!nodes.length).length,"
+        + "inflight:!!ALL_LT_INFLIGHT})", context);
+      if (reachedPost && built.state !== "ok")
+        problems.push(`POST 完成后状态=${built.state}`);
+      if (reachedPost && (built.count !== 1 || built.empty))
+        problems.push(`POST 完成后绘制结果 count=${built.count}, empty=${built.empty}`);
+      if (built.inflight) problems.push("POST 完成后 inflight 未清理");
+      if (calls.map((x) => x.method).join(",") !== "GET,POST")
+        problems.push(`请求顺序=${calls.map((x) => x.method).join(",")}`);
+      const fetchLimit = vm.runInContext("ALL_LT_FETCH_TIMEOUT_MS", context);
+      const buildLimit = vm.runInContext("ALL_LT_BUILD_TIMEOUT_MS", context);
+      if (!deadlines.includes(fetchLimit) || !deadlines.includes(buildLimit))
+        problems.push(`没有使用 GET/POST 专用超时: ${deadlines.join(",")}`);
+      if (buildLimit < 3600 * 1000)
+        problems.push(`POST 超时 ${buildLimit}ms 短于密页边车上限`);
+
+      // 再走 stale 分支，在 POST 飞行期间使页面代次失效。
+      vm.runInContext(
+        "epoch+=1; ALL_LT=null; ALL_LT_KEY=''; ALL_LT_STATE='idle';"
+        + "ALL_LT_DETAIL=''; ALL_LT_INFLIGHT=null; build();",
+        context, {filename: "all-stale-setup"});
+      const staleCalls = [];
+      let releaseStale;
+      let sawStalePost;
+      const stalePostSeen = new Promise((resolve) => { sawStalePost = resolve; });
+      context.fetch = async (_url, opt = {}) => {
+        const method = String(opt.method || "GET").toUpperCase();
+        staleCalls.push(method);
+        if (method === "GET") return response({state: "stale"});
+        sawStalePost();
+        return await new Promise((resolve) => {
+          releaseStale = () => resolve(response({...full,
+            types: [{...full.types[0], line_type_number: 902}]}));
+        });
+      };
+      const staleRun = context.ensureAllLinetypes();
+      const reachedStalePost = await Promise.race([
+        stalePostSeen.then(() => true),
+        new Promise((resolve) => globalThis.setTimeout(() => resolve(false), 2000)),
+      ]);
+      if (!reachedStalePost) {
+        problems.push("GET stale 后没有自动 POST");
+      } else {
+        vm.runInContext("epoch+=1; build();", context,
+          {filename: "all-change-page-generation"});
+        releaseStale();
+        await staleRun;
+        const guarded = vm.runInContext(
+          "({all:ALL_LT,state:ALL_LT_STATE,has902:ALL_NODES.has(902),"
+          + "inflight:!!ALL_LT_INFLIGHT})", context);
+        if (guarded.all !== null || guarded.state !== "idle" || guarded.has902)
+          problems.push("切页后旧 POST 响应回写了新页状态/几何");
+        if (guarded.inflight) problems.push("切页后旧 inflight 未收尾");
+      }
+      if (staleCalls.join(",") !== "GET,POST")
+        problems.push(`stale 请求顺序=${staleCalls.join(",")}`);
+    }
+  } catch (error) {
+    problems.push(`抛出 -> ${String(error).slice(0, 180)}`);
+  } finally {
+    context.fetch = oldFetch;
+    context.setTimeout = oldSetTimeout;
+    context.clearTimeout = oldClearTimeout;
+    context.__allAutoSaved = saved;
+    vm.runInContext(
+      "CUR=__allAutoSaved.cur; PAGE=__allAutoSaved.page; epoch=__allAutoSaved.epoch;"
+      + "ALL_LT=__allAutoSaved.all; ALL_LT_KEY=__allAutoSaved.key;"
+      + "ALL_LT_STATE=__allAutoSaved.state; ALL_LT_DETAIL=__allAutoSaved.detail;"
+      + "ALL_FOCUS=__allAutoSaved.focus; ALL_FILTER=__allAutoSaved.filter;"
+      + "ALL_LT_INFLIGHT=null;"
+      + "$('tgAll').querySelector('input').checked=__allAutoSaved.checked;"
+      + "if(PAGE){build();renderList();syncLayers();}",
+      context, {filename: "all-autobuild-restore"});
+  }
+  if (problems.length) {
+    console.log(`  FAIL All line types 自动生成: ${problems.join("; ")}`);
+    failures += 1;
+  } else if (saved.page) {
+    console.log("  OK   All line types 自动生成: GET→building→POST；去重、长超时和切页防回写通过");
   }
 }
 

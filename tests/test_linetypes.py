@@ -7,10 +7,189 @@ steps/arrows.py 的同文判据完全一致 —— 两处各写一份是有意�
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from steps import linetypes                                    # noqa: E402
 from steps.linetypes import bind, regroup                      # noqa: E402
+
+
+def all_geometry_pair():
+    """Matching main-cache metadata and a full-geometry rerun."""
+    page = {
+        "page_fingerprint": "page-fingerprint",
+        "owned_ops_sha1": "owned-ops",
+        "fused_ops_sha1": "fused-ops",
+        "path_ops": 6,
+        "owned_path_ops": 3,
+    }
+    rows = [
+        {"line_type_number": 1, "signature_family": "motif_periodic",
+         "recognition_source": "method1", "op_count": 2,
+         "ops_sha1": "type-one", "segment_count": 1},
+        {"line_type_number": 2, "signature_family": "pdf_text_dash_line",
+         "recognition_source": "method2", "op_count": 1,
+         "ops_sha1": "type-two", "segment_count": 1},
+    ]
+    main = {"sig": "current-signature", "v": 5, "page": dict(page),
+            "all_line_types": [dict(row) for row in rows]}
+    fresh_rows = []
+    # Deliberately reverse the producer order: publication must be stable by
+    # line_type_number rather than trusting incidental subprocess ordering.
+    for row in reversed(rows):
+        fresh_rows.append({
+            **row,
+            "by_run": [{
+                "run_id": "1", "op_count": row["op_count"],
+                "segment_count": 1, "bbox": [1, 2, 3, 4],
+                "polylines": [[[1, 2], [3, 4]]],
+            }],
+        })
+    fresh = {
+        "ok": True, "page": dict(page), "engine": {"engine": "unit"},
+        "types": fresh_rows,
+        "residual": {"op_count": 3, "segment_count": 1,
+                     "polylines": [[[5, 6], [7, 8]]]},
+    }
+    return main, fresh
+
+
+class AllGeometryVerificationTests(unittest.TestCase):
+    def test_exact_operation_identity_is_normalized_for_publication(self):
+        main, fresh = all_geometry_pair()
+        out = linetypes.verify_all_page_geometry(main, fresh)
+        self.assertEqual(out["sig"], main["sig"])
+        self.assertEqual(out["v"], main["v"])
+        self.assertEqual(out["all_v"], linetypes.ALL_GEOMETRY_VERSION)
+        self.assertEqual(out["producer_sha256"],
+                         linetypes.sidecar.all_geometry_digest())
+        self.assertEqual([row["line_type_number"] for row in out["types"]],
+                         [1, 2])
+        self.assertEqual(out["page"], fresh["page"])
+        self.assertEqual(out["engine"], fresh["engine"])
+        self.assertEqual(out["residual"], fresh["residual"])
+        self.assertNotIn("ok", out)
+
+    def test_every_page_ownership_fingerprint_is_required_and_exact(self):
+        for key in ("page_fingerprint", "owned_ops_sha1", "fused_ops_sha1",
+                    "path_ops", "owned_path_ops"):
+            with self.subTest(key=key, condition="different"):
+                main, fresh = all_geometry_pair()
+                fresh["page"][key] = "different"
+                with self.assertRaisesRegex(linetypes.AllGeometryMismatch, key):
+                    linetypes.verify_all_page_geometry(main, fresh)
+            with self.subTest(key=key, condition="missing"):
+                main, fresh = all_geometry_pair()
+                fresh["page"].pop(key)
+                with self.assertRaisesRegex(linetypes.AllGeometryMismatch, key):
+                    linetypes.verify_all_page_geometry(main, fresh)
+
+    def test_type_number_sets_must_match_in_both_directions(self):
+        main, fresh = all_geometry_pair()
+        fresh["types"] = fresh["types"][:1]
+        with self.assertRaisesRegex(linetypes.AllGeometryMismatch,
+                                    "missing type numbers"):
+            linetypes.verify_all_page_geometry(main, fresh)
+
+        main, fresh = all_geometry_pair()
+        fresh["types"].append({
+            "line_type_number": 9, "signature_family": "motif_periodic",
+            "recognition_source": "method1", "op_count": 1,
+            "ops_sha1": "unexpected", "segment_count": 0, "by_run": [],
+        })
+        with self.assertRaisesRegex(linetypes.AllGeometryMismatch,
+                                    "extra type numbers"):
+            linetypes.verify_all_page_geometry(main, fresh)
+
+    def test_each_type_operation_identity_field_must_match(self):
+        replacements = {
+            "signature_family": "different-family",
+            "recognition_source": "different-source",
+            "op_count": 999,
+            "ops_sha1": "different-operation-set",
+            "segment_count": 999,
+        }
+        for key, value in replacements.items():
+            with self.subTest(key=key):
+                main, fresh = all_geometry_pair()
+                target = next(row for row in fresh["types"]
+                              if row["line_type_number"] == 1)
+                target[key] = value
+                with self.assertRaisesRegex(
+                        linetypes.AllGeometryMismatch,
+                        r"type #1 operation identity differs"):
+                    linetypes.verify_all_page_geometry(main, fresh)
+
+    def test_duplicate_numbers_and_missing_run_geometry_are_rejected(self):
+        main, fresh = all_geometry_pair()
+        fresh["types"].append(dict(fresh["types"][0]))
+        with self.assertRaisesRegex(linetypes.AllGeometryMismatch,
+                                    "duplicate line type"):
+            linetypes.verify_all_page_geometry(main, fresh)
+
+        main, fresh = all_geometry_pair()
+        fresh["types"][0].pop("by_run")
+        with self.assertRaisesRegex(linetypes.AllGeometryMismatch,
+                                    "has no run geometry"):
+            linetypes.verify_all_page_geometry(main, fresh)
+
+    def test_compute_wrapper_runs_full_sidecar_then_verifies(self):
+        main, fresh = all_geometry_pair()
+        with mock.patch.object(
+                linetypes.sidecar, "run_all_page", return_value=fresh) as run:
+            out = linetypes.compute_all_page_geometry(
+                "/tmp/unit.pdf", 3, main, timeout=45, cpu_budget=2)
+        self.assertEqual(out["sig"], main["sig"])
+        run.assert_called_once_with(
+            "/tmp/unit.pdf", 3, timeout=45, cpu_budget=2,
+            residual=True, dbg=None)
+
+    def test_zero_types_still_publishes_residual_geometry(self):
+        page = {
+            "page_fingerprint": "zero-page",
+            "owned_ops_sha1": "empty-owner-set",
+            "fused_ops_sha1": "empty-fused-set",
+            "path_ops": 1,
+            "owned_path_ops": 0,
+        }
+        main = {"sig": "zero", "v": 5, "page": dict(page),
+                "all_line_types": []}
+        fresh = {
+            "page": dict(page), "types": [], "engine": {},
+            "residual": {"op_count": 1, "segment_count": 1,
+                         "polylines": [[[1, 2], [3, 4]]]},
+        }
+        out = linetypes.verify_all_page_geometry(main, fresh)
+        self.assertEqual(out["types"], [])
+        self.assertEqual(out["residual"]["op_count"], 1)
+
+    def test_geometry_bucket_and_residual_counts_are_verified(self):
+        main, fresh = all_geometry_pair()
+        fresh["types"][0]["by_run"][0]["polylines"] = []
+        with self.assertRaisesRegex(linetypes.AllGeometryMismatch,
+                                    "geometry count differs"):
+            linetypes.verify_all_page_geometry(main, fresh)
+
+        main, fresh = all_geometry_pair()
+        fresh["residual"]["op_count"] = 2
+        with self.assertRaisesRegex(linetypes.AllGeometryMismatch,
+                                    "residual geometry count differs"):
+            linetypes.verify_all_page_geometry(main, fresh)
+
+    def test_cached_geometry_requires_current_producer_and_full_validation(self):
+        main, fresh = all_geometry_pair()
+        cached = linetypes.verify_all_page_geometry(main, fresh)
+        self.assertIsNotNone(linetypes.validated_all_page(
+            cached, main, main["sig"]))
+
+        old = dict(cached, producer_sha256="old-producer")
+        self.assertIsNone(linetypes.validated_all_page(old, main, main["sig"]))
+
+        corrupt = dict(cached)
+        corrupt["page"] = dict(cached["page"], owned_ops_sha1="corrupt")
+        self.assertIsNone(linetypes.validated_all_page(
+            corrupt, main, main["sig"]))
 
 
 def row(key, ti, tip, *, near=None, dist=0.2, ranked=(), own_ops=0):

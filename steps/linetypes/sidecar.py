@@ -21,6 +21,7 @@ from pathlib import Path
 _BASE_DIR = Path(__file__).resolve().parent.parent.parent
 _SIDECAR_DIR = _BASE_DIR / "tools" / "linetype_sidecar"
 _RUNNER = _SIDECAR_DIR / "run.py"
+_ALL_RUNNER = _SIDECAR_DIR / "run_all.py"
 _ENGINE_DIR = _SIDECAR_DIR / "engine" / "line_type_engine"
 
 
@@ -76,6 +77,24 @@ _DIGEST = {"value": None, "stamp": None}
 
 def sidecar_available():
     return _RUNNER.is_file() and _PYTHON.is_file() and _ENGINE_DIR.is_dir()
+
+
+def all_sidecar_available():
+    """Whether the optional full-page geometry producer can run."""
+    return (_ALL_RUNNER.is_file() and _PYTHON.is_file()
+            and _ENGINE_DIR.is_dir())
+
+
+def all_geometry_digest():
+    """Content identity of the optional full-geometry producer.
+
+    ``run_all.py`` is intentionally excluded from the main line-type cache
+    signature so that viewer-only changes never invalidate expensive primary
+    results.  Its own sidecar cache still needs an identity, otherwise an old
+    coordinate projection can survive a producer update under the same main
+    ``sig``.
+    """
+    return hashlib.sha256(_ALL_RUNNER.read_bytes()).hexdigest()
 
 
 def engine_digest():
@@ -223,6 +242,73 @@ def _kill_tree(pid):
             pass
 
 
+def _run_job(runner, payload, *, sheet, timeout, dbg, label):
+    """Run one sidecar entry point and kill its complete process tree on timeout."""
+    # **不能用 subprocess.run(timeout=)**。它超时后只 kill 直接子进程
+    # （run.py），而 cpu_budget>=2 时引擎开的 multiprocessing spawn 孙进程
+    # 继承了 stdout/stderr 的写端 —— 直接子进程死了、管道却还被孙进程握着，
+    # 内部的 communicate() 于是无限阻塞：超时保护把自己挂死。实测 bristol
+    # P24 在「30 分钟超时」下卡了 10.5 小时，孙进程满核空转 196 分钟，
+    # 另有一批孤儿活了 21.7 小时。
+    #
+    # 正确做法：超时后**先**整棵树一起杀，再回收管道。顺序不能反 —— 先杀
+    # 直接子进程会把孙进程变成孤儿，taskkill /T 就沿不到它们了。
+    limit = int(timeout if timeout is not None else TIMEOUT)
+    # start_new_session：POSIX 上让子进程自成进程组，_kill_tree 才能 killpg
+    # 一刀连孙进程一起杀。**不能省** —— 不建新组的话 killpg 会把 webapp 自己
+    # 也杀掉（同组）。Windows 上这个参数无效，那边走 taskkill /T。
+    proc = subprocess.Popen(
+        [str(_PYTHON), "-B", str(runner)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        errors="replace",
+        start_new_session=(os.name != "nt"),
+        # 边车自己会加 sys.path，别把宿主的 site-packages 混进去：
+        # 宿主的 PyMuPDF 1.27.2.3 会被引擎的版本闸拒掉。
+        env={**os.environ, "PYTHONPATH": "", "PYTHONUTF8": "1"},
+    )
+    try:
+        stdout, stderr = proc.communicate(input=json.dumps(payload), timeout=limit)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc.pid)
+        try:
+            # 树杀干净了管道就会关，这一步应当立刻返回；给一点余量兜底。
+            stdout, stderr = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = "", ""
+        raise RuntimeError(
+            f"{label} timeout after {limit}s (sheet {sheet})")
+
+    class _Done:
+        pass
+
+    result = _Done()
+    result.stdout = stdout or ""
+    result.stderr = stderr or ""
+    result.returncode = proc.returncode
+    proc = result
+
+    if proc.stdout:
+        try:
+            parsed = json.loads(proc.stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"{label} bad output: {error}; "
+                f"stdout={proc.stdout[:300]!r} "
+                f"stderr={proc.stderr.strip()[:300]!r}") from error
+        if parsed.get("ok"):
+            if dbg:
+                dbg.note(f"{label}: " + json.dumps(parsed.get("page", {})))
+            return parsed
+        raise RuntimeError(
+            f"{label} {parsed.get('code')}: {parsed.get('error')}")
+
+    raise RuntimeError(
+        f"{label} exit {proc.returncode} with no output: "
+        f"{proc.stderr.strip()[:400]}")
+
+
 def run_page(pdf_path, sheet, targets, *, top_k=None, cpu_budget=None,
              timeout=None, dbg=None):
     """跑一页。sheet 是 **1-based**（引擎 API 就是 1-based，别传 page_index）.
@@ -239,7 +325,7 @@ def run_page(pdf_path, sheet, targets, *, top_k=None, cpu_budget=None,
     if not isinstance(sheet, int) or isinstance(sheet, bool) or sheet < 1:
         raise ValueError(f"sheet must be a 1-based int, got {sheet!r}")
 
-    job = {
+    payload = {
         "pdf": str(pdf_path),
         "sheet": int(sheet),
         "targets": [{"key": str(row["key"]), "ti": int(row.get("ti") or 0),
@@ -251,69 +337,36 @@ def run_page(pdf_path, sheet, targets, *, top_k=None, cpu_budget=None,
         "top_k": int(top_k if top_k is not None else TOP_K),
         "cpu_budget": int(cpu_budget if cpu_budget is not None else CPU_BUDGET),
     }
-    if not job["targets"]:
+    if not payload["targets"]:
         raise ValueError("no targets: caller must skip pages with no anchors")
+    return _run_job(
+        _RUNNER, payload, sheet=sheet, timeout=timeout, dbg=dbg,
+        label="linetype sidecar")
 
-    # **不能用 subprocess.run(timeout=)**。它超时后只 kill 直接子进程
-    # （run.py），而 cpu_budget>=2 时引擎开的 multiprocessing spawn 孙进程
-    # 继承了 stdout/stderr 的写端 —— 直接子进程死了、管道却还被孙进程握着，
-    # 内部的 communicate() 于是无限阻塞：超时保护把自己挂死。实测 bristol
-    # P24 在「30 分钟超时」下卡了 10.5 小时，孙进程满核空转 196 分钟，
-    # 另有一批孤儿活了 21.7 小时。
-    #
-    # 正确做法：超时后**先**整棵树一起杀，再回收管道。顺序不能反 —— 先杀
-    # 直接子进程会把孙进程变成孤儿，taskkill /T 就沿不到它们了。
-    limit = int(timeout if timeout is not None else TIMEOUT)
-    # start_new_session：POSIX 上让子进程自成进程组，_kill_tree 才能 killpg
-    # 一刀连孙进程一起杀。**不能省** —— 不建新组的话 killpg 会把 webapp 自己
-    # 也杀掉（同组）。Windows 上这个参数无效，那边走 taskkill /T。
-    proc = subprocess.Popen(
-        [str(_PYTHON), "-B", str(_RUNNER)],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, encoding="utf-8",
-        errors="replace",
-        start_new_session=(os.name != "nt"),
-        # 边车自己会加 sys.path，别把宿主的 site-packages 混进去：
-        # 宿主的 PyMuPDF 1.27.2.3 会被引擎的版本闸拒掉。
-        env={**os.environ, "PYTHONPATH": "", "PYTHONUTF8": "1"},
-    )
-    try:
-        stdout, stderr = proc.communicate(input=json.dumps(job), timeout=limit)
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc.pid)
-        try:
-            # 树杀干净了管道就会关，这一步应当立刻返回；给一点余量兜底。
-            stdout, stderr = proc.communicate(timeout=120)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = "", ""
+
+def run_all_page(pdf_path, sheet, *, cpu_budget=None, timeout=None,
+                 residual=True, dbg=None):
+    """Re-run one page and return geometry for every recognized line type.
+
+    This is deliberately separate from :func:`run_page`: callers must verify
+    every emitted operation-set fingerprint against the current main cache
+    before publishing it.
+    """
+    if not all_sidecar_available():
         raise RuntimeError(
-            f"linetype sidecar timeout after {limit}s (sheet {sheet})")
-
-    class _Done:
-        pass
-
-    result = _Done()
-    result.stdout = stdout or ""
-    result.stderr = stderr or ""
-    result.returncode = proc.returncode
-    proc = result
-
-    if proc.stdout:
-        try:
-            parsed = json.loads(proc.stdout)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(
-                f"linetype sidecar bad output: {error}; "
-                f"stdout={proc.stdout[:300]!r} "
-                f"stderr={proc.stderr.strip()[:300]!r}") from error
-        if parsed.get("ok"):
-            if dbg:
-                dbg.note("linetypes: " + json.dumps(parsed.get("page", {})))
-            return parsed
-        raise RuntimeError(
-            f"linetype sidecar {parsed.get('code')}: {parsed.get('error')}")
-
-    raise RuntimeError(
-        f"linetype sidecar exit {proc.returncode} with no output: "
-        f"{proc.stderr.strip()[:400]}")
+            f"all-line-type sidecar missing: python={_PYTHON} "
+            f"exists={_PYTHON.is_file()} runner={_ALL_RUNNER} "
+            f"exists={_ALL_RUNNER.is_file()} engine={_ENGINE_DIR} "
+            f"exists={_ENGINE_DIR.is_dir()}")
+    if not isinstance(sheet, int) or isinstance(sheet, bool) or sheet < 1:
+        raise ValueError(f"sheet must be a 1-based int, got {sheet!r}")
+    payload = {
+        "pdf": str(pdf_path),
+        "sheet": int(sheet),
+        "cpu_budget": int(
+            cpu_budget if cpu_budget is not None else CPU_BUDGET),
+        "residual": bool(residual),
+    }
+    return _run_job(
+        _ALL_RUNNER, payload, sheet=sheet, timeout=timeout, dbg=dbg,
+        label="all-line-type sidecar")

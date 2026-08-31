@@ -2131,11 +2131,18 @@ function pick(key,fly){
    两者一起看，"never clustered"  and  "clustered but not selected" 才分得开。 */
 let ALL_LT=null;               // /api/linetypes_all 的响应
 let ALL_LT_KEY='';             // slug|page —— 翻页后不许拿上一页的几何
-let ALL_LT_STATE='idle';       // idle|loading|ok|not-run|stale|disabled|no-arrows|error
+let ALL_LT_STATE='idle';       // idle|loading|building|ok|disabled|no-arrows|error
 let ALL_LT_DETAIL='';
 let ALL_NODES=new Map();       // 线型编号 -> [节点]
 let ALL_FOCUS=null;            // 当前聚焦的线型编号
 let ALL_FILTER='';
+let ALL_LT_INFLIGHT=null;      // {key,promise} —— 同一页代次不重复 GET/POST
+
+// 已生成的几何可能有十几 MB，GET 不能沿用通用请求的 15s。POST
+// 会在服务端重跑本地线型引擎：超密页的边车上限是 3600s，多留 5 分钟给
+// 进程排队、校验、序列化和传输。这只是浏览器 deadline，不改变服务端的计算上限。
+const ALL_LT_FETCH_TIMEOUT_MS=120000;
+const ALL_LT_BUILD_TIMEOUT_MS=65*60*1000;
 
 function allKey(){
   // epoch 是一次 /api/page 装载的代次。同一 slug/page 后台从 updating
@@ -2162,22 +2169,52 @@ function flyToBox(box){
 async function ensureAllLinetypes(){
   if(!PAGE||!CUR){syncLayers();return}
   const key=allKey();
-  if(ALL_LT&&ALL_LT_KEY===key){drawAllLinetypes();renderList();return}
-  ALL_LT=null; ALL_LT_KEY=key; ALL_LT_STATE='loading'; ALL_LT_DETAIL='';
-  renderList(); syncLayers();
-  const r=await api('/api/linetypes_all/'+encodeURIComponent(CUR.slug)
-                    +'/'+PAGE.page);
-  if(allKey()!==key)return;              // 请求飞行期间翻页了，丢弃
-  if(!r.ok||!r.body){
-    ALL_LT_STATE='error';
-    ALL_LT_DETAIL=(r.body&&r.body.error)||('HTTP '+r.status);
-  }else if(r.body.state!=='ok'){
-    ALL_LT_STATE=r.body.state||'error';
-    ALL_LT_DETAIL=r.body.detail||'';
-  }else{
-    ALL_LT=r.body; ALL_LT_STATE='ok';
+  if(ALL_LT&&ALL_LT_KEY===key){drawAllLinetypes();renderList();syncLayers();return}
+  if(ALL_LT_INFLIGHT&&ALL_LT_INFLIGHT.key===key)
+    return ALL_LT_INFLIGHT.promise;
+
+  const url='/api/linetypes_all/'+encodeURIComponent(CUR.slug)+'/'+PAGE.page;
+  const request={key:key,promise:null};
+  request.promise=(async()=>{
+    ALL_LT=null; ALL_LT_KEY=key; ALL_LT_STATE='loading'; ALL_LT_DETAIL='';
+    renderList(); syncLayers();
+
+    // GET 永远先走——大多数再次勾选只读已验证的盘上几何，
+    // 不会因一次 UI 点击就重跑昂贵的本地聚类。
+    let r=await api(url,null,ALL_LT_FETCH_TIMEOUT_MS);
+    if(allKey()!==key)return;             // 请求飞行期间翻页/重载了，丢弃
+
+    if(r.ok&&r.body&&(r.body.state==='not-run'||r.body.state==='stale')){
+      const why=r.body.state;
+      ALL_LT_STATE='building';
+      ALL_LT_DETAIL=why==='stale'
+        ?'The cached geometry is stale; rebuilding it against the current line-type result.'
+        :'Generating and verifying geometry for every recognized line type on this sheet.';
+      renderList(); syncLayers();
+      // POST 只在 GET 明确说 missing/stale 时发；同一 key 的重复点击会复用
+      // ALL_LT_INFLIGHT.promise，不会再开第二个边车。
+      r=await api(url,{method:'POST'},ALL_LT_BUILD_TIMEOUT_MS);
+      if(allKey()!==key)return;           // 慢 POST 结束时可能已切到另一页
+    }
+
+    if(!r.ok||!r.body){
+      ALL_LT_STATE='error';
+      ALL_LT_DETAIL=(r.body&&r.body.error)||('HTTP '+r.status);
+    }else if(r.body.state!=='ok'){
+      ALL_LT_STATE=r.body.state||'error';
+      ALL_LT_DETAIL=r.body.detail||r.body.error||'';
+    }else{
+      ALL_LT=r.body; ALL_LT_STATE='ok'; ALL_LT_DETAIL='';
+    }
+    drawAllLinetypes(); renderList(); syncLayers();
+  })();
+  ALL_LT_INFLIGHT=request;
+  try{
+    return await request.promise;
+  }finally{
+    // 旧页请求收尾时，不得清掉新页已经换上的 inflight token。
+    if(ALL_LT_INFLIGHT===request)ALL_LT_INFLIGHT=null;
   }
-  drawAllLinetypes(); renderList(); syncLayers();
 }
 
 function drawAllLinetypes(){
@@ -2274,6 +2311,7 @@ function showAllTypeDetail(t){
               'members '+(t.member_count||0),
               'min_sim '+(t.minimum_pair_similarity==null?'?'
                           :Number(t.minimum_pair_similarity).toFixed(4))];
+  if(t.support_only)bits.push('support only — no vector stroke to draw');
   if(t.clipped_ops)bits.push(t.clipped_ops+' op  clipped');
   if((t.groups||[]).length)bits.push((t.groups||[]).length+'  engine groups');
   const who=bound.length
@@ -2291,10 +2329,9 @@ function showAllTypeDetail(t){
 
 const AL_STATE_TEXT={
   loading:'Loading all line types…',
-  'not-run':'no debug geometry generated for this sheet yet (run tools/linetype_sidecar/'
-            +'verify_all_geometry.py <project> <sheet>)',
-  stale:'the debug geometry is not from the current results (signature mismatch), so it is not shown — using it would '
-        +'draw conclusions about a different clustering run',
+  building:'Generating all line types locally… this dense sheet may take several minutes.',
+  'not-run':'Full line-type geometry has not been generated for this sheet.',
+  stale:'The saved full geometry belongs to an older line-type result.',
   disabled:'line-type seam is off (LINETYPES=1  not set)',
   'no-arrows':'the main line-type result for this sheet was never computed',
   error:'Fetch failed',
@@ -2352,7 +2389,8 @@ function renderAllSection(box){
     b.classList.toggle('on',on2);
     b.setAttribute('aria-pressed',String(on2));
     const meta=[t.signature_family||'?',(t.op_count||0)+' op',
-                (t.segment_count||0)+'  segments'];
+                t.support_only?'support only — no vector stroke'
+                              :(t.segment_count||0)+'  segments'];
     if((t.runs||[]).length>1)meta.push((t.runs||[]).length+'  runs');
     if(t.recovered_from_fusion)meta.push('method1 recovered');
     else meta.push(t.recognition_source||'');

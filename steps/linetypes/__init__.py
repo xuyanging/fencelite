@@ -64,11 +64,13 @@ ENABLED = os.environ.get("LINETYPES", "0") not in ("0", "", "false", "no", "off"
 RUN_GATE = os.environ.get("LINETYPE_RUN_GATE", "0") not in (
     "0", "", "false", "no", "off")
 
-__all__ = ["ALL_PAGE_SUFFIX", "ENABLED", "LINETYPE_VERSION",
-           "all_page_path", "all_payload", "anchors_of", "bind",
+__all__ = ["ALL_GEOMETRY_VERSION", "ALL_PAGE_SUFFIX", "ENABLED", "LINETYPE_VERSION",
+           "AllGeometryMismatch", "all_page_path", "all_payload", "anchors_of", "bind",
            "computed_pages", "load_page", "page_dir", "page_path", "save_page",
+           "compute_all_page_geometry", "has_current_all_page",
            "compute_page_linetypes", "has_current_linetypes",
-           "load_all_page",
+           "load_all_page", "save_all_page", "validated_all_page",
+           "verify_all_page_geometry",
            "linetypes_signature", "page_payload", "regroup",
            "resolve_visible", "sidecar", "sidecar_available",
            "symbol_owners_of"]
@@ -113,6 +115,15 @@ def page_path(slug, page):
 # 逐类型比 ops_sha1 证明与主缓存同源。文件里带主缓存当时的 sig，读盘期用它
 # 判当期：sig 不符就是**另一次聚类的几何**，宁可不显示也不能拿它下结论。
 ALL_PAGE_SUFFIX = ".all.json"
+ALL_GEOMETRY_VERSION = 1
+ALL_GEOMETRY_ROW_KEYS = (
+    "signature_family", "recognition_source", "op_count", "ops_sha1",
+    "segment_count",
+)
+
+
+class AllGeometryMismatch(RuntimeError):
+    """The full-geometry rerun does not describe the current main result."""
 
 
 def all_page_path(slug, page):
@@ -125,6 +136,183 @@ def load_all_page(slug, page):
         return None
     entry = store.load_json(path, None)
     return entry if isinstance(entry, dict) else None
+
+
+def save_all_page(slug, page, entry):
+    """Atomically persist verified full-page debug geometry."""
+    path = all_page_path(slug, page)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    store.save_json(path, entry)
+
+
+def has_current_all_page(entry, sig):
+    if not (isinstance(entry, dict) and entry.get("sig") == sig
+            and entry.get("all_v") == ALL_GEOMETRY_VERSION
+            and isinstance(entry.get("types"), list)):
+        return False
+    try:
+        producer = sidecar.all_geometry_digest()
+    except OSError:
+        return False
+    return entry.get("producer_sha256") == producer
+
+
+def _all_rows(rows, source):
+    by_number = {}
+    for row in rows or ():
+        if not isinstance(row, dict):
+            raise AllGeometryMismatch(f"{source} contains a non-object type")
+        try:
+            number = int(row["line_type_number"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AllGeometryMismatch(
+                f"{source} contains an invalid line_type_number") from exc
+        if number in by_number:
+            raise AllGeometryMismatch(
+                f"{source} contains duplicate line type #{number}")
+        by_number[number] = row
+    return by_number
+
+
+def _geometry_totals(row, number):
+    """Validate run buckets and return their (op, segment) totals."""
+    buckets = row.get("by_run")
+    if not isinstance(buckets, list):
+        raise AllGeometryMismatch(f"type #{number} has no run geometry")
+    seen_runs = set()
+    op_total = 0
+    segment_total = 0
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            raise AllGeometryMismatch(
+                f"type #{number} contains an invalid run bucket")
+        run_id = str(bucket.get("run_id"))
+        if run_id in seen_runs:
+            raise AllGeometryMismatch(
+                f"type #{number} contains duplicate run {run_id}")
+        seen_runs.add(run_id)
+        polylines = bucket.get("polylines")
+        if not isinstance(polylines, list) or any(
+                not isinstance(line, list) for line in polylines):
+            raise AllGeometryMismatch(
+                f"type #{number} run {run_id} has invalid polylines")
+        try:
+            bucket_ops = int(bucket.get("op_count"))
+            bucket_segments = int(bucket.get("segment_count"))
+        except (TypeError, ValueError) as exc:
+            raise AllGeometryMismatch(
+                f"type #{number} run {run_id} has invalid counts") from exc
+        drawn_segments = sum(max(0, len(line) - 1) for line in polylines)
+        if bucket_ops < 0 or bucket_segments < 0 \
+                or drawn_segments != bucket_segments:
+            raise AllGeometryMismatch(
+                f"type #{number} run {run_id} geometry count differs")
+        op_total += bucket_ops
+        segment_total += bucket_segments
+    return op_total, segment_total
+
+
+def verify_all_page_geometry(main_entry, fresh):
+    """Validate a full-geometry rerun against one captured main cache entry.
+
+    Full geometry is produced by a separate executable so that adding this
+    optional view does not invalidate every main line-type cache.  It may be
+    published only when both page ownership hashes and every numbered type's
+    exact operation-set fingerprint match the current main result.
+    """
+    if not isinstance(main_entry, dict) or not isinstance(fresh, dict):
+        raise AllGeometryMismatch("main or full-geometry result is missing")
+    main_rows = main_entry.get("all_line_types")
+    fresh_rows = fresh.get("types")
+    if not isinstance(main_rows, list) or not isinstance(fresh_rows, list):
+        raise AllGeometryMismatch("main or full-geometry type list is invalid")
+    expected = _all_rows(main_rows, "main cache")
+    actual = _all_rows(fresh_rows, "full-geometry rerun")
+
+    main_page = main_entry.get("page") or {}
+    fresh_page = fresh.get("page") or {}
+    errors = []
+    for key in ("page_fingerprint", "owned_ops_sha1", "fused_ops_sha1",
+                "path_ops", "owned_path_ops"):
+        left, right = main_page.get(key), fresh_page.get(key)
+        if left is None or right is None or left != right:
+            errors.append(f"{key} differs")
+
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    if missing:
+        errors.append(f"missing type numbers {missing[:8]}")
+    if extra:
+        errors.append(f"extra type numbers {extra[:8]}")
+    for number in sorted(set(expected) & set(actual)):
+        left = tuple(expected[number].get(key) for key in ALL_GEOMETRY_ROW_KEYS)
+        right = tuple(actual[number].get(key) for key in ALL_GEOMETRY_ROW_KEYS)
+        if left != right:
+            errors.append(f"type #{number} operation identity differs")
+            if len(errors) >= 8:
+                break
+        try:
+            op_total, segment_total = _geometry_totals(
+                actual[number], number)
+        except AllGeometryMismatch as exc:
+            errors.append(str(exc))
+            if len(errors) >= 8:
+                break
+            continue
+        if (op_total != actual[number].get("op_count")
+                or segment_total != actual[number].get("segment_count")):
+            errors.append(f"type #{number} run totals differ")
+            if len(errors) >= 8:
+                break
+    if errors:
+        raise AllGeometryMismatch("; ".join(errors))
+
+    residual = fresh.get("residual")
+    if not isinstance(residual, dict) \
+            or not isinstance(residual.get("polylines"), list):
+        raise AllGeometryMismatch("residual geometry is invalid")
+    try:
+        residual_ops = int(residual.get("op_count"))
+        residual_segments = int(residual.get("segment_count"))
+    except (TypeError, ValueError) as exc:
+        raise AllGeometryMismatch("residual counts are invalid") from exc
+    drawn_residual_segments = sum(
+        max(0, len(line) - 1) for line in residual["polylines"]
+        if isinstance(line, list))
+    if (any(not isinstance(line, list) for line in residual["polylines"])
+            or residual_ops != fresh_page.get("path_ops", 0)
+            - fresh_page.get("owned_path_ops", 0)
+            or residual_segments != drawn_residual_segments):
+        raise AllGeometryMismatch("residual geometry count differs")
+    return {
+        "sig": main_entry.get("sig"),
+        "v": main_entry.get("v"),
+        "all_v": ALL_GEOMETRY_VERSION,
+        "producer_sha256": sidecar.all_geometry_digest(),
+        "page": fresh_page,
+        "engine": fresh.get("engine") or {},
+        "types": [actual[number] for number in sorted(actual)],
+        "residual": residual,
+    }
+
+
+def validated_all_page(entry, main_entry, sig):
+    """Return canonical current geometry, or ``None`` for any stale/corrupt file."""
+    if not has_current_all_page(entry, sig):
+        return None
+    try:
+        return verify_all_page_geometry(main_entry, entry)
+    except (AllGeometryMismatch, OSError):
+        return None
+
+
+def compute_all_page_geometry(pdf_path, sheet, main_entry, *, timeout=None,
+                              cpu_budget=None, dbg=None):
+    """Materialize and verify geometry for every type in one main result."""
+    fresh = sidecar.run_all_page(
+        pdf_path, int(sheet), timeout=timeout, cpu_budget=cpu_budget,
+        residual=True, dbg=dbg)
+    return verify_all_page_geometry(main_entry, fresh)
 
 
 def all_payload(all_entry, main_entry=None):
@@ -150,6 +338,13 @@ def all_payload(all_entry, main_entry=None):
         buckets = row.get("by_run") or []
         keep["polylines"] = [line for bucket in buckets
                              for line in (bucket.get("polylines") or ())]
+        # A recognized cluster may contain only non-vector support operations
+        # (for example repeated text labels).  Keep it in the complete audit
+        # list, but mark why there is no SVG stroke instead of making that look
+        # like another missing-geometry bug.
+        keep["support_only"] = bool(
+            keep.get("op_count") and not keep["polylines"]
+            and not keep.get("segment_count"))
         keep["runs"] = [{key: bucket.get(key) for key in
                          ("run_id", "op_count", "segment_count", "bbox")}
                         for bucket in buckets]

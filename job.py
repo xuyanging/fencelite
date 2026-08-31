@@ -2086,6 +2086,43 @@ def _linetype_one(slug, page, items, arrow_entry, sig, should_cancel=None):
         return page, len(entry.get("used_all") or ()), None
 
 
+def materialize_all_linetypes(slug, page, sig):
+    """Build the optional all-line-types geometry for one current main result.
+
+    The viewer calls this only after its cache-only GET reports missing or
+    stale geometry.  The expensive rerun is serialized with normal line-type
+    work for the same sheet, shares the global heavy-sidecar capacity, and is
+    published only after operation-set parity is checked again against the
+    latest main cache.
+    """
+    page = int(page)
+    with _linetype_page_lock(slug, page):
+        main_entry = linetypes.load_page(slug, page)
+        if not linetypes.has_current_linetypes(main_entry, sig):
+            raise RuntimeError("main line-type result changed before generation")
+        cached = linetypes.validated_all_page(
+            linetypes.load_all_page(slug, page), main_entry, sig)
+        if cached is not None:
+            return cached
+
+        arrow_entry = load_json(
+            slug_dir(slug) / "arrows.json", {}).get(str(page)) or {}
+        timeout = _linetype_timeout_for(slug, page, arrow_entry)
+        with _slot_pool("heavy-sidecar", HEAVY_SIDECAR_SLOTS).slot():
+            generated = linetypes.compute_all_page_geometry(
+                pdf_path(slug), page, main_entry, timeout=timeout)
+
+        # A rerun or upload can replace prerequisites during the minutes spent
+        # in the sidecar.  Verify against the latest cache, not merely the
+        # object captured before computation, before the atomic write.
+        latest = linetypes.load_page(slug, page)
+        if not linetypes.has_current_linetypes(latest, sig):
+            raise RuntimeError("main line-type result changed during generation")
+        generated = linetypes.verify_all_page_geometry(latest, generated)
+        linetypes.save_all_page(slug, page, generated)
+        return generated
+
+
 def _stage_linetypes(slug, on_progress=None, should_cancel=None):
     """箭头末端框里那一种线，在全页高亮出来（本地矢量 + 独立 venv 边车）。
 

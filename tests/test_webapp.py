@@ -16,6 +16,7 @@ import tempfile
 import types
 import unittest
 import threading
+from contextlib import ExitStack, contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
@@ -640,6 +641,143 @@ class PageTests(WebappCase):
         self.assertTrue(body["processing"])
         self.assertEqual(body["items"], [])
         self.assertEqual(body["record"]["vlm_items"], [])
+
+
+class AllLineTypesRouteTests(WebappCase):
+    @contextmanager
+    def route_context(self, *, all_entry=None, generated=None,
+                      generation_error=None):
+        """Reach the route with current prerequisites and no real sidecar."""
+        sig = "lt-current"
+        main = {
+            "sig": sig, "v": 5, "bindings": [],
+            "page": {
+                "page_fingerprint": "page",
+                "owned_ops_sha1": "owned",
+                "fused_ops_sha1": "fused",
+                "path_ops": 1,
+                "owned_path_ops": 1,
+            },
+            "all_line_types": [{
+                "line_type_number": 1,
+                "signature_family": "motif_periodic",
+                "recognition_source": "method1",
+                "op_count": 1, "ops_sha1": "one", "segment_count": 1,
+            }],
+        }
+        if generated is None:
+            generated = {
+                "sig": sig, "v": 5,
+                "all_v": webapp.linetypes.ALL_GEOMETRY_VERSION,
+                "producer_sha256": (
+                    webapp.linetypes.sidecar.all_geometry_digest()),
+                "page": dict(main["page"]),
+                "engine": {"engine": "unit"},
+                "types": [{
+                    "line_type_number": 1,
+                    "signature_family": "motif_periodic",
+                    "recognition_source": "method1",
+                    "op_count": 1, "ops_sha1": "one",
+                    "segment_count": 1,
+                    "by_run": [{
+                        "run_id": "1", "op_count": 1,
+                        "segment_count": 1, "bbox": [1, 2, 3, 4],
+                        "polylines": [[[1, 2], [3, 4]]],
+                    }],
+                }],
+                "residual": {"op_count": 0, "segment_count": 0,
+                             "polylines": []},
+            }
+        results = {"pages": {"1": {}}, "pdf_revision": "pdf-current"}
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(webapp.linetypes, "ENABLED", True))
+            stack.enter_context(mock.patch.object(
+                webapp, "_results_state", return_value=(results, None)))
+            stack.enter_context(mock.patch.object(
+                webapp, "_placement_anchors_for", return_value=[]))
+            stack.enter_context(mock.patch.object(
+                webapp.arrows, "arrows_signature", return_value="arrow-current"))
+            stack.enter_context(mock.patch.object(
+                webapp.arrows, "has_current_arrows", return_value=True))
+            stack.enter_context(mock.patch.object(
+                webapp.store, "load_json", return_value={"1": {}}))
+            stack.enter_context(mock.patch.object(
+                webapp.linetypes, "linetypes_signature", return_value=sig))
+            stack.enter_context(mock.patch.object(
+                webapp.linetypes, "load_page", return_value=main))
+            stack.enter_context(mock.patch.object(
+                webapp.linetypes, "load_all_page", return_value=all_entry))
+            materialize = stack.enter_context(mock.patch.object(
+                job_module, "materialize_all_linetypes",
+                return_value=generated, side_effect=generation_error))
+            yield materialize, generated
+
+    def test_get_missing_is_cache_only_and_never_computes(self):
+        with self.route_context(all_entry=None) as (materialize, _generated):
+            response = self.client.get(
+                f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"state": "not-run"})
+        materialize.assert_not_called()
+
+    def test_post_missing_materializes_and_returns_full_geometry(self):
+        with self.route_context(all_entry=None) as (materialize, generated):
+            response = self.client.post(
+                f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["state"], "ok")
+        self.assertEqual(len(body["types"]), 1)
+        self.assertEqual(body["types"][0]["polylines"],
+                         [[[1, 2], [3, 4]]])
+        materialize.assert_called_once_with(SLUG, 1, generated["sig"])
+
+    def test_invalid_existing_cache_is_not_published_and_post_rebuilds(self):
+        with self.route_context() as (_materialize, valid):
+            invalid = dict(valid)
+            invalid["page"] = dict(valid["page"], owned_ops_sha1="wrong")
+
+        with self.route_context(all_entry=invalid) as (materialize, _):
+            response = self.client.get(f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"state": "stale"})
+        materialize.assert_not_called()
+
+        with self.route_context(all_entry=invalid) as (materialize, generated):
+            response = self.client.post(f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["state"], "ok")
+        materialize.assert_called_once_with(SLUG, 1, generated["sig"])
+
+    def test_cross_site_post_is_rejected_before_generation(self):
+        with mock.patch.object(
+                job_module, "materialize_all_linetypes") as materialize:
+            for headers in (XSITE, {"Origin": "http://evil.example"}):
+                with self.subTest(headers=headers):
+                    response = self.client.post(
+                        f"/api/linetypes_all/{SLUG}/1", headers=headers)
+                    self.assertEqual(response.status_code, 403)
+                    self.assertEqual(response.get_json()["error"],
+                                     "cross-site write rejected")
+        materialize.assert_not_called()
+
+    def test_generation_error_does_not_leak_sidecar_or_file_details(self):
+        secret = "/srv/private/final_plans/input.pdf: API_TOKEN=secret"
+        with self.route_context(
+                all_entry=None,
+                generation_error=RuntimeError(secret)) as (materialize, _), \
+                mock.patch("builtins.print"):
+            response = self.client.post(
+                f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json(), {
+            "state": "error",
+            "error": "full line-type geometry generation failed",
+        })
+        self.assertNotIn(secret, response.get_data(as_text=True))
+        self.assertNotIn("RuntimeError", response.get_data(as_text=True))
+        materialize.assert_called_once()
 
 
 class LineTypeRefreshStatusTests(WebappCase):

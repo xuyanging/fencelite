@@ -1138,7 +1138,7 @@ def page_data(slug, page):
                                "plan_groups": len(plan_boxes)}})
 
 
-@app.route("/api/linetypes_all/<slug>/<int:page>")
+@app.route("/api/linetypes_all/<slug>/<int:page>", methods=["GET", "POST"])
 def linetypes_all(slug, page):
     """调试视图：这一页**全部**线型的几何 + residual ink（前端按需拉）.
 
@@ -1154,12 +1154,16 @@ def linetypes_all(slug, page):
     state：
       disabled      接缝没打开
       no-arrows     箭头层不当期 / 这页没有末端 —— 主结果本身就没算
-      not-run       没有 .all.json（跑 tools/linetype_sidecar/
-                    verify_all_geometry.py 补）
-      stale         .all.json 的 sig 与当期主结果不符 —— 那是**另一次聚类**
-                    的几何，拿它下结论会得出关于别的结果的结论，所以不发
+      not-run       GET 没有 .all.json；前端随后 POST，在本地按需生成
+      stale         .all.json 版本/生产器/逐类型指纹与当期主结果不符；
+                    可能是旧结果或损坏文件，所以不发并允许 POST 自愈
       ok            types / residual 可用
+
+    GET 始终只读缓存。POST 只在 missing/stale 时运行本地边车，不调用模型；
+    结果必须逐类型通过 op-set 指纹校验后才原子发布。
     """
+    if request.method == "POST" and _cross_site_write_blocked():
+        return jsonify({"error": "cross-site write rejected"}), 403
     if not store.is_valid_slug(slug):
         return jsonify({"error": "bad slug"}), 400
     if not linetypes.ENABLED:
@@ -1183,11 +1187,29 @@ def linetypes_all(slug, page):
     if not linetypes.has_current_linetypes(main_entry, sig):
         return jsonify({"state": "no-arrows", "detail": "main result not current"})
 
-    all_entry = linetypes.load_all_page(slug, page)
+    stored_entry = linetypes.load_all_page(slug, page)
+    all_entry = linetypes.validated_all_page(
+        stored_entry, main_entry, sig)
+    if request.method == "POST" and all_entry is None:
+        try:
+            generated = job.materialize_all_linetypes(slug, page, sig)
+            all_entry = linetypes.validated_all_page(
+                generated, main_entry, sig)
+            if all_entry is None:
+                raise linetypes.AllGeometryMismatch(
+                    "materialized geometry failed publication validation")
+        except Exception as exc:                              # noqa: BLE001
+            # Sidecar diagnostics can contain absolute paths; keep them in the
+            # server log and return only a stable client-facing state.
+            print(f"[linetypes-all] {slug} P{page} generation failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return jsonify({
+                "state": "error",
+                "error": "full line-type geometry generation failed",
+            }), 500
     if all_entry is None:
-        return jsonify({"state": "not-run"})
-    if all_entry.get("sig") != sig:
-        return jsonify({"state": "stale"})
+        return jsonify({"state": "not-run" if stored_entry is None
+                        else "stale"})
     payload = linetypes.all_payload(all_entry, main_entry)
     payload["state"] = "ok"
     return jsonify(payload)
