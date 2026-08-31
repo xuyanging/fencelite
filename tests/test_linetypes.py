@@ -30,7 +30,12 @@ def all_geometry_pair():
          "ops_sha1": "type-one", "segment_count": 1},
         {"line_type_number": 2, "signature_family": "pdf_text_dash_line",
          "recognition_source": "method2", "op_count": 1,
-         "ops_sha1": "type-two", "segment_count": 1},
+         "ops_sha1": "type-two", "segment_count": 1,
+         "pattern_instance_count": 1,
+         "pattern_instances": [{
+             "region_id": "pdf-text-1", "literal_text": "8'",
+             "bbox": [10, 20, 30, 40],
+         }]},
     ]
     main = {"sig": "current-signature", "v": 5, "page": dict(page),
             "all_line_types": [dict(row) for row in rows]}
@@ -120,6 +125,17 @@ class AllGeometryVerificationTests(unittest.TestCase):
                         linetypes.AllGeometryMismatch,
                         r"type #1 operation identity differs"):
                     linetypes.verify_all_page_geometry(main, fresh)
+
+    def test_method2_pattern_instances_must_match_main_result(self):
+        main, fresh = all_geometry_pair()
+        target = next(row for row in fresh["types"]
+                      if row["line_type_number"] == 2)
+        target["pattern_instances"] = [dict(target["pattern_instances"][0])]
+        target["pattern_instances"][0]["bbox"] = [0, 0, 1, 1]
+        with self.assertRaisesRegex(
+                linetypes.AllGeometryMismatch,
+                r"type #2 operation identity differs"):
+            linetypes.verify_all_page_geometry(main, fresh)
 
     def test_duplicate_numbers_and_missing_run_geometry_are_rejected(self):
         main, fresh = all_geometry_pair()

@@ -15,6 +15,7 @@ from typing import Callable
 from ..ir import GroupingIR, PageIR
 from ..results import LineTypeRecognitionResult
 from ..versions import PYTHON_METHOD1_ENGINE_VERSION
+from .postprocess_carrier import recover_compound_carrier_support
 from .postprocess_compound import (
     augment_compound_path_line_types,
     enforce_extendable_route_line_types,
@@ -50,6 +51,7 @@ METHOD1_POSTPROCESS_STAGE_NAMES = (
     "vector_legend_samples",
     "solid_legend_samples",
     "confirmed_type_reclaim",
+    "compound_carrier_support_recovery",
 )
 
 
@@ -193,6 +195,12 @@ def apply_method1_postprocessors(
         (
             METHOD1_POSTPROCESS_STAGE_NAMES[8],
             lambda result: reclaim_confirmed_line_types(
+                page, grouping, serialized_groups, result
+            ),
+        ),
+        (
+            METHOD1_POSTPROCESS_STAGE_NAMES[9],
+            lambda result: recover_compound_carrier_support(
                 page, grouping, serialized_groups, result
             ),
         ),

@@ -115,10 +115,10 @@ def page_path(slug, page):
 # 逐类型比 ops_sha1 证明与主缓存同源。文件里带主缓存当时的 sig，读盘期用它
 # 判当期：sig 不符就是**另一次聚类的几何**，宁可不显示也不能拿它下结论。
 ALL_PAGE_SUFFIX = ".all.json"
-ALL_GEOMETRY_VERSION = 1
+ALL_GEOMETRY_VERSION = 2
 ALL_GEOMETRY_ROW_KEYS = (
     "signature_family", "recognition_source", "op_count", "ops_sha1",
-    "segment_count",
+    "segment_count", "pattern_instance_count", "pattern_instances",
 )
 
 

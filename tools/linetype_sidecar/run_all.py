@@ -52,6 +52,7 @@ _ENGINE = _HERE / "engine"
 _fail = _run._fail
 _bbox = _run._bbox
 _connected_runs = _run._connected_runs
+_method2_pattern_instances = _run._method2_pattern_instances
 
 
 def main():
@@ -276,6 +277,13 @@ def main():
         if clipped(op_index):
             clipped_by_cluster[number] = clipped_by_cluster.get(number, 0) + 1
 
+    try:
+        pattern_instances_by_number = _method2_pattern_instances(
+            recognition, payload, to_page_frame
+        )
+    except Exception as error:                                   # noqa: BLE001
+        _fail("PATTERN_INSTANCE_ERROR", f"{type(error).__name__}: {error}")
+
     run_counts = {}
     for op_index, number in owner.items():
         key = (number, str(run_of.get(op_index, 1)))
@@ -304,6 +312,7 @@ def main():
         number = int(cluster["line_type_number"])
         page_lines = [[to_page_frame(x, y) for x, y in line]
                       for line in ir_by_cluster.get(number) or ()]
+        pattern_instances = pattern_instances_by_number.get(number) or []
         types.append({
             "line_type_number": number,
             "line_type_id": cluster["line_type_id"],
@@ -321,6 +330,8 @@ def main():
             "groups": sorted({group_of[i] for i in
                               cluster["commands"]["op_indices"]
                               if i in group_of}),
+            "pattern_instance_count": len(pattern_instances),
+            "pattern_instances": pattern_instances,
             "by_run": by_run_of(number),
         })
     for row in recovered:
@@ -343,6 +354,8 @@ def main():
             "clipped_ops": clipped_by_cluster.get(number, 0),
             "groups": sorted({group_of[i] for i in row["op_indices"]
                               if i in group_of}),
+            "pattern_instance_count": 0,
+            "pattern_instances": [],
             "recovered_from_fusion": True,
             "op_count_in_method1": row["op_count_in_method1"],
             "by_run": by_run_of(number),

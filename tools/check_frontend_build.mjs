@@ -45,7 +45,10 @@ const makeNode = (tag) => {
     appendChild(child) { this.children.push(child); return child; },
     removeChild(child) { this.children = this.children.filter((c) => c !== child); },
     remove() {},
-    setAttribute(k, v) { this.attributes[k] = v; },
+    setAttribute(k, v) {
+      this.attributes[k] = v;
+      if (String(k).toLowerCase() === "class") this.className = String(v || "");
+    },
     getAttribute(k) { return this.attributes[k]; },
     removeAttribute(k) { delete this.attributes[k]; },
     addEventListener(type, fn) {
@@ -1072,6 +1075,240 @@ for (const rel of urls) {
     const shipped = (lt.line_types || []).filter((t) => t.polylines);
     console.log(`  OK   ${rel}: build() 通过  线型可见=${JSON.stringify(lt.visible || [])} `
       + `发出 ${shipped.length} 个 / ${shipped.reduce((n, t) => n + t.polylines.reduce((m, l) => m + Math.max(0, l.length - 1), 0), 0)} 段`);
+  }
+}
+
+// ---- Method 2 confirmed pattern 框：normal / All / 来源 / 开关缓存 ---------
+// 用刚拉到的真实 page payload 做外壳，注入一个已经绑定且会发到前端的线型
+// metadata。这样既走真实 build()/makeScopeModel()/change listener，又不依赖盘上
+// All cache 是否恰好已经由新版 sidecar 重算。
+{
+  const problems = [];
+  const oldFetch = context.fetch;
+  const saved = vm.runInContext(
+    "({cur:CUR,page:PAGE,epoch,all:ALL_LT,key:ALL_LT_KEY,state:ALL_LT_STATE,"
+    + "detail:ALL_LT_DETAIL,focus:ALL_FOCUS,filter:ALL_FILTER,inflight:ALL_LT_INFLIGHT,"
+    + "selectedScope,selectedRow,ltChecked:$('tgLt').querySelector('input').checked,"
+    + "allChecked:$('tgAll').querySelector('input').checked})", context);
+  let skipped = false;
+  try {
+    const fixture = saved.page ? JSON.parse(JSON.stringify(saved.page)) : null;
+    if (!fixture) {
+      skipped = true;
+      console.log("  SKIP Method 2 pattern 框: 没有可用页面外壳");
+    } else {
+      fixture.record = fixture.record || {};
+      fixture.items = Array.isArray(fixture.items) ? fixture.items : [];
+      let scopeItem = fixture.items.find((item) => item && String(item.text || "").trim());
+      if (!scopeItem) {
+        scopeItem = {text:"8' SIDELINE FENCE",label:"callout",source:"probe",
+          box_2d:[80,80,95,180]};
+        fixture.items = [scopeItem];
+      }
+      const scopeText = String(scopeItem.text).replace(/\s+/g, " ").trim();
+      const scopeToken = scopeText.normalize("NFKC").toLocaleUpperCase();
+      const instances = [
+        {region_id:"probe-a",group_id:"G-A",op_indices:[11,12],literal_text:"8'",
+          pattern_source:"inline_measurement",bbox:[100,120,145,205]},
+        {region_id:"probe-b",group_id:"G-A",op_indices:[21,22],literal_text:"8'",
+          pattern_source:"inline_measurement",bbox:[100,240,145,325]},
+      ];
+      const target = {
+        line_type_number:701,line_type_id:"probe-method2",
+        signature_family:"synthetic_method2",recognition_source:"method2",
+        op_count:4,segment_count:1,member_count:2,runs:[{run_id:"r1"}],
+        bbox:[100,120,145,325],polylines:[[[110,120],[110,325]]],
+        pattern_instance_count:instances.length,
+      };
+      // 第三个退化 bbox 是防御性负例：不能制造一个 0 面积框。
+      target.pattern_instances = [...instances,
+        {region_id:"invalid",bbox:[400,400,400,450]}];
+      fixture.record.linetypes = {
+        visible:[target.line_type_number],
+        groups:[{group:"t:"+scopeToken,text:scopeText,
+          visible_line_type_number:target.line_type_number,in_plan_count:1,
+          votes_in_plan:{}}],
+        line_types:[target],bindings:[],page:{line_types:1},
+      };
+
+      context.__patternPage = fixture;
+      vm.runInContext(
+        "PAGE=__patternPage; CUR={slug:'method2_pattern_probe',page:PAGE.page}; epoch+=1;"
+        + "selectedScope=null;selectedRow=null;ALL_LT=null;ALL_LT_KEY='';"
+        + "ALL_LT_STATE='idle';ALL_LT_DETAIL='';ALL_LT_INFLIGHT=null;ALL_FOCUS=null;"
+        + "$('tgLt').querySelector('input').checked=true;"
+        + "$('tgAll').querySelector('input').checked=false;"
+        + "makeScopeModel();build();renderList();syncLayers();", context,
+        {filename:"method2-pattern-normal"});
+      context.__patternNumber = target.line_type_number;
+      const normal = JSON.parse(vm.runInContext(
+        "JSON.stringify({"
+        + "nodes:(LT_NODES.get(__patternNumber)||[]).map(n=>({tag:n.tagName,"
+        + "cls:n.getAttribute('class'),pattern:n.dataset.pattern,lt:n.dataset.lt,"
+        + "x:n.getAttribute('x'),y:n.getAttribute('y'),w:n.getAttribute('width'),"
+        + "h:n.getAttribute('height')})),"
+        + "rows:(LT_INDEX.rows||[]).filter(r=>r.number===__patternNumber),"
+        + "method1Leak:method2PatternInstances({recognition_source:'method1',"
+        + "pattern_instances:__patternPage.record.linetypes.line_types.find("
+        + "t=>t.line_type_number===__patternNumber).pattern_instances}).length})", context));
+      const normalBoxes = normal.nodes.filter((node) => node.cls === "lt-pattern");
+      if (normalBoxes.length !== 2)
+        problems.push(`normal 画了 ${normalBoxes.length} 个框，应为 2`);
+      if (normalBoxes.some((node) => node.tag !== "RECT"
+          || node.pattern !== "confirmed" || Number(node.lt) !== target.line_type_number
+          || !(Number(node.w) > 0) || !(Number(node.h) > 0)))
+        problems.push("normal pattern 框的 rect/data/尺寸不完整");
+      if (normal.method1Leak !== 0)
+        problems.push("Method 1 误带 pattern_instances 时仍会画框");
+      if (!normal.rows.length || normal.rows.some((row) =>
+          row.source !== "Method 2" || row.patternCount !== 2))
+        problems.push("normal FENCELINE 没展示 Method 2 / confirmed pattern 数");
+      const normalListRows = (context.document.getElementById("list").children || [])
+        .filter((node) => node.dataset
+          && Number(node.dataset.lt) === target.line_type_number);
+      if (!normalListRows.length || normalListRows.some((node) =>
+          !String(node.innerHTML).includes("Method 2")
+          || !String(node.innerHTML).includes("2 confirmed patterns boxed")))
+        problems.push("normal 列表来源/框数量文案缺失");
+
+      const targetRow = normal.rows[0];
+      if (targetRow) {
+        context.__patternScope = targetRow.scopeId;
+        vm.runInContext("selectScope(__patternScope,false);", context,
+          {filename:"method2-pattern-normal-focus"});
+        const focused = JSON.parse(vm.runInContext(
+          "JSON.stringify((LT_NODES.get(__patternNumber)||[])"
+          + ".filter(n=>n.getAttribute('class')==='lt-pattern')"
+          + ".map(n=>({focus:n.classList.contains('lt-focus'),"
+          + "dim:n.classList.contains('lt-dim')})))", context));
+        if (focused.length !== 2 || focused.some((node) => !node.focus || node.dim))
+          problems.push("normal pattern 框没有跟随 callout focus/dim");
+      }
+      const ltInput = context.document.getElementById("tgLt").querySelector("input");
+      const ltGroup = context.document.getElementById("gLt");
+      ltInput.checked = false; ltInput.dispatchEvent({type:"change"});
+      if (ltGroup.style.display !== "none")
+        problems.push("关闭 Line types 后 normal pattern 框层仍显示");
+      ltInput.checked = true; ltInput.dispatchEvent({type:"change"});
+      const restoredNormalBoxes = vm.runInContext(
+        "(LT_NODES.get(__patternNumber)||[]).filter(n=>"
+        + "n.getAttribute('class')==='lt-pattern').length", context);
+      if (ltGroup.style.display === "none"
+          || restoredNormalBoxes !== 2)
+        problems.push("重开 Line types 后 normal pattern 框未保留");
+
+      const allM2 = {
+        line_type_number:701,signature_family:"synthetic_method2",
+        recognition_source:"method2",op_count:4,segment_count:1,
+        member_count:2,runs:[{run_id:"r1"}],bound_by:[],
+        bbox:[100,120,145,325],polylines:[[[110,120],[110,325]]],
+        pattern_instance_count:2,pattern_instances:instances,
+      };
+      const allM1 = {
+        line_type_number:702,signature_family:"synthetic_method1",
+        recognition_source:"method1",op_count:2,segment_count:1,
+        member_count:2,runs:[{run_id:"r2"}],bound_by:[],
+        bbox:[300,120,345,205],polylines:[[[310,120],[310,205]]],
+        // 故意带同名字段，验证 source gate，而不是仅靠后端“通常不会发”。
+        pattern_instance_count:1,pattern_instances:[instances[0]],
+      };
+      context.__patternAll = {state:"ok",page:{path_ops:8,owned_path_ops:6},
+        types:[allM2,allM1],residual:{op_count:1,polylines:[[[500,500],[510,510]]]}};
+      vm.runInContext(
+        "ALL_LT=__patternAll;ALL_LT_KEY=allKey();ALL_LT_STATE='ok';"
+        + "ALL_LT_DETAIL='';ALL_LT_INFLIGHT=null;ALL_FOCUS=null;ALL_FILTER='';"
+        + "$('tgAll').querySelector('input').checked=true;drawAllLinetypes();"
+        + "renderList();syncLayers();", context, {filename:"method2-pattern-all"});
+      const allState = JSON.parse(vm.runInContext(
+        "JSON.stringify({m2:(ALL_NODES.get(701)||[]).map(n=>({"
+        + "cls:n.getAttribute('class'),pattern:n.dataset.pattern})),"
+        + "m1:(ALL_NODES.get(702)||[]).map(n=>n.getAttribute('class'))})", context));
+      const allBoxes = allState.m2.filter((node) => node.cls === "al-pattern");
+      if (allBoxes.length !== 2 || allBoxes.some((node) => node.pattern !== "confirmed"))
+        problems.push(`All Method 2 框=${allBoxes.length}，应为两个 confirmed rect`);
+      if (allState.m1.includes("al-pattern"))
+        problems.push("All 层给 Method 1 画了 pattern 框");
+
+      context.focusAllType(701, false);
+      const allFocused = JSON.parse(vm.runInContext(
+        "JSON.stringify({m2:(ALL_NODES.get(701)||[]).filter(n=>"
+        + "n.getAttribute('class')==='al-pattern').map(n=>({"
+        + "focus:n.classList.contains('al-focus'),dim:n.classList.contains('al-dim')})),"
+        + "m1:(ALL_NODES.get(702)||[]).map(n=>({"
+        + "focus:n.classList.contains('al-focus'),dim:n.classList.contains('al-dim')}))})",
+        context));
+      if (allFocused.m2.length !== 2
+          || allFocused.m2.some((node) => !node.focus || node.dim)
+          || allFocused.m1.some((node) => node.focus || !node.dim))
+        problems.push("All pattern 框没有随类型 focus，其余类型没有 dim");
+      context.showAllTypeDetail(allM2);
+      const detail = context.document.getElementById("sel").innerHTML;
+      if (!detail.includes("source Method 2")
+          || !detail.includes("2 confirmed pattern instances boxed"))
+        problems.push("All 详情没有 Method 2 来源/confirmed pattern 数");
+      context.renderList();
+      const allItems = (context.document.getElementById("list").children || [])
+        .filter((node) => node.classList && node.classList.contains("al-item"));
+      const m2Item = allItems.find((node) => Number(node.dataset.al) === 701);
+      const m1Item = allItems.find((node) => Number(node.dataset.al) === 702);
+      if (!m2Item || !String(m2Item.innerHTML).includes("Method 2")
+          || !String(m2Item.innerHTML).includes("2 confirmed patterns boxed"))
+        problems.push("All 列表没有 Method 2 / pattern 数");
+      if (!m1Item || !String(m1Item.innerHTML).includes("Method 1"))
+        problems.push("All 列表没有 Method 1 来源");
+
+      let networkCalls = 0;
+      context.fetch = async () => {
+        networkCalls += 1;
+        return {ok:false,status:599,json:async()=>({error:"unexpected request"})};
+      };
+      const allInput = context.document.getElementById("tgAll").querySelector("input");
+      const allGroup = context.document.getElementById("gAll");
+      allInput.checked = false; allInput.dispatchEvent({type:"change"});
+      if (allGroup.style.display !== "none")
+        problems.push("关闭 All 后 pattern 框层仍显示");
+      const offListItems = (context.document.getElementById("list").children || [])
+        .filter((node) => node.classList && node.classList.contains("al-item"));
+      const offListSection = (context.document.getElementById("list").children || [])
+        .some((node) => String(node.textContent || "") === "ALL LINE TYPES (DEBUG)");
+      if (offListItems.length || offListSection)
+        problems.push("关闭 All 后调试侧栏仍残留");
+      allInput.checked = true; allInput.dispatchEvent({type:"change"});
+      await Promise.resolve();
+      const restoredBoxes = (allGroup.children || []).filter((node) =>
+        node.getAttribute && node.getAttribute("class") === "al-pattern");
+      const restoredListItems = (context.document.getElementById("list").children || [])
+        .filter((node) => node.classList && node.classList.contains("al-item"));
+      if (allGroup.style.display === "none" || restoredBoxes.length !== 2)
+        problems.push("再次打开 All 没从缓存恢复两个 pattern 框");
+      if (restoredListItems.length !== 2)
+        problems.push("再次打开 All 没从缓存恢复调试侧栏");
+      if (networkCalls)
+        problems.push(`All pattern 开→关→开额外请求 ${networkCalls} 次`);
+    }
+  } catch (error) {
+    const first = error && error.stack ? error.stack.split("\n")[0] : String(error);
+    problems.push(`抛出 -> ${first}`);
+  } finally {
+    context.fetch = oldFetch;
+    context.__patternSaved = saved;
+    vm.runInContext(
+      "CUR=__patternSaved.cur;PAGE=__patternSaved.page;epoch=__patternSaved.epoch;"
+      + "ALL_LT=__patternSaved.all;ALL_LT_KEY=__patternSaved.key;"
+      + "ALL_LT_STATE=__patternSaved.state;ALL_LT_DETAIL=__patternSaved.detail;"
+      + "ALL_FOCUS=__patternSaved.focus;ALL_FILTER=__patternSaved.filter;"
+      + "ALL_LT_INFLIGHT=__patternSaved.inflight;selectedScope=__patternSaved.selectedScope;"
+      + "selectedRow=__patternSaved.selectedRow;"
+      + "$('tgLt').querySelector('input').checked=__patternSaved.ltChecked;"
+      + "$('tgAll').querySelector('input').checked=__patternSaved.allChecked;"
+      + "if(PAGE){makeScopeModel();build();renderList();syncLayers();}", context,
+      {filename:"method2-pattern-restore"});
+  }
+  if (problems.length) {
+    console.log(`  FAIL Method 2 pattern 框: ${problems.join("; ")}`);
+    failures += 1;
+  } else if (!skipped) {
+    console.log("  OK   Method 2 pattern 框: normal/All 仅框 confirmed Method 2；来源、focus、开关缓存通过");
   }
 }
 

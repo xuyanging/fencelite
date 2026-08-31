@@ -48,6 +48,7 @@ MIN_PARALLEL_CARRIER_CANDIDATES = 64
 MIN_PARALLEL_CARRIER_PAIRWISE_WORK = 25_000_000
 _EPSILON = 1e-6
 _DASH_NORMALIZATION = re.compile(r"[\u2010-\u2015\u2212]")
+_INLINE_FEET_TOKEN = re.compile(r"^\d{1,3}(?:\.\d{1,3})?\s*['\u2019\u2032]$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +124,7 @@ class RegionSignature:
     canonical_key: str
     pattern_source: str
     literal_key: str | None = None
+    inline_carrier_style_key: tuple[object, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,6 +584,167 @@ def _unicode_letter(value: str) -> bool:
     return any(unicodedata.category(character).startswith("L") for character in value)
 
 
+def _is_inline_feet_token(value: str) -> bool:
+    """Whether a non-letter literal can be an authored inline line pattern.
+
+    Native PDF text historically required a Unicode letter.  That keeps
+    ordinary dimensions, coordinates and page numbers out of Method2, but it
+    also rejects genuine repeated fence tokens such as ``8'`` before carrier
+    evidence is considered.  Keep the exception deliberately narrow: a short
+    number followed by an explicit feet mark.  Geometry below must still prove
+    that the token is literally bracketed by its carrier.
+    """
+
+    return _INLINE_FEET_TOKEN.fullmatch(value) is not None
+
+
+def _inline_carrier_paths(
+    context: _Context,
+    dense_index: int,
+) -> tuple[PathOperationIR, PathOperationIR] | None:
+    if dense_index <= 0 or dense_index + 1 >= len(context.page.operations):
+        return None
+    group_id = context.operation_index.group_id(dense_index)
+    neighbor_indices = (dense_index - 1, dense_index + 1)
+    if any(
+        context.operation_index.group_id(index) != group_id
+        for index in neighbor_indices
+    ):
+        return None
+    neighbors = tuple(
+        context.operation_index.operation(index) for index in neighbor_indices
+    )
+    if any(not isinstance(operation, PathOperationIR) for operation in neighbors):
+        return None
+    left, right = neighbors
+    assert isinstance(left, PathOperationIR)
+    assert isinstance(right, PathOperationIR)
+    return left, right
+
+
+def _inline_carrier_path_style(operation: PathOperationIR) -> tuple[object, ...]:
+    """Visual style identity for a numeric token's surrounding carrier.
+
+    Source provenance and layer names are intentionally absent: equal-looking
+    line types may be authored in different streams or optional-content
+    layers.  Paint channel, color, opacity, width, dash, cap/join, hairline and
+    blend mode do change the visible carrier and therefore must prevent a
+    literal-only cross-style merge.  Rounding only removes representation
+    noise from source transforms; it is much narrower than the admission
+    width-ratio guard.
+    """
+
+    return (
+        _channel_for(operation),
+        tuple(round(value, 9) for value in (operation.stroke_color or ())),
+        round(operation.stroke_opacity, 6),
+        round(operation.line_width, 3),
+        operation.hairline,
+        tuple(round(value, 3) for value in operation.dash_array),
+        round(operation.dash_phase, 3),
+        operation.line_cap,
+        round(operation.line_join, 3),
+        operation.blend_mode,
+    )
+
+
+def _inline_carrier_style_key(
+    context: _Context,
+    dense_index: int,
+) -> tuple[object, ...] | None:
+    paths = _inline_carrier_paths(context, dense_index)
+    if paths is None:
+        return None
+    left_style, right_style = map(_inline_carrier_path_style, paths)
+    return left_style if left_style == right_style else None
+
+
+def _strict_inline_carrier_sandwich(
+    context: _Context,
+    dense_index: int,
+    frame: RegionFrame,
+    page_diagonal: float,
+) -> bool:
+    """Require ``carrier, token, carrier`` in one authored Group.
+
+    The two carrier paths must be the dense operations immediately around the
+    text, be open straight strokes, lie on opposite sides of the text frame,
+    and agree with its writing axis.  This is intentionally stronger than the
+    later family attachment search: it is the admission guard that prevents a
+    repeated dimension value elsewhere on the sheet from entering Method2.
+    """
+
+    paths = _inline_carrier_paths(context, dense_index)
+    if paths is None or _inline_carrier_style_key(context, dense_index) is None:
+        return False
+    if any(
+        operation.fill
+        or any(segment.kind in {"curve", "close"} for segment in operation.segments)
+        or sum(segment.kind == "move" for segment in operation.segments) != 1
+        for operation in paths
+    ):
+        return False
+    metrics = tuple(_straight_path_metrics(operation) for operation in paths)
+    if any(metric is None for metric in metrics):
+        return False
+    positive_widths = [operation.line_width for operation in paths if operation.line_width > 0]
+    if len(positive_widths) == 2 and _ratio_similarity(*positive_widths) < 0.6:
+        return False
+
+    gap_tolerance = max(frame.minor * 2.2, page_diagonal * 0.0015)
+    sides: set[str] = set()
+    for operation, metric in zip(paths, metrics):
+        assert metric is not None
+        alignment = abs(metric.direction.x * frame.ux + metric.direction.y * frame.uy)
+        if alignment < 0.93:
+            return False
+        corners = _bounds_corners(operation.bounds)
+        values_u = [_projection(point, frame.ux, frame.uy) for point in corners]
+        values_v = [_projection(point, frame.vx, frame.vy) for point in corners]
+        v_gap = _interval_gap(
+            min(values_v), max(values_v), frame.min_v, frame.max_v
+        )
+        if v_gap > frame.minor * 0.85:
+            return False
+        u_min, u_max = min(values_u), max(values_u)
+        if u_max <= frame.min_u + frame.minor * 0.35:
+            side = "left"
+            gap = max(0.0, frame.min_u - u_max)
+        elif u_min >= frame.max_u - frame.minor * 0.35:
+            side = "right"
+            gap = max(0.0, u_min - frame.max_u)
+        else:
+            return False
+        if gap > max(gap_tolerance, frame.major * 5.0):
+            return False
+        sides.add(side)
+    return sides == {"left", "right"}
+
+
+def _contextual_inline_carrier_corner(
+    context: _Context,
+    dense_index: int,
+    frame: RegionFrame,
+) -> bool:
+    """Admit a turn token only inside a run already proven by strict anchors."""
+
+    paths = _inline_carrier_paths(context, dense_index)
+    if paths is None or _inline_carrier_style_key(context, dense_index) is None:
+        return False
+    for index, operation in zip((dense_index - 1, dense_index + 1), paths):
+        if (
+            operation.fill
+            or _carrier_geometry_for(operation, index) is None
+        ):
+            return False
+    metrics = tuple(_straight_path_metrics(operation) for operation in paths)
+    return any(
+        metric is not None
+        and abs(metric.direction.x * frame.ux + metric.direction.y * frame.uy) >= 0.93
+        for metric in metrics
+    )
+
+
 def _source_text_point(
     matrix: tuple[float, float, float, float, float, float],
     x: float,
@@ -598,12 +761,16 @@ def _native_text_signature_for(
     operation: TextOperationIR,
     dense_index: int,
     page_diagonal: float,
+    *,
+    allow_contextual_inline: bool = False,
 ) -> RegionSignature | None:
     literal_key = _normalized_pdf_text(operation.literal_text)
+    contains_letter = _unicode_letter(literal_key)
+    inline_feet_token = _is_inline_feet_token(literal_key)
     if (
         not literal_key
         or _javascript_string_length(literal_key) > 80
-        or not _unicode_letter(literal_key)
+        or not (contains_letter or inline_feet_token)
     ):
         return None
     if operation.source_matrix is not None:
@@ -649,6 +816,20 @@ def _native_text_signature_for(
         or frame.minor < page_diagonal * 0.0001
     ):
         return None
+    if inline_feet_token:
+        strict = _strict_inline_carrier_sandwich(
+            context, dense_index, frame, page_diagonal
+        )
+        if not strict and not (
+            allow_contextual_inline
+            and _contextual_inline_carrier_corner(context, dense_index, frame)
+        ):
+            return None
+        inline_carrier_style_key = _inline_carrier_style_key(context, dense_index)
+        if inline_carrier_style_key is None:
+            return None
+    else:
+        inline_carrier_style_key = None
     group_id = context.operation_index.group_id(dense_index)
     orientation = math.atan2(uy, ux) * 180.0 / math.pi
     region = _PatternRegion(
@@ -670,6 +851,7 @@ def _native_text_signature_for(
         region, frame, (), frozenset(), 0, 0, 0, 0,
         frame.major / max(_EPSILON, frame.minor), "", 0.0,
         f"pdf-text:{literal_key}", "pdf_text", literal_key,
+        inline_carrier_style_key,
     )
 
 
@@ -779,6 +961,11 @@ def _compare_region_signatures(
         score = float(
             left.pattern_source == right.pattern_source
             and left.literal_key == right.literal_key
+            and (
+                not _is_inline_feet_token(left.literal_key or "")
+                or left.inline_carrier_style_key
+                == right.inline_carrier_style_key
+            )
         )
         return done("pdf_text_literal", score, False)
     if left.channel != right.channel:
@@ -973,20 +1160,48 @@ def _complete_text_pattern_families(
     )
     for family in vector_families:
         family.indices[:] = [vector_indices[index] for index in family.indices]
-    literal_buckets: dict[str, list[int]] = {}
+    literal_buckets: dict[
+        tuple[str, tuple[object, ...] | None], list[int]
+    ] = {}
     for index, signature in enumerate(signatures):
         if signature.pattern_source == "pdf_text" and signature.literal_key:
-            literal_buckets.setdefault(signature.literal_key, []).append(index)
-    literal_families = [
-        _Family(indices, 1.0)
-        for indices in literal_buckets.values()
-        if len({
+            style_key = (
+                signature.inline_carrier_style_key
+                if _is_inline_feet_token(signature.literal_key)
+                else None
+            )
+            literal_buckets.setdefault(
+                (signature.literal_key, style_key), []
+            ).append(index)
+    literal_families: list[_Family] = []
+    for (literal_key, _style_key), indices in literal_buckets.items():
+        paint_orders = {
             context.operation_index.operation(
                 signatures[index].region.op_indices[0]
             ).paint_order
             for index in indices
-        }) >= 2
-    ]
+        }
+        if len(paint_orders) < 2:
+            continue
+        if _is_inline_feet_token(literal_key):
+            paint_orders_by_group: dict[str, set[int]] = {}
+            for index in indices:
+                signature = signatures[index]
+                paint_orders_by_group.setdefault(
+                    signature.region.group_id, set()
+                ).add(
+                    context.operation_index.operation(
+                        signature.region.op_indices[0]
+                    ).paint_order
+                )
+            # Numeric literals are weak identity on their own.  Require a real
+            # repeated run in one authored Group rather than duplicate trace
+            # spans or two coincidental dimension labels.  ``paint_order`` is
+            # the authored event identity and may intentionally repeat across
+            # multiple dense TextOperationIR spans.
+            if max(map(len, paint_orders_by_group.values()), default=0) < 3:
+                continue
+        literal_families.append(_Family(indices, 1.0))
     result = [*vector_families, *literal_families]
     result.sort(key=lambda family: signatures[family.indices[0]].region.op_indices[0])
     return result
@@ -1349,6 +1564,79 @@ def _attachment_indices(attachment: _DashAttachment | None) -> tuple[int, ...]:
     if attachment is None:
         return ()
     return tuple(item.op_index for item in (*attachment.left, *attachment.right))
+
+
+def _is_inline_measurement_family(
+    family: _Family,
+    signatures: Sequence[RegionSignature],
+) -> bool:
+    return bool(family.indices) and all(
+        signatures[index].pattern_source == "pdf_text"
+        and signatures[index].literal_key is not None
+        and _is_inline_feet_token(signatures[index].literal_key or "")
+        for index in family.indices
+    )
+
+
+def _interior_measurement_carriers(
+    context: _Context,
+    family: _Family,
+    signatures: Sequence[RegionSignature],
+) -> set[int]:
+    """Return carriers genuinely between two repeated measurement tokens.
+
+    A normal text line may legitimately extend its carrier past the terminal
+    label.  A numeric measurement token is different: an exterior tail is
+    weak evidence and can run straight into an unrelated periodic type.  Keep
+    only the authored path interval between adjacent instances.  The interval
+    must contain nothing except open carrier paths.  Strict sandwich anchors
+    already proved this literal and Group before contextual corner instances
+    were admitted, so dense source order is stronger evidence here than a
+    single-axis attachment at a bend.  This preserves the visible
+    ``line, 8', line`` chain while preventing route-tail extension from
+    consuming a neighbouring square or dash family.
+    """
+
+    by_group: dict[str, list[int]] = {}
+    for signature_index in family.indices:
+        signature = signatures[signature_index]
+        by_group.setdefault(signature.region.group_id, []).append(signature_index)
+    interior: set[int] = set()
+    for group_indices in by_group.values():
+        ordered = sorted(
+            group_indices,
+            key=lambda index: signatures[index].region.op_indices[0],
+        )
+        for left_index, right_index in zip(ordered, ordered[1:]):
+            left_op = signatures[left_index].region.op_indices[-1]
+            right_op = signatures[right_index].region.op_indices[0]
+            if (
+                right_op <= left_op + 1
+                or right_op - left_op > SEQUENTIAL_CARRIER_MAX_OP_GAP
+            ):
+                continue
+            between = tuple(range(left_op + 1, right_op))
+            if any(
+                not isinstance(context.operation_index.operation(index), PathOperationIR)
+                for index in between
+            ):
+                continue
+            geometries = tuple(
+                geometry
+                for index in between
+                if (
+                    isinstance(
+                        operation := context.operation_index.operation(index),
+                        PathOperationIR,
+                    )
+                    and not operation.fill
+                    and (geometry := _carrier_geometry_for(operation, index)) is not None
+                )
+            )
+            if len(geometries) != len(between):
+                continue
+            interior.update(geometry.op_index for geometry in geometries)
+    return interior
 
 
 @dataclass(frozen=True, slots=True)
@@ -2496,6 +2784,65 @@ def recognize_repeated_text_pattern_families(
             )
         ) is not None
     ]
+    strict_inline_by_key: dict[
+        tuple[str, str, tuple[object, ...]], list[int]
+    ] = {}
+    for signature in native_signatures:
+        literal_key = signature.literal_key or ""
+        style_key = signature.inline_carrier_style_key
+        if _is_inline_feet_token(literal_key) and style_key is not None:
+            strict_inline_by_key.setdefault(
+                (signature.region.group_id, literal_key, style_key), []
+            ).append(signature.region.op_indices[0])
+    qualified_inline_spans: dict[
+        tuple[str, str, tuple[object, ...]], tuple[int, int]
+    ] = {}
+    for key, indices in strict_inline_by_key.items():
+        distinct_paint_orders = {
+            context.operation_index.operation(index).paint_order
+            for index in indices
+        }
+        if len(distinct_paint_orders) >= 3:
+            qualified_inline_spans[key] = (min(indices), max(indices))
+    native_signatures = [
+        signature
+        for signature in native_signatures
+        if not _is_inline_feet_token(signature.literal_key or "")
+        or (
+            signature.region.group_id,
+            signature.literal_key or "",
+            signature.inline_carrier_style_key,
+        )
+        in qualified_inline_spans
+    ]
+    strict_native_ops = {
+        signature.region.op_indices[0] for signature in native_signatures
+    }
+    if qualified_inline_spans:
+        for dense_index, operation in context.operation_index.text_items():
+            if dense_index in strict_native_ops:
+                continue
+            literal_key = _normalized_pdf_text(operation.literal_text)
+            group_id = context.operation_index.group_id(dense_index)
+            if not _is_inline_feet_token(literal_key):
+                continue
+            signature = _native_text_signature_for(
+                context,
+                operation,
+                dense_index,
+                page_diagonal,
+                allow_contextual_inline=True,
+            )
+            if signature is None or signature.inline_carrier_style_key is None:
+                continue
+            span = qualified_inline_spans.get((
+                group_id,
+                literal_key,
+                signature.inline_carrier_style_key,
+            ))
+            if span is not None and span[0] < dense_index < span[1]:
+                native_signatures.append(signature)
+        native_signatures.sort(key=lambda item: item.region.op_indices[0])
     regions.extend(signature.region for signature in native_signatures)
     signatures: list[RegionSignature] = [*vector_signatures, *native_signatures]
     seed_families = _complete_text_pattern_families(context, signatures)
@@ -2615,6 +2962,24 @@ def recognize_repeated_text_pattern_families(
         page_diagonal,
         best_owner,
     )
+    measurement_interior_ops = {
+        family_index: _interior_measurement_carriers(
+            context,
+            family,
+            signatures,
+        )
+        for family_index, family in enumerate(families)
+        if family_index in connected_families
+        and _is_inline_measurement_family(family, signatures)
+    }
+    if measurement_interior_ops:
+        best_owner = {
+            op_index: owner
+            for op_index, owner in best_owner.items()
+            if owner.family_index not in measurement_interior_ops
+            or op_index in measurement_interior_ops[owner.family_index]
+        }
+        bridged_route_ops.intersection_update(best_owner)
     families_with_owned_carrier = {
         owner.family_index for owner in best_owner.values()
     }

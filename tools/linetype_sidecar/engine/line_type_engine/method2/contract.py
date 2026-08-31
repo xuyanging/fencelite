@@ -29,7 +29,7 @@ METHOD2_TARGET_SPEC_VERSION = FROZEN_TS_METHOD2_ENGINE_VERSION
 METHOD2_LOCAL_PROJECTION_VERSION = PYTHON_METHOD2_LOCAL_PROJECTION_VERSION
 METHOD2_RESULT_SCHEMA_VERSION = 2
 
-_FEATURE_ITEMS = (
+_FROZEN_TS_FEATURE_ITEMS = (
     ("repeated_vector_text_family_clustering", True),
     ("native_pdf_text_pattern_clustering", True),
     ("vector_short_stroke_text_pattern_clustering", True),
@@ -44,6 +44,17 @@ _FEATURE_ITEMS = (
     ("sequential_multi_path_pattern_rescue", True),
 )
 
+_FEATURE_ITEMS = (
+    *_FROZEN_TS_FEATURE_ITEMS[:2],
+    ("native_inline_feet_pattern_clustering", True),
+    *_FROZEN_TS_FEATURE_ITEMS[2:-1],
+    ("measurement_internal_carrier_ownership", True),
+    _FROZEN_TS_FEATURE_ITEMS[-1],
+)
+
+FROZEN_TS_METHOD2_FEATURES: Mapping[str, bool] = MappingProxyType(
+    dict(_FROZEN_TS_FEATURE_ITEMS)
+)
 LINE_TYPE_METHOD2_FEATURES: Mapping[str, bool] = MappingProxyType(dict(_FEATURE_ITEMS))
 
 
@@ -181,7 +192,7 @@ LINE_TYPE_METHOD2_CONFIG_HASH = line_type_method2_config_hash()
 
 
 def frozen_ts_method2_config_hash(
-    features: Mapping[str, bool] = LINE_TYPE_METHOD2_FEATURES,
+    features: Mapping[str, bool] = FROZEN_TS_METHOD2_FEATURES,
 ) -> str:
     """Return the frozen r46 config hash used only as a parity anchor."""
 
@@ -441,6 +452,7 @@ def validate_line_type_method2_envelope(
 
 __all__ = [
     "FROZEN_TS_METHOD2_CONFIG_HASH",
+    "FROZEN_TS_METHOD2_FEATURES",
     "LINE_TYPE_METHOD2_CONFIG_HASH",
     "LINE_TYPE_METHOD2_FEATURES",
     "LineTypeFingerprintWriter",

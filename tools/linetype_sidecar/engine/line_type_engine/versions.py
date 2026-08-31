@@ -6,19 +6,19 @@ operation-level migration gates pass.
 """
 
 PYTHON_ENGINE_VERSION = (
-    "python-line-type-engine-p10-source-text-image-style-aligned-2026-08-24"
+    "python-line-type-engine-p11-inline-feet-carrier-support-2026-08-31"
 )
 PYTHON_METHOD1_ENGINE_VERSION = (
-    f"{PYTHON_ENGINE_VERSION}/method1-r10-source-text-contract-candidate"
+    f"{PYTHON_ENGINE_VERSION}/method1-r11-inline-feet-guard-carrier-support-candidate"
 )
 PYTHON_METHOD2_LOCAL_PROJECTION_VERSION = (
     "method2-local-group-projection-v1-source-group-owned-2026-08-24"
 )
 PYTHON_METHOD2_ENGINE_VERSION = (
-    f"{PYTHON_ENGINE_VERSION}/method2-r46-source-native-frame-candidate"
+    f"{PYTHON_ENGINE_VERSION}/method2-r47-inline-feet-pattern-candidate"
 )
 PYTHON_FUSION_ENGINE_VERSION = (
-    f"{PYTHON_ENGINE_VERSION}/fusion-policy-v1-local-projection-candidate"
+    f"{PYTHON_ENGINE_VERSION}/fusion-policy-v2-companion-support-projection-candidate"
 )
 PAGE_IR_VERSION = "source-aligned-page-ir-v10"
 GROUPING_IR_VERSION = (

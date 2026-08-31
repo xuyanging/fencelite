@@ -79,6 +79,7 @@ job = {
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 import json
 import math
@@ -141,6 +142,163 @@ def _bbox(polylines):
         return None
     return [round(min(ys), 2), round(min(xs), 2),
             round(max(ys), 2), round(max(xs), 2)]
+
+
+def _method2_pattern_instances(recognition, projected_payload, to_page_frame):
+    """Map confirmed Method2 audit regions onto fused display type numbers."""
+    envelope = getattr(recognition, "method2", None)
+    if envelope is None:
+        return {}
+    if not isinstance(projected_payload, Mapping):
+        raise ValueError("projected Method2 payload is invalid")
+    audit = getattr(
+        getattr(envelope, "audit", None),
+        "repeated_vector_text_family_clustering",
+        None,
+    )
+    if audit is None:
+        raise ValueError("Method2 pattern audit is missing")
+    regions = getattr(audit, "region_instances", None)
+    expected_count = getattr(audit, "line_type_confirmed_instance_count", None)
+    if not isinstance(regions, (list, tuple)):
+        raise ValueError("Method2 pattern audit region_instances is invalid")
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count < 0
+    ):
+        raise ValueError("Method2 confirmed pattern count is invalid")
+
+    number_by_source = {}
+    method2_numbers = set()
+    clusters = projected_payload.get("global_line_types") or ()
+    if not isinstance(clusters, (list, tuple)):
+        raise ValueError("projected global_line_types is invalid")
+    for position, cluster in enumerate(clusters):
+        if not isinstance(cluster, Mapping):
+            raise ValueError(f"projected line type #{position} is invalid")
+        if cluster.get("recognition_source") != "method2":
+            continue
+        source_id = cluster.get("source_line_type_id")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("projected Method2 line type has no source id")
+        if source_id in number_by_source:
+            raise ValueError(f"duplicate Method2 source id {source_id!r}")
+        raw_number = cluster.get("line_type_number")
+        if isinstance(raw_number, bool) or not isinstance(raw_number, int):
+            raise ValueError("projected Method2 line type number is invalid")
+        number = raw_number
+        if number <= 0 or number in method2_numbers:
+            raise ValueError("projected Method2 line type number is invalid or duplicate")
+        number_by_source[source_id] = number
+        method2_numbers.add(number)
+
+    by_number = {}
+    confirmed_count = 0
+    mapped_count = 0
+    for position, raw in enumerate(regions):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"Method2 pattern region #{position} is invalid")
+        region = dict(raw)
+        if region.get("line_type_confirmed") is not True:
+            continue
+        confirmed_count += 1
+        source_id = region.get("global_type_id")
+        number = number_by_source.get(source_id)
+        if number is None:
+            raise ValueError(
+                f"confirmed Method2 pattern region #{position} has unmapped "
+                f"source id {source_id!r}"
+            )
+        bounds = region.get("bounds")
+        if not isinstance(bounds, Mapping):
+            raise ValueError(
+                f"confirmed Method2 pattern region #{position} has invalid bounds"
+            )
+        values = []
+        for key in ("minX", "minY", "maxX", "maxY"):
+            raw_value = bounds.get(key)
+            if (
+                isinstance(raw_value, bool)
+                or not isinstance(raw_value, (int, float))
+            ):
+                raise ValueError(
+                    f"confirmed Method2 pattern region #{position} has "
+                    f"non-finite {key}"
+                )
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    f"confirmed Method2 pattern region #{position} has "
+                    f"non-finite {key}"
+                ) from error
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"confirmed Method2 pattern region #{position} has "
+                    f"non-finite {key}"
+                )
+            values.append(value)
+        min_x, min_y, max_x, max_y = values
+        if max_x <= min_x or max_y <= min_y:
+            raise ValueError(
+                f"confirmed Method2 pattern region #{position} has degenerate bounds"
+            )
+        corners = [
+            to_page_frame(x, y)
+            for x in (min_x, max_x)
+            for y in (min_y, max_y)
+        ]
+        if any(
+            not isinstance(point, (list, tuple))
+            or len(point) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in point
+            )
+            for point in corners
+        ):
+            raise ValueError(
+                f"confirmed Method2 pattern region #{position} projection is invalid"
+            )
+        box = _bbox([corners])
+        if (
+            box is None
+            or box[2] <= box[0]
+            or box[3] <= box[1]
+        ):
+            raise ValueError(
+                f"confirmed Method2 pattern region #{position} projection is empty "
+                "or degenerate"
+            )
+        instance = {
+            "region_id": region.get("region_id"),
+            "display_label": region.get("display_label"),
+            "group_id": region.get("group_id"),
+            "op_indices": list(region.get("op_indices") or ()),
+            "literal_text": region.get("literal_text"),
+            "pattern_source": region.get("pattern_source"),
+            "orientation_degrees": region.get("orientation_degrees"),
+            "recovered": bool(region.get("recovered")),
+            "bbox": box,
+        }
+        by_number.setdefault(number, []).append(instance)
+        mapped_count += 1
+    if confirmed_count != expected_count or mapped_count != expected_count:
+        raise ValueError(
+            "Method2 pattern count disagrees with audit "
+            f"(audit={expected_count}, confirmed={confirmed_count}, "
+            f"mapped={mapped_count})"
+        )
+    for instances in by_number.values():
+        instances.sort(key=lambda item: (
+            str(item.get("group_id") or ""),
+            tuple(item.get("op_indices") or ()),
+            str(item.get("region_id") or ""),
+        ))
+    return by_number
 
 
 def _is_own_geometry(lines, own_lines):
@@ -225,18 +383,18 @@ def _connected_runs(op_indices, ir_geometry, tau=RUN_TOUCH_PT):
 def _nearest_point_on(point, lines, to_page_frame):
     """IR 帧里 point 到这些折线的最近落点，转成页面帧 [y, x]。可视化用。"""
     best = None
-    py, px = point
+    px, py = point
     for line in lines:
         for (ax, ay), (bx, by) in zip(line, line[1:]):
-            dy, dx = by - ay, bx - ax
-            den = dy * dy + dx * dx
+            dx, dy = bx - ax, by - ay
+            den = dx * dx + dy * dy
             if den <= 1e-12:
-                qy, qx = ay, ax
+                qx, qy = ax, ay
             else:
-                t = ((py - ay) * dy + (px - ax) * dx) / den
+                t = ((px - ax) * dx + (py - ay) * dy) / den
                 t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-                qy, qx = ay + t * dy, ax + t * dx
-            d = math.hypot(py - qy, px - qx)
+                qx, qy = ax + t * dx, ay + t * dy
+            d = math.hypot(px - qx, py - qy)
             if best is None or d < best[0]:
                 best = (d, qx, qy)
     if best is None:
@@ -521,11 +679,18 @@ def main():
         if clipped(op_index):
             clipped_by_cluster[number] = clipped_by_cluster.get(number, 0) + 1
 
+    try:
+        pattern_instances_by_number = _method2_pattern_instances(
+            recognition, payload, to_page_frame
+        )
+    except Exception as error:                                   # noqa: BLE001
+        _fail("PATTERN_INSTANCE_ERROR", f"{type(error).__name__}: {error}")
     meta = {}
     for cluster in payload["global_line_types"]:
         number = int(cluster["line_type_number"])
         lines = ir_by_cluster.get(number) or []
         page_lines = [[to_page_frame(x, y) for x, y in line] for line in lines]
+        pattern_instances = pattern_instances_by_number.get(number) or []
         meta[number] = {
             "line_type_number": number,
             "line_type_id": cluster["line_type_id"],
@@ -552,6 +717,8 @@ def main():
             # >0 说明这个簇里有 op 的 segments 伸出了被 clip 裁过的 bounds，
             # 全画会在图上空白处描线。上报而不是静默裁掉。
             "clipped_ops": clipped_by_cluster.get(number, 0),
+            "pattern_instance_count": len(pattern_instances),
+            "pattern_instances": pattern_instances,
         }
 
     for row in recovered:
@@ -575,6 +742,8 @@ def main():
                 str(i) for i in sorted(row["op_indices"])).encode()).hexdigest(),
             "bbox": _bbox(page_lines),
             "clipped_ops": clipped_by_cluster.get(number, 0),
+            "pattern_instance_count": 0,
+            "pattern_instances": [],
             # 这一层是"被 fusion 连带丢弃后补回来的"，必须能分辨。
             "recovered_from_fusion": True,
             "op_count_in_method1": row["op_count_in_method1"],

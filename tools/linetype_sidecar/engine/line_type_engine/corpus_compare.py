@@ -32,7 +32,7 @@ from .fusion_contract import (
 from .method1.serializer import METHOD1_SERIALIZED_INPUT_HASH_SCHEMA
 from .method2.contract import (
     FROZEN_TS_METHOD2_CONFIG_HASH,
-    LINE_TYPE_METHOD2_FEATURES,
+    FROZEN_TS_METHOD2_FEATURES,
 )
 from .results import LineTypeRecognitionResult
 from .versions import (
@@ -659,7 +659,7 @@ def _validate_ts_method2_envelope(
         or value.get("engine_version") != FROZEN_TS_METHOD2_ENGINE_VERSION
         or value.get("config_hash") != FROZEN_TS_METHOD2_CONFIG_HASH
         or value.get("page_identity") != page_identity
-        or dict(value.get("features", {})) != dict(LINE_TYPE_METHOD2_FEATURES)
+        or dict(value.get("features", {})) != dict(FROZEN_TS_METHOD2_FEATURES)
         or not isinstance(result, Mapping)
         or not _is_exact_integer(result.get("schema_version"), 1)
     ):

@@ -18,6 +18,7 @@ from .multi_path_carrier import (
 from .contract import (
     LINE_TYPE_METHOD2_CONFIG_HASH,
     LINE_TYPE_METHOD2_FEATURES,
+    FROZEN_TS_METHOD2_FEATURES,
     METHOD2_ENGINE_VERSION,
     METHOD2_LOCAL_PROJECTION_VERSION,
     METHOD2_TARGET_SPEC_VERSION,
@@ -38,6 +39,7 @@ __all__ = [
     "CarrierDelimitedMultiPathRegion",
     "LINE_TYPE_METHOD2_CONFIG_HASH",
     "LINE_TYPE_METHOD2_FEATURES",
+    "FROZEN_TS_METHOD2_FEATURES",
     "LineTypeMethod2Audit",
     "LineTypeMethod2Envelope",
     "LineTypeMethod2Result",

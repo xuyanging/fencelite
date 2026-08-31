@@ -186,6 +186,59 @@ def _source_members(global_types: Sequence[GlobalLineType]) -> frozenset[str]:
     )
 
 
+def _unique_method1_support_locals(
+    groups: Sequence[RecognizedGroup],
+    all_global_types: Sequence[GlobalLineType],
+    retained_global_types: Sequence[GlobalLineType],
+) -> frozenset[str]:
+    """Return carrier-support locals proven to belong to one retained global.
+
+    Carrier companions extend a compound global's drawable coverage without
+    becoming signature members.  Normal fusion projects locals through
+    ``GlobalLineType.members``, so these deliberately memberless support
+    records need one narrow projection rule.  Every support operation must be
+    owned by the same single retained Method1 global; missing or competing
+    ownership fails closed and leaves the local out of the fused line types.
+    """
+
+    retained_objects = {id(global_type) for global_type in retained_global_types}
+    retained_positions = {
+        position
+        for position, global_type in enumerate(all_global_types)
+        if id(global_type) in retained_objects
+        and global_type.signature_family == "compound_path_periodic"
+    }
+    owners_by_op: dict[int, set[int]] = {}
+    for global_position, global_type in enumerate(all_global_types):
+        for op_index in global_type.op_indices:
+            # Check against every Method1 global, including ones skipped by
+            # Method2.  Otherwise an op shared with a skipped source could look
+            # uniquely owned after that source was removed.  Tuple position is
+            # used rather than the external id so malformed duplicate ids
+            # cannot make two globals look like one owner.
+            owners_by_op.setdefault(op_index, set()).add(global_position)
+
+    support_keys: set[str] = set()
+    for group in groups:
+        for line_type in group.line_types:
+            if (
+                line_type.model != "parallel_carrier_companion"
+                or not line_type.op_indices
+            ):
+                continue
+            owners = tuple(
+                owners_by_op.get(op_index, set())
+                for op_index in line_type.op_indices
+            )
+            if (
+                all(len(op_owners) == 1 for op_owners in owners)
+                and len({next(iter(op_owners)) for op_owners in owners}) == 1
+                and next(iter(owners[0])) in retained_positions
+            ):
+                support_keys.add(_member_key(group.group_id, line_type.type_id))
+    return frozenset(support_keys)
+
+
 def _clone_local_type(
     line_type: LocalLineType,
     source: RecognitionSource,
@@ -256,6 +309,14 @@ def fuse_line_type_recognition_results(
             retained_method1.append(global_type)
 
     retained_method1_members = _source_members(retained_method1)
+    retained_method1_locals = (
+        retained_method1_members
+        | _unique_method1_support_locals(
+            method1.groups,
+            method1.global_types,
+            retained_method1,
+        )
+    )
     method2_members = _source_members(method2.global_types)
     method1_groups = {str(group.group_id): group for group in method1.groups}
     method2_groups = {str(group.group_id): group for group in method2.groups}
@@ -306,7 +367,7 @@ def fuse_line_type_recognition_results(
                 line_types.append(clone)
 
         append(_METHOD2, method2_group, method2_members)
-        append(_METHOD1, method1_group, retained_method1_members)
+        append(_METHOD1, method1_group, retained_method1_locals)
         known_ops = _all_known_group_ops(method1_group, method2_group)
         non_line_ops = tuple(
             op_index for op_index in known_ops if op_index not in assigned

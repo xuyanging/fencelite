@@ -186,6 +186,15 @@ rect.bx.bx-plc:hover,rect.bx.bx-plc.pick{fill:rgba(124,58,237,.62);
 .lt-line.lt-focus{stroke-width:5;stroke-opacity:1;
                   filter:drop-shadow(0 0 3px rgba(15,23,42,.45))}
 .lt-line.lt-dim{stroke-opacity:0}
+/* Method 2 的输入不是一条孤立笔画，而是多个已确认的重复 pattern 实例。
+   只把这些 confirmed instance 框出来；Method 1 永远不画框。框也加入对应
+   线型的 focus/dim 节点集合，点 callout 时不会留下无主的调试标记。 */
+.lt-pattern{fill:rgba(255,255,255,.04);stroke-width:2.2;stroke-opacity:.95;
+            stroke-dasharray:7 4;pointer-events:none;vector-effect:non-scaling-stroke;
+            transition:stroke-opacity .12s ease,stroke-width .12s ease}
+.lt-pattern.lt-focus{stroke-width:3.4;stroke-opacity:1;
+                     filter:drop-shadow(0 0 2px rgba(15,23,42,.5))}
+.lt-pattern.lt-dim{stroke-opacity:0;fill-opacity:0}
 /* 判据可视化：末端 → 它最近的那条线，标出实际用来判断的距离。
    开 Debug 才显示 —— 平时不该挡住图。 */
 /* 全部线型（调试层）。这是**旁路视图**，不参与产品口径：正常视图只画被指到
@@ -196,6 +205,11 @@ rect.bx.bx-plc:hover,rect.bx.bx-plc.pick{fill:rgba(124,58,237,.62);
 .al-line.al-focus{stroke-width:4.4;stroke-opacity:1;
                   filter:drop-shadow(0 0 2px rgba(0,0,0,.35))}
 .al-line.al-dim{stroke-opacity:0}
+.al-pattern{fill:rgba(255,255,255,.035);stroke-width:1.8;stroke-opacity:.95;
+            stroke-dasharray:6 4;pointer-events:none;vector-effect:non-scaling-stroke}
+.al-pattern.al-focus{stroke-width:3;stroke-opacity:1;
+                     filter:drop-shadow(0 0 2px rgba(0,0,0,.4))}
+.al-pattern.al-dim{stroke-opacity:0;fill-opacity:0}
 /* residual = 有 ink 但不属于任何线型。灰色、细、压在下面 —— 它是「这里确实
    没有线型」的直接证据，不是结果。 */
 .al-resid{fill:none;stroke:#64748b;stroke-width:1;stroke-opacity:.5;
@@ -617,6 +631,50 @@ let LT_NODES=new Map();        // 线型编号 -> [polyline 节点]
 let LT_INDEX={types:[],rows:[],orphans:[],orphanNumbers:new Set(),
               scopesByNumber:new Map(),numberByScope:new Map()};
 
+function lineTypeSourceLabel(type){
+  if(type&&type.recovered_from_fusion)return 'Method 1 recovered';
+  const source=String((type&&type.recognition_source)||'').toLowerCase();
+  if(source==='method1')return 'Method 1';
+  if(source==='method2')return 'Method 2';
+  return source||'Source unknown';
+}
+
+/* pattern_instances 是后端从 Method 2 audit 中只投影
+   line_type_confirmed=true 的 region_instances 得到的。前端再 fail-closed
+   地限定 source=method2 和合法页面帧 bbox：即使 Method 1 类型意外带了
+   同名字段，也不会被画成 Method 2。 */
+function method2PatternInstances(type){
+  if(String((type&&type.recognition_source)||'').toLowerCase()!=='method2')return [];
+  const instances=Array.isArray(type&&type.pattern_instances)
+    ?type.pattern_instances:[];
+  return instances.filter(instance=>{
+    const box=instance&&instance.bbox;
+    if(!Array.isArray(box)||box.length!==4)return false;
+    const q=box.map(Number);
+    return q.every(Number.isFinite)&&q[2]>q[0]&&q[3]>q[1];
+  });
+}
+
+function appendPatternInstanceBox(parent,instance,cls,color,number,W,H,dataKey){
+  const box=instance.bbox.map(Number);
+  const rc=document.createElementNS(NS,'rect');
+  rc.setAttribute('x',(box[1]/1000*W).toFixed(1));
+  rc.setAttribute('y',(box[0]/1000*H).toFixed(1));
+  rc.setAttribute('width',Math.max((box[3]-box[1])/1000*W,2).toFixed(1));
+  rc.setAttribute('height',Math.max((box[2]-box[0])/1000*H,2).toFixed(1));
+  rc.setAttribute('class',cls); rc.setAttribute('stroke',color);
+  rc.dataset[dataKey]=number; rc.dataset.pattern='confirmed';
+  if(instance.region_id!=null)rc.dataset.region=String(instance.region_id);
+  const bits=['Method 2 confirmed repeated pattern'];
+  if(instance.literal_text)bits.push(String(instance.literal_text));
+  if(instance.pattern_source)bits.push(String(instance.pattern_source));
+  if(instance.group_id!=null)bits.push('Group '+instance.group_id);
+  const ti=document.createElementNS(NS,'title');
+  ti.textContent=bits.join(' · '); rc.appendChild(ti);
+  parent.appendChild(rc);
+  return rc;
+}
+
 function buildLinetypeIndex(){
   LT_NODES=new Map();
   LT_INDEX={types:[],rows:[],orphans:[],orphanNumbers:new Set(),
@@ -646,6 +704,8 @@ function buildLinetypeIndex(){
       LT_INDEX.orphans.push({
         scopeId:null, text:String(g.text||'(No text)'), number:number,
         family:meta0.signature_family||'', segments:meta0.segment_count||0,
+        source:lineTypeSourceLabel(meta0),
+        patternCount:method2PatternInstances(meta0).length,
         terminals:(g.in_plan_count||0),
       });
       LT_INDEX.orphanNumbers.add(number);
@@ -661,6 +721,8 @@ function buildLinetypeIndex(){
       scopeId:scope.id, text:scope.text, gate:!!scope.gate, number:number,
       family:meta.signature_family||'', segments:meta.segment_count||0,
       recovered:!!meta.recovered_from_fusion,
+      source:lineTypeSourceLabel(meta),
+      patternCount:method2PatternInstances(meta).length,
       terminals:(g.in_plan_count||0), votes:g.votes_in_plan||{},
       // 同型但没接上的走线，没被任何末端指到（不画，但要说出来）。
       droppedRuns:dropped.length,
@@ -1829,10 +1891,17 @@ function build(){
       gLt.appendChild(ln);
       nodes.push(ln);
     }
+    const patternInstances=method2PatternInstances(t);
+    for(const instance of patternInstances){
+      const rc=appendPatternInstanceBox(
+        gLt,instance,'lt-pattern',color,t.line_type_number,W,H,'lt');
+      nodes.push(rc);
+    }
     const ti=document.createElementNS(NS,'title');
     ti.textContent='Line types #'+t.line_type_number+' · '+(t.signature_family||'')
       +' · '+(t.segment_count||0)+'  segments'
-      +(t.recovered_from_fusion?' · method1 recovered (collateral of fusion)':'');
+      +' · '+lineTypeSourceLabel(t)
+      +(patternInstances.length?(' · '+patternInstances.length+' confirmed patterns'):'');
     gLt.appendChild(ti);
     LT_NODES.set(t.line_type_number,nodes);
   }
@@ -1999,6 +2068,7 @@ for(const [tg] of LAYERS){
     if(tg==='tgAll'&&$('tgAll').querySelector('input').checked){
       ensureAllLinetypes(); return;
     }
+    if(tg==='tgAll')renderList();
     syncLayers();
   });
 }
@@ -2250,6 +2320,11 @@ function drawAllLinetypes(){
       const ln=poly(gAll,line,'al-line',color);
       if(ln){ln.dataset.al=t.line_type_number;nodes.push(ln)}
     }
+    for(const instance of method2PatternInstances(t)){
+      const rc=appendPatternInstanceBox(
+        gAll,instance,'al-pattern',color,t.line_type_number,W,H,'al');
+      nodes.push(rc);
+    }
     ALL_NODES.set(t.line_type_number,nodes);
   }
   applyAllFocus();
@@ -2303,14 +2378,15 @@ function focusAllType(number,fly){
 
 function showAllTypeDetail(t){
   const bound=(t.bound_by||[]);
+  const patternCount=method2PatternInstances(t).length;
   const bits=[(t.signature_family||'?'),
-              'source '+(t.recognition_source||'?')
-              +(t.recovered_from_fusion?' (recovered after fusion dropped it)':''),
+              'source '+lineTypeSourceLabel(t),
               (t.op_count||0)+' op',(t.segment_count||0)+'  segments',
               (t.runs||[]).length+'  runs',
               'members '+(t.member_count||0),
               'min_sim '+(t.minimum_pair_similarity==null?'?'
                           :Number(t.minimum_pair_similarity).toFixed(4))];
+  if(patternCount)bits.push(patternCount+' confirmed pattern instances boxed');
   if(t.support_only)bits.push('support only — no vector stroke to draw');
   if(t.clipped_ops)bits.push(t.clipped_ops+' op  clipped');
   if((t.groups||[]).length)bits.push((t.groups||[]).length+'  engine groups');
@@ -2392,8 +2468,9 @@ function renderAllSection(box){
                 t.support_only?'support only — no vector stroke'
                               :(t.segment_count||0)+'  segments'];
     if((t.runs||[]).length>1)meta.push((t.runs||[]).length+'  runs');
-    if(t.recovered_from_fusion)meta.push('method1 recovered');
-    else meta.push(t.recognition_source||'');
+    meta.push(lineTypeSourceLabel(t));
+    const patternCount=method2PatternInstances(t).length;
+    if(patternCount)meta.push(patternCount+' confirmed patterns boxed');
     const bound=(t.bound_by||[]).length;
     b.innerHTML='<i class="al-sw" style="background:'
       +alColor(t.line_type_number)+'"></i><span class="scope-copy">'
@@ -2462,10 +2539,12 @@ function renderList(){
       const meta=['Line types #'+row.number];
       if(row.family)meta.push(row.family);
       meta.push(row.segments+'  segments');
+      meta.push(row.source);
+      if(row.patternCount)meta.push(row.patternCount+' confirmed patterns boxed');
       if(row.terminals)meta.push(row.terminals+'  terminals');
       // 这个线型是 fusion 连带丢弃后补回来的（method1 认领、
       // method2 从未认领、fused 却无主）。标出来，免得当成 fused 同源。
-      if(row.recovered)meta.push('method1 recovered');
+      if(row.recovered)meta.push('restored after fusion dropped it');
       // 跨组合并出来的同型区域，没被指到的不画 —— 但要让人看得见有多少。
       if(row.droppedRuns)
         meta.push('plus  '+row.droppedRuns+'  more runs of the same type are not pointed at ('
@@ -2483,7 +2562,8 @@ function renderList(){
       d.className='scope-item fence lt-row lt-orphan';
       d.innerHTML='<i class="scope-dot fence"></i><span class="scope-copy">'
         +'<span class="scope-text">'+esc(row.text)+'</span><span class="scope-meta">'
-        +esc(['Line types #'+row.number,row.family,row.segments+'  segments',
+        +esc(['Line types #'+row.number,row.family,row.segments+'  segments',row.source,
+              row.patternCount?(row.patternCount+' confirmed patterns boxed'):'',
               'text not in the scope list'].filter(Boolean).join(' · '))
         +'</span></span><span class="scope-n">#'+row.number+'</span>';
       box.appendChild(d);

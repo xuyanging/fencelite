@@ -27,6 +27,7 @@ from .serializer import SerializedGroup, serialize_path
 
 
 _LOCAL_KEY_SEPARATOR = "\0"
+_INLINE_FEET_LABEL = re.compile(r"^\d{1,3}(?:\.\d{1,3})?\s*['\u2019\u2032]$")
 
 
 def _local_key(group_id: str, type_id: str) -> str:
@@ -39,6 +40,19 @@ def _sorted_unique(values: Iterable[int]) -> tuple[int, ...]:
 
 def _normalized_line_label(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip()).upper()
+
+
+def _is_inline_feet_label(text: str) -> bool:
+    """Whether text can be the numeric inline pattern protected below.
+
+    The compound ownership exception exists for the narrow Method2 admission
+    added for authored tokens such as ``8'``.  Ordinary text-labelled lines
+    must retain frozen r10 competition semantics; protecting every compound
+    type caused unrelated utility and hatch families to lose valid coverage
+    across the regression corpus.
+    """
+
+    return _INLINE_FEET_LABEL.fullmatch(_normalized_line_label(text)) is not None
 
 
 def _bounds_center(bounds: BoundsIR) -> tuple[float, float]:
@@ -549,6 +563,29 @@ def augment_text_labeled_line_types(
         ), None)
         if target is None:
             continue
+        target_path_indices = {
+            dense_index
+            for dense_index in target.op_indices
+            if isinstance(
+                context.operation_index.operation(dense_index),
+                PathOperationIR,
+            )
+        }
+        protected_path_indices = (
+            {
+                dense_index
+                for global_type in result.global_types
+                if global_type.signature_family == "compound_path_periodic"
+                and global_type.group_count >= 2
+                for dense_index in global_type.op_indices
+                if isinstance(
+                    context.operation_index.operation(dense_index),
+                    PathOperationIR,
+                )
+            }
+            if _is_inline_feet_label(seed.label)
+            else set()
+        )
         matching_by_group: dict[str, list[int]] = {}
         for dense_index, operation in text_operations:
             if _text_label_key(operation) != seed.label_key:
@@ -572,6 +609,17 @@ def augment_text_labeled_line_types(
                     if (
                         isinstance(operation, PathOperationIR)
                         and _path_style_key(operation) in seed.allowed_path_styles
+                        # Ordinary text labels still resolve local competition
+                        # exactly as frozen r10 did.  A short feet token admitted
+                        # as an inline Method2 pattern may not steal a path from
+                        # a compound identity already proven in multiple Groups:
+                        # on final_plans P3, repeated 8' labels consumed the
+                        # square-post SIDELINE FENCE motif after compound
+                        # matching had joined both areas.
+                        and (
+                            dense_index not in protected_path_indices
+                            or dense_index in target_path_indices
+                        )
                     ):
                         recovered_paths.add(dense_index)
             if len(recovered_texts) >= 2 and len(recovered_paths) >= 2:
