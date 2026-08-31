@@ -49,6 +49,25 @@ def candidate(page=2, *, slug="demo", sig="arrow+eengine|lt5"):
     )
 
 
+def legend_candidate(page=2, *, slug="demo", sig="legend-sig"):
+    return tool.Candidate(
+        slug=slug,
+        page=page,
+        items=[],
+        arrow_entry={},
+        sig=sig,
+        cache_state="stale",
+        channel="legend",
+        samples=[{
+            "symbol_index": 4,
+            "text_index": 2,
+            "box_2d": [10.0, 20.0, 30.0, 40.0],
+            "value": "8'",
+            "source": "vlm",
+        }],
+    )
+
+
 class RefreshStateTests(unittest.TestCase):
     def test_writer_atomically_publishes_complete_contract(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -131,6 +150,52 @@ class RefreshStateTests(unittest.TestCase):
                 refresh_state.page_refresh_status("demo", 4, state),
                 "running")
 
+    def test_channel_filter_distinguishes_two_jobs_on_the_same_page(self):
+        state = {
+            "schema": refresh_state.STATE_SCHEMA,
+            "kind": refresh_state.STATE_KIND,
+            "heartbeat_at": time.time(),
+            "engine": "engine",
+            "phase": "waiting",
+            "queued": [{"slug": "demo", "page": 4,
+                        "channel": "legend"}],
+            "active": [{"slug": "demo", "page": 4,
+                        "channel": "arrow"}],
+        }
+        with mock.patch.object(refresh_state, "current_engine_short",
+                               return_value="engine"):
+            self.assertEqual(refresh_state.page_refresh_status(
+                "demo", 4, state, channel="arrow"), "running")
+            self.assertEqual(refresh_state.page_refresh_status(
+                "demo", 4, state, channel="legend"), "waiting")
+            self.assertEqual(refresh_state.page_refresh_status(
+                "demo", 4, state), "running")
+            self.assertIsNone(refresh_state.page_refresh_status(
+                "demo", 4, state, channel="not-a-channel"))
+
+    def test_engine_identity_covers_arrow_and_legend_producers(self):
+        with mock.patch.object(refresh_state.sidecar, "engine_digest",
+                               return_value="arrow-a"), \
+                mock.patch.object(
+                    refresh_state.legend_sidecar, "producer_digest",
+                    return_value="legend-a"):
+            baseline = refresh_state.current_engine_short()
+        with mock.patch.object(refresh_state.sidecar, "engine_digest",
+                               return_value="arrow-b"), \
+                mock.patch.object(
+                    refresh_state.legend_sidecar, "producer_digest",
+                    return_value="legend-a"):
+            arrow_changed = refresh_state.current_engine_short()
+        with mock.patch.object(refresh_state.sidecar, "engine_digest",
+                               return_value="arrow-a"), \
+                mock.patch.object(
+                    refresh_state.legend_sidecar, "producer_digest",
+                    return_value="legend-b"):
+            legend_changed = refresh_state.current_engine_short()
+
+        self.assertNotEqual(baseline, arrow_changed)
+        self.assertNotEqual(baseline, legend_changed)
+
 
 class InventoryTests(unittest.TestCase):
     def test_current_signature_failures_are_not_retried(self):
@@ -150,6 +215,8 @@ class InventoryTests(unittest.TestCase):
             mock.patch.object(tool, "project_slugs", return_value=["demo"]),
             mock.patch.object(tool.job, "_linetype_jobs",
                               return_value=(raw_jobs, ["upstream warning"])),
+            mock.patch.object(tool.job, "_legend_linetype_jobs",
+                              return_value=([], [])),
             mock.patch.object(tool.linetypes, "load_page",
                               side_effect=lambda _slug, page: cache[page]),
         ):
@@ -159,8 +226,52 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual([row.cache_state for row in found.candidates],
                          ["stale", "missing", "stale"])
         self.assertEqual(found.current_failures, [{
-            "slug": "demo", "page": 1, "error": "deterministic failure"}])
+            "slug": "demo", "page": 1, "channel": "arrow",
+            "error": "deterministic failure"}])
         self.assertEqual(found.warnings, ["demo: upstream warning"])
+
+    def test_inventory_queues_arrow_and_legend_for_the_same_page(self):
+        arrow_job = (3, ["items"], {"arrow": 1}, "arrow-sig")
+        samples = [{"symbol_index": 2, "box_2d": [1, 2, 3, 4]}]
+        legend_job = (3, samples, "legend-sig")
+        with (
+            mock.patch.object(tool, "project_slugs", return_value=["demo"]),
+            mock.patch.object(tool.job, "_linetype_jobs",
+                              return_value=([arrow_job], [])),
+            mock.patch.object(tool.job, "_legend_linetype_jobs",
+                              return_value=([legend_job], [])),
+            mock.patch.object(tool.linetypes, "load_page", return_value=None),
+            mock.patch.object(tool.legend_linetypes, "load_page",
+                              return_value=None),
+        ):
+            found = tool.inventory()
+
+        self.assertEqual(
+            [(row.page, row.channel) for row in found.candidates],
+            [(3, "arrow"), (3, "legend")])
+        self.assertIs(found.candidates[1].samples, samples)
+        public = found.public()
+        self.assertEqual(
+            [(row["page"], row["channel"])
+             for row in public["candidates"]],
+            [(3, "arrow"), (3, "legend")])
+        self.assertEqual(public["channels"]["arrow"]["eligible"], 1)
+        self.assertEqual(public["channels"]["legend"]["eligible"], 1)
+
+    def test_current_legend_failure_is_terminal_for_this_signature(self):
+        raw_job = (9, ["samples"], "legend-current")
+        with mock.patch.object(tool.legend_linetypes, "load_page",
+                               return_value={
+                                   "sig": "legend-current",
+                                   "error": "deterministic matcher failure",
+                               }):
+            row, failure = tool._legend_candidate("demo", raw_job)
+
+        self.assertIsNone(row)
+        self.assertEqual(failure, {
+            "slug": "demo", "page": 9, "channel": "legend",
+            "error": "deterministic matcher failure",
+        })
 
     def test_even_an_empty_current_error_marker_is_terminal(self):
         raw_job = (1, ["items"], {"arrow": 1}, "sig-1")
@@ -235,6 +346,49 @@ class PageExecutionTests(unittest.TestCase):
         self.assertEqual(result.count, 7)
         compute.assert_called_once_with(
             row.slug, row.page, row.items, row.arrow_entry, row.sig)
+        self.assertEqual(result.channel, "arrow")
+
+    def test_legend_recompute_uses_legend_entrypoint_and_success_gate(self):
+        row = legend_candidate()
+        runner = tool.RefreshRunner(clock=lambda: 20.0)
+        entry = {"sig": row.sig, "v": tool.legend_linetypes.VERSION,
+                 "ok": True, "line_types": [], "bindings": []}
+        with (
+            mock.patch.object(tool.job, "_legend_linetype_one",
+                              return_value=(row.page, 4, None)) as compute,
+            mock.patch.object(tool.legend_linetypes, "load_page",
+                              return_value=entry),
+            mock.patch.object(runner, "_candidate_for_page", return_value=(
+                None, "no longer stale/missing with current prerequisites")),
+        ):
+            result = runner._run_candidate(row)
+
+        self.assertEqual(result.state, "completed")
+        self.assertEqual(result.channel, "legend")
+        self.assertEqual(result.count, 4)
+        compute.assert_called_once_with(
+            row.slug, row.page, row.samples, row.sig)
+
+    def test_legend_success_return_is_rejected_without_explicit_ok(self):
+        row = legend_candidate()
+        runner = tool.RefreshRunner(clock=lambda: 20.0)
+        with (
+            mock.patch.object(tool.job, "_legend_linetype_one",
+                              return_value=(row.page, 1, None)),
+            mock.patch.object(tool.legend_linetypes, "load_page",
+                              return_value={
+                                  "sig": row.sig,
+                                  "v": tool.legend_linetypes.VERSION,
+                                  "line_types": [],
+                              }),
+            mock.patch.object(runner, "_candidate_for_page",
+                              return_value=(row, None)),
+        ):
+            result = runner._run_candidate(row)
+
+        self.assertEqual(result.state, "failed")
+        self.assertEqual(result.channel, "legend")
+        self.assertIn("post-write validation", result.error)
 
     def test_success_return_is_rejected_when_cache_is_not_current(self):
         row = candidate()
@@ -296,6 +450,8 @@ class PageExecutionTests(unittest.TestCase):
                        for item in state.get("queued", [])]
         self.assertTrue(queued_rows)
         self.assertTrue(all("sig" not in item for item in queued_rows))
+        self.assertTrue(all(item["channel"] == "arrow"
+                            for item in queued_rows))
 
     def test_card_appearing_during_revalidation_defers_the_submit(self):
         row = candidate()

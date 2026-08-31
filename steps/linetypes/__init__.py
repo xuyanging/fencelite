@@ -29,9 +29,10 @@
 * **只发布被指到的线型**。gladstone P2 实测全页 12 个线型，其中一个就有 725 条
   op / 4350 段；全发是 1 MB+ 的 SVG。真正被指到的只有 1~2 个。所以「用重复指代
   排除无关线型」既是产品口径，也是这层能上前端的前提。
-* **一页只有 38% 的 path op 属于任何线型**（P2 实测 1311/3414）。所以判据是
-  「拥有离 tip 最近那条 op 的簇」而不是「最近的簇」，最近的 op 是 residual 时
-  就给 residual —— 详见 bind.py。
+* **一页只有 38% 的 path op 属于任何线型**（P2 实测 1311/3414）。因此最近
+  path op 仍作为审计证据；若它是 residual，则只在更严格的 12 pt 范围内回退到
+  最近的已识别线型。这样箭头先碰到载线/边框时不会漏掉几 pt 外的周期图案，也
+  不会吸附到远处无关簇 —— 详见 bind.py。
 * **失败必须落盘成"被当期判据拒绝的形状"**：写 ``{sig, v, error}`` 且**不带
   ``page``/``bindings``**，于是 has_current_linetypes 判假、下次自动重试。写成
   成功形状就是永久假缓存。
@@ -325,13 +326,36 @@ def all_payload(all_entry, main_entry=None):
     没被选中」和「压根没有」的分界，必须在列表里一眼看到。
     """
     bound = {}
+    precision = float(((main_entry or {}).get("page") or {})
+                      .get("tip_precision_pt") or 0.0)
     for row in (main_entry or {}).get("bindings") or ():
         number = row.get("line_type_number")
+        distance = row.get("distance_to_type")
+        # Read-time binding rules can legitimately advance without rerunning
+        # the expensive clustering cache.  In that case an old row may still
+        # carry ``line_type_number=None`` even though its retained nearest-op
+        # evidence now passes the current guard (final P3's 8' H FENCE).
+        if number is None:
+            state, candidate, current_distance = bind.verdict_of(
+                row, precision)
+            if state == "bound":
+                number = candidate
+                distance = current_distance
         if number is None:
             continue
+        key = row.get("key")
+        if row.get("source") == "legend_template":
+            binding_kind = "legend_sample"
+        elif regroup.symbol_index_of(key) is not None:
+            binding_kind = "symbol_callout"
+        elif isinstance(key, int) or str(key).lstrip("-").isdigit():
+            binding_kind = "text_callout"
+        else:
+            binding_kind = "unknown"
         bound.setdefault(int(number), []).append(
             {"key": row.get("key"), "ti": row.get("ti"),
-             "distance": row.get("distance_to_type")})
+             "distance": distance, "binding_kind": binding_kind,
+             "source": row.get("source")})
     types = []
     for row in all_entry.get("types") or ():
         keep = {key: value for key, value in row.items() if key != "by_run"}

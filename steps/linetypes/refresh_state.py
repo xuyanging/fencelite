@@ -17,6 +17,7 @@ would be mistaken for a resumable project.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import threading
 import time
@@ -25,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from steps import store
+from steps.legend_linetypes import sidecar as legend_sidecar
 from steps.linetypes import sidecar
 
 STATE_SCHEMA = 1
@@ -94,18 +96,24 @@ def is_fresh(state, *, now: float | None = None,
 
 
 def current_engine_short() -> str:
-    """Engine identity used to scope signature-free public queue rows.
+    """Combined producer identity for signature-free public queue rows.
 
     Queue/active rows intentionally omit their full (potentially bulky and
-    input-specific) line-type signature.  A top-level engine identity is
-    sufficient for the web read helper because the worker revalidates the
-    page's complete production signature immediately before submitting it.
+    input-specific) channel signature.  The worker repairs both ordinary
+    arrow-bound caches and supervised legend caches, so the heartbeat must be
+    invalidated when *either* producer changes.  Otherwise a web process from
+    a new deploy could mistake an old worker's legend row for current work.
     """
-    digest = str(sidecar.engine_digest())
-    return hashlib.sha1(digest.encode()).hexdigest()[:12]
+    payload = {
+        "arrow": str(sidecar.engine_digest()),
+        "legend": str(legend_sidecar.producer_digest()),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()[:12]
 
 
-def page_refresh_status(slug, page, state=None):
+def page_refresh_status(slug, page, state=None, *, channel=None):
     """Return ``queued``, ``running``, ``waiting``, or ``None`` for a page.
 
     Only a fresh status file from the current line-type engine is trusted.
@@ -113,6 +121,10 @@ def page_refresh_status(slug, page, state=None):
     worker is temporarily in its global ``waiting`` phase (already-started
     pages are deliberately allowed to finish).  A queued row is ``waiting``
     while foreground upload/rerun cards pause new starts, otherwise ``queued``.
+
+    ``channel`` may be ``"arrow"`` or ``"legend"`` to disambiguate the two
+    independent cache jobs on the same sheet.  Omitting it retains the legacy
+    page-level view and reports activity in either channel.
     """
     value = load_state() if state is None else state
     if (not isinstance(value, dict)
@@ -129,9 +141,15 @@ def page_refresh_status(slug, page, state=None):
         return None
     if wanted_page < 1:
         return None
+    if channel is not None:
+        channel = str(channel).strip().lower()
+        if channel not in ("arrow", "legend"):
+            return None
 
     def matches(row):
         if not isinstance(row, dict) or row.get("slug") != slug:
+            return False
+        if channel is not None and row.get("channel") != channel:
             return False
         try:
             return int(row.get("page")) == wanted_page

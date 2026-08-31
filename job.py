@@ -75,7 +75,7 @@ from core.config import (MODEL_NAME, PRICING, PROJECTS_DIR, compute_cost,
 from core.gemini import (RECORDER, is_timeout_error,
                          should_retry_model_error)
 from core.pdfio import FITZ_LOCK
-from steps import arrows, linetypes
+from steps import arrows, legend_linetypes, linetypes
 from steps.debug import DebugSink
 from steps.store import (DATA_DIR, JOBS_DIR, is_valid_slug, items_of, load_json,
                          pdf_path, pdf_revision, results_path, save_json,
@@ -2020,6 +2020,46 @@ def _linetype_jobs(slug):
     return jobs, warnings
 
 
+def _legend_linetype_jobs(slug):
+    """Schedule every current, explicitly boxed legend line sample.
+
+    This is deliberately independent from ``arrows.json`` and placements.  A
+    legend swatch is itself the supervised anchor, so requiring an arrow
+    terminal (or a shape placement) would silently restore the exact missing
+    pipeline edge this channel exists to fill.
+    """
+    from steps.symbols import has_current_symbols
+
+    res = load_json(results_path(slug), None)
+    pdf = pdf_path(slug)
+    if not res or not pdf.exists():
+        return [], []
+    revision = pdf_revision(pdf)
+    symbols = load_json(slug_dir(slug) / "symbols.json", {})
+    jobs, warnings = [], []
+    for pstr, rec in sorted(res.get("pages", {}).items(),
+                            key=lambda pair: int(pair[0])):
+        items = items_of(rec)
+        if not items:
+            continue
+        symbol_entry = symbols.get(pstr)
+        if not has_current_symbols(symbol_entry, sig_of(items, revision)):
+            # Symbol detection owns the warning for a stale/failed page.  Do
+            # not duplicate it here; merely refuse to consume stale boxes.
+            continue
+        result = (symbol_entry or {}).get("result") or {}
+        samples = legend_linetypes.samples_of(result)
+        if not samples:
+            continue
+        sig = legend_linetypes.signature(revision, samples)
+        page = int(pstr)
+        if legend_linetypes.has_current(
+                legend_linetypes.load_page(slug, page), sig):
+            continue
+        jobs.append((page, samples, sig))
+    return jobs, warnings
+
+
 def _linetype_timeout_for(slug, page, arrow_entry):
     """Choose a bounded deadline without penalising genuinely huge sheets."""
     geometry = (arrow_entry or {}).get("geometry")
@@ -2034,6 +2074,26 @@ def _linetype_timeout_for(slug, page, arrow_entry):
     try:
         paths = int(geometry.get("vector_paths") or 0)
     except (TypeError, ValueError):
+        return LINETYPE_DENSE_TIMEOUT
+    return (LINETYPE_DENSE_TIMEOUT
+            if paths >= LINETYPE_DENSE_PATHS else LINETYPE_TIMEOUT)
+
+
+def _legend_linetype_timeout_for(slug, page):
+    """Choose the legend sidecar deadline from the PDF, never arrow cache.
+
+    Legend work must remain schedulable when a page has no callout/terminal and
+    therefore no ``arrows.json`` entry.  ``page_geometry_status`` is the same
+    cheap MuPDF count used by the arrow stage; failure favours recall and uses
+    the dense budget.
+    """
+    try:
+        geometry = arrows.page_geometry_status(pdf_path(slug), int(page) - 1)
+    except Exception:                                      # noqa: BLE001
+        return LINETYPE_DENSE_TIMEOUT
+    try:
+        paths = int((geometry or {}).get("vector_paths") or 0)
+    except (AttributeError, TypeError, ValueError):
         return LINETYPE_DENSE_TIMEOUT
     return (LINETYPE_DENSE_TIMEOUT
             if paths >= LINETYPE_DENSE_PATHS else LINETYPE_TIMEOUT)
@@ -2078,6 +2138,15 @@ def _linetype_retryable(error):
     return "SourceAlignmentError" not in message
 
 
+def _legend_linetype_retryable(error):
+    """Apply the ordinary bounded policy plus legend structured errors."""
+    if not _linetype_retryable(error):
+        return False
+    return re.search(
+        r"legend line-type sidecar [A-Z][A-Z0-9_]+:",
+        str(error)) is None
+
+
 def _linetype_job_still_current(slug, page, sig):
     """Return whether this captured sheet/signature is still schedulable.
 
@@ -2090,6 +2159,13 @@ def _linetype_job_still_current(slug, page, sig):
     """
     jobs, _warnings = _linetype_jobs(slug)
     return any(candidate[0] == int(page) and candidate[3] == sig
+               for candidate in jobs)
+
+
+def _legend_linetype_job_still_current(slug, page, sig):
+    """Whether the captured supervised samples are still the current work."""
+    jobs, _warnings = _legend_linetype_jobs(slug)
+    return any(candidate[0] == int(page) and candidate[2] == sig
                for candidate in jobs)
 
 
@@ -2146,6 +2222,64 @@ def _linetype_one(slug, page, items, arrow_entry, sig, should_cancel=None):
         return page, len(entry.get("used_all") or ()), None
 
 
+def _legend_linetype_one(slug, page, samples, sig, should_cancel=None):
+    """Extract and match one page's supervised legend swatches.
+
+    The successful cache is owned by :mod:`steps.legend_linetypes`; a failure
+    marker intentionally omits ``ok: true`` so ``has_current`` rejects it and
+    a later run retries.  Both generations are guarded by the same stable page
+    lock as ordinary line-type work, preventing two heavy engines from parsing
+    one sheet concurrently in different web/backfill processes.
+    """
+    with _linetype_page_lock(slug, page, cancelled=should_cancel):
+        _raise_if_cancelled(should_cancel)
+        if not _legend_linetype_job_still_current(slug, page, sig):
+            return page, 0, None
+
+        entry = None
+        error = None
+        timeout = _legend_linetype_timeout_for(slug, page)
+        for attempt in range(RETRIES + 1):
+            try:
+                with _slot_pool(
+                        "heavy-sidecar", HEAVY_SIDECAR_SLOTS).slot(
+                            cancelled=should_cancel):
+                    _raise_if_cancelled(should_cancel)
+                    entry = legend_linetypes.compute_page(
+                        pdf_path(slug), page, samples, sig=sig,
+                        timeout=timeout)
+                break
+            except SlotWaitCancelled as exc:
+                raise Cancelled() from exc
+            except Cancelled:
+                raise
+            except Exception as exc:                        # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"
+                if attempt < RETRIES and _legend_linetype_retryable(exc):
+                    _retry_pause(5 * (attempt + 1), should_cancel)
+                else:
+                    break
+
+        # A symbol re-detection can replace the supervised box while this
+        # dense page is running.  Never publish either generation against a
+        # superseded sample signature.
+        if not _legend_linetype_job_still_current(slug, page, sig):
+            return page, 0, None
+
+        if entry is not None and (
+                not isinstance(entry, dict) or entry.get("ok") is not True):
+            error = "legend line-type sidecar returned no successful payload"
+            entry = None
+        if entry is None:
+            error = error or "legend line-type sidecar returned no result"
+            entry = {"sig": sig, "v": legend_linetypes.VERSION,
+                     "error": error}
+        legend_linetypes.save_page(slug, page, entry)
+        if entry.get("ok") is not True:
+            return page, None, error
+        return page, len(entry.get("line_types") or ()), None
+
+
 def materialize_all_linetypes(slug, page, sig):
     """Build the optional all-line-types geometry for one current main result.
 
@@ -2184,29 +2318,40 @@ def materialize_all_linetypes(slug, page, sig):
 
 
 def _stage_linetypes(slug, on_progress=None, should_cancel=None):
-    """箭头末端框里那一种线，在全页高亮出来（本地矢量 + 独立 venv 边车）。
+    """Run arrow-bound and supervised-legend line matching together.
 
     页级并发由 ``LINETYPE_PAGE_WORKERS`` 控制（生产前台为 2）；每个线程等待一个
     单页边车，边车内部再按 ``LINETYPE_CPU_BUDGET`` 使用 worker 预算（生产前台 4，
     低优先级 refresh 2）。每页独立缓存，并受跨进程页锁与共享 heavy slot 保护。
     """
-    jobs, warnings = _linetype_jobs(slug)
-    print(f"linetype jobs: {len(jobs)}  page_workers={LINETYPE_PAGE_WORKERS}",
-          flush=True)
+    # ARROWS=0 used to mean the ordinary terminal-bound channel never ran.
+    # Keep that feature-toggle contract even though the independent supervised
+    # legend channel now makes this stage reachable without arrows.
+    jobs, warnings = (_linetype_jobs(slug) if arrows.ENABLED else ([], []))
+    legend_jobs, legend_warnings = _legend_linetype_jobs(slug)
+    warnings.extend(legend_warnings)
+    total_jobs = len(jobs) + len(legend_jobs)
+    print(f"linetype jobs: {len(jobs)} arrow + {len(legend_jobs)} legend  "
+          f"page_workers={LINETYPE_PAGE_WORKERS}", flush=True)
     if on_progress:
-        on_progress(0, len(jobs))
+        on_progress(0, total_jobs)
     total = 0
+    legend_total = 0
     done = 0
     # 页级并行。每个线程只是等一个边车子进程，GIL 不碍事；真正吃 CPU 的是
     # 子进程。串行时实测整机 CPU 只有 13~16%（16 核 / 32 线程），因为单页内部
     # 有大段单线程阶段（PageIR 抽取、序列化、进程启停），并行跑多页正好把这些
     # 空档填上。一页一个缓存文件，所以并发写盘不会互相等。
     with ThreadPoolExecutor(max_workers=max(1, LINETYPE_PAGE_WORKERS)) as pool:
-        futures = {
-            pool.submit(
-                _linetype_one, slug, *page_job, should_cancel): page_job[0]
-            for page_job in jobs
-        }
+        futures = {}
+        for page_job in jobs:
+            future = pool.submit(
+                _linetype_one, slug, *page_job, should_cancel)
+            futures[future] = ("arrow", page_job[0])
+        for page_job in legend_jobs:
+            future = pool.submit(
+                _legend_linetype_one, slug, *page_job, should_cancel)
+            futures[future] = ("legend", page_job[0])
         heartbeat_stop = threading.Event()
 
         def heartbeat():
@@ -2222,7 +2367,7 @@ def _stage_linetypes(slug, on_progress=None, should_cancel=None):
                     return
                 _set(
                     slug,
-                    detail=(f"Line-type engine active: {done}/{len(jobs)} "
+                    detail=(f"Line-type engine active: {done}/{total_jobs} "
                             f"sheets finished, {remaining} remaining "
                             f"(per-sheet limit {LINETYPE_TIMEOUT}s; dense "
                             f"{LINETYPE_DENSE_TIMEOUT}s)"))
@@ -2231,7 +2376,7 @@ def _stage_linetypes(slug, on_progress=None, should_cancel=None):
         heartbeat_thread.start()
         try:
             for future in as_completed(futures):
-                submitted = futures[future]
+                source, submitted = futures[future]
                 if should_cancel and should_cancel():
                     for pending in futures:
                         pending.cancel()
@@ -2243,20 +2388,28 @@ def _stage_linetypes(slug, on_progress=None, should_cancel=None):
                     error = f"{type(exc).__name__}: {exc}"
                 done += 1
                 if on_progress:
-                    on_progress(done, len(jobs))
+                    on_progress(done, total_jobs)
                 if error:
-                    warnings.append(
-                        f"P{page} line-type clustering failed: {error}")
-                    print(f"[{done}/{len(jobs)}] {slug} P{page}: ERROR {error}",
+                    if source == "legend":
+                        warnings.append(
+                            f"P{page} legend line-type matching failed: {error}")
+                    else:
+                        warnings.append(
+                            f"P{page} line-type clustering failed: {error}")
+                    print(f"[{done}/{total_jobs}] {slug} P{page} "
+                          f"({source}): ERROR {error}",
                           flush=True)
                 else:
-                    total += count or 0
-                    print(f"[{done}/{len(jobs)}] {slug} P{page}: "
-                          f"{count} line types", flush=True)
+                    if source == "legend":
+                        legend_total += count or 0
+                    else:
+                        total += count or 0
+                    print(f"[{done}/{total_jobs}] {slug} P{page} "
+                          f"({source}): {count} line types", flush=True)
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1)
-    print(f"linetypes total: {total}", flush=True)
+    print(f"linetypes total: {total} arrow + {legend_total} legend", flush=True)
     return warnings
 
 
@@ -2522,8 +2675,12 @@ def _run_pipeline(slug, target, should_cancel=None):
     guard()
     _snapshot(slug)
 
-    # arrows 关着的时候 placements 直接顶到 1.0；打开时才把尾段一分为二。
-    plc_hi = 0.96 if arrows.ENABLED else 1.0
+    # Legend line samples are independent from arrows.  When only LINETYPES is
+    # on, reserve the same final 2% slice that line types already occupied in
+    # the full chain; when both local seams are off, placements still reaches
+    # 100% exactly as before.
+    plc_hi = (0.96 if arrows.ENABLED else
+              (0.98 if linetypes.ENABLED else 1.0))
     _set(slug, stage="placements",
          detail="Shape placement matching (local, no model)…",
          progress=0.92, stage_done=0, stage_total=0, stage_unit="sheets")
@@ -2532,9 +2689,9 @@ def _run_pipeline(slug, target, should_cancel=None):
         should_cancel=sc)))
     guard()
 
+    linetype_lo = plc_hi
     if arrows.ENABLED:
-        # 线型层吊在箭头结果上（它绑的就是箭头末端），所以只有 arrows 开着时
-        # 才有它的位置；开着时把尾段再一分为二。
+        # 普通线型仍然绑箭头末端；legend 线型走独立的 supervised channel。
         arw_hi = 0.98 if linetypes.ENABLED else 1.0
         _set(slug, stage="arrows", detail="Arrow / leader detection…",
              progress=plc_hi, stage_done=0, stage_total=0,
@@ -2544,17 +2701,19 @@ def _run_pipeline(slug, target, should_cancel=None):
             should_cancel=sc)))
         guard()
         _snapshot(slug)
+        linetype_lo = arw_hi
 
-        if linetypes.ENABLED:
-            _set(slug, stage="linetypes",
-                 detail="Line-type clustering (local sidecar, no model)…",
-                 progress=arw_hi, stage_done=0, stage_total=0,
-                 stage_unit="sheets")
-            _warn(slug, timed("linetypes", lambda: _stage_linetypes(
-                slug, on_progress=_stage_progress(slug, arw_hi, 1.0),
-                should_cancel=sc)))
-            guard()
-            _snapshot(slug)
+    if linetypes.ENABLED:
+        _set(slug, stage="linetypes",
+             detail=("Line-type clustering and legend matching "
+                     "(local sidecar, no model)…"),
+             progress=linetype_lo, stage_done=0, stage_total=0,
+             stage_unit="sheets")
+        _warn(slug, timed("linetypes", lambda: _stage_linetypes(
+            slug, on_progress=_stage_progress(slug, linetype_lo, 1.0),
+            should_cancel=sc)))
+        guard()
+        _snapshot(slug)
 
     _set(slug, stage="done", detail="Done", progress=1.0,
          stage_done=0, stage_total=0, stage_unit=None)

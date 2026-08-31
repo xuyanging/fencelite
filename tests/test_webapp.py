@@ -863,6 +863,97 @@ class LineTypeRefreshStatusTests(WebappCase):
         self.assertEqual(status["state"], "all-gate")
 
 
+class LegendLineTypePublicationTests(WebappCase):
+    """The supervised legend channel publishes without an arrow cache."""
+
+    @staticmethod
+    def _symbol_entry():
+        return {"result": {"symbols": [{
+            "category": "line", "text_index": 0,
+            "box_2d": [20, 700, 24, 760], "value": "8'",
+            "source": "page",
+        }]}}
+
+    @staticmethod
+    def _legend_entry():
+        return {
+            "sig": "legend-current", "v": 1, "ok": True,
+            "page": {"sheet": 1, "base_line_types": 12,
+                     "legend_samples": 1, "legend_matches": 1},
+            "line_types": [{
+                "line_type_number": 3,
+                "base_line_type_number": 3,
+                "recognition_source": "legend_template",
+                "base_recognition_source": "method2",
+                "matched_line_type_numbers": [3],
+                "matched_cluster_sources": {"3": "method2"},
+                "type_uid": "legend:type-three",
+                "line_type_id": "legend:id-three",
+                "by_run": {"lt3:r1": {
+                    "run_id": "lt3:r1", "op_count": 1,
+                    "segment_count": 1, "bbox": [100, 100, 110, 200],
+                    "polylines": [[[100, 100], [110, 200]]],
+                }},
+            }],
+            "bindings": [{
+                "source": "legend_template", "key": "s0:0", "ti": 0,
+                "tip": [105, 150], "tips": [[105, 150]],
+                "matched_runs": ["lt3:r1"],
+                "nearest_op": {"distance": 0.0, "owner": 3,
+                               "run_id": "lt3:r1"},
+                "nearest_owned_op": {"distance": 0.0, "owner": 3,
+                                     "run_id": "lt3:r1"},
+                "ranked": [{"line_type_number": 3, "distance": 0.0}],
+            }],
+            "samples": [{"sample_index": 0}],
+        }
+
+    def _attach(self, publishable):
+        record = {}
+        items = [{"text": "8' HIGH FENCE",
+                  "box_2d": [20, 600, 30, 680]}]
+        symbols = {"1": self._symbol_entry()}
+
+        def load_json(path, default=None):
+            return symbols if Path(path).name == "symbols.json" else {}
+
+        with mock.patch.object(webapp.linetypes, "ENABLED", True), \
+                mock.patch.object(webapp.store, "load_json",
+                                  side_effect=load_json), \
+                mock.patch.object(webapp, "_symbols_publishable",
+                                  return_value=publishable), \
+                mock.patch.object(webapp, "_placement_anchors_for",
+                                  return_value=[]), \
+                mock.patch.object(webapp.arrows, "arrows_signature",
+                                  return_value="arrow-current"), \
+                mock.patch.object(webapp.arrows, "has_current_arrows",
+                                  return_value=False), \
+                mock.patch.object(webapp.legend_linetypes, "signature",
+                                  return_value="legend-current"), \
+                mock.patch.object(webapp.legend_linetypes, "load_page",
+                                  return_value=self._legend_entry()), \
+                mock.patch.object(webapp.legend_linetypes, "has_current",
+                                  return_value=True):
+            webapp._attach_linetypes(
+                record, SLUG, 1, items, "pdf-current",
+                plan_regions=[[0, 0, 500, 500]])
+        return record
+
+    def test_current_legend_sample_publishes_full_type_without_arrows(self):
+        record = self._attach(True)
+        self.assertEqual(record["linetypes_status"]["state"], "ok")
+        self.assertEqual(record["linetypes_status"]["legend_state"], "ok")
+        self.assertEqual(record["linetypes"]["visible"], [3])
+        row = record["linetypes"]["line_types"][0]
+        self.assertEqual(row["recognition_source"], "legend_template")
+        self.assertEqual(row["polylines"], [[[100, 100], [110, 200]]])
+
+    def test_stale_symbol_boxes_cannot_publish_an_old_legend_cache(self):
+        record = self._attach(False)
+        self.assertNotIn("linetypes", record)
+        self.assertEqual(record["linetypes_status"]["state"], "no-arrows")
+
+
 class ImageTests(WebappCase):
     def test_base_image_is_cached_jpeg(self):
         self.make_pdf()

@@ -4,16 +4,17 @@
 This tool intentionally imports and calls the production orchestration
 functions instead of growing a second implementation of line-type execution:
 
-* ``job._linetype_jobs`` is the prerequisite/currentness inventory;
-* ``job._linetype_one`` is the only page recompute path;
-* ``linetypes.has_current_linetypes`` revalidates every successful return.
+* ``job._linetype_jobs`` / ``job._legend_linetype_jobs`` own inventory;
+* ``job._linetype_one`` / ``job._legend_linetype_one`` own recomputation;
+* each channel's cache predicate revalidates every successful return.
 
-Only pages with current results + arrows and at least one terminal are ever
-queued.  A failure entry stamped with the *current* signature is normally
-reported but not retried; the next timer tick would otherwise burn the same
-600/1800 second deadline forever.  The one exception is a recorded timeout
-whose old deadline is lower than the page's current adaptive deadline (for
-example after a density-threshold correction).  A failure from an older engine
+Ordinary jobs still require current results + arrows and at least one terminal.
+Legend jobs instead require a current symbol result with an explicitly boxed
+line sample; they do not depend on arrows.  A failure entry stamped with the
+*current* channel signature is normally reported but not retried; the next
+timer tick would otherwise burn the same deadline forever.  The ordinary
+channel retains its one exception for a recorded timeout whose old deadline is
+lower than the page's current adaptive deadline.  A failure from an older
 signature is stale evidence and is eligible again.
 
 The worker gives uploads priority at page boundaries.  Before every submit it
@@ -45,7 +46,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import job                                                        # noqa: E402
-from steps import linetypes, store                                 # noqa: E402
+from steps import legend_linetypes, linetypes, store               # noqa: E402
 from steps.linetypes.refresh_state import (                        # noqa: E402
     RefreshStateWriter,
     WorkerAlreadyRunning,
@@ -102,9 +103,12 @@ class Candidate:
     arrow_entry: dict
     sig: str
     cache_state: str
+    channel: str = "arrow"
+    samples: list | None = None
 
     def public(self):
         return {"slug": self.slug, "page": self.page,
+                "channel": self.channel,
                 "cache_state": self.cache_state}
 
 
@@ -123,12 +127,20 @@ class Inventory:
             bucket = by_project.setdefault(
                 row.slug, {"stale": [], "missing": []})
             bucket[row.cache_state].append(row.page)
+        channels = {}
+        for row in self.candidates:
+            bucket = channels.setdefault(
+                row.channel, {"eligible": 0, "stale": 0, "missing": 0})
+            bucket["eligible"] += 1
+            bucket[row.cache_state] += 1
         return {
             "eligible": len(self.candidates),
             "stale": stale,
             "missing": missing,
             "current_failures": len(self.current_failures),
             "projects": by_project,
+            "channels": channels,
+            "candidates": [row.public() for row in self.candidates],
             "failure_pages": self.current_failures,
             "warnings": self.warnings,
         }
@@ -142,9 +154,11 @@ class PageResult:
     count: int | None = None
     error: str | None = None
     seconds: float = 0.0
+    channel: str = "arrow"
 
     def public(self):
         value = {"slug": self.slug, "page": self.page,
+                 "channel": self.channel,
                  "state": self.state,
                  "seconds": round(float(self.seconds), 2)}
         if self.count is not None:
@@ -160,6 +174,7 @@ def _current_failure(entry, sig):
 
 
 def _candidate(slug, raw_job):
+    """Build one ordinary arrow-bound candidate (legacy helper name)."""
     page, items, arrow_entry, sig = raw_job
     entry = linetypes.load_page(slug, page)
     if _current_failure(entry, sig):
@@ -184,6 +199,29 @@ def _candidate(slug, raw_job):
     ), None
 
 
+def _legend_candidate(slug, raw_job):
+    """Build one supervised legend candidate, suppressing current failures."""
+    page, samples, sig = raw_job
+    entry = legend_linetypes.load_page(slug, page)
+    if _current_failure(entry, sig):
+        return None, {
+            "slug": slug,
+            "page": int(page),
+            "channel": "legend",
+            "error": str(entry.get("error"))[:500],
+        }
+    return Candidate(
+        slug=slug,
+        page=int(page),
+        items=[],
+        arrow_entry={},
+        sig=sig,
+        cache_state="missing" if entry is None else "stale",
+        channel="legend",
+        samples=samples,
+    ), None
+
+
 def project_slugs(selected=None):
     """Safe, deterministic project enumeration for an inventory pass."""
     if selected:
@@ -199,30 +237,41 @@ def project_slugs(selected=None):
 def inventory(selected=None):
     """Inventory stale/missing pages using production prerequisites.
 
-    ``job._linetype_jobs`` already rejects missing PDFs/results, stale arrows,
-    and pages without terminals.  The only additional policy here is to skip a
-    current-signature error entry.
+    Each production job builder owns its own prerequisites.  The only
+    additional policy here is to skip a current-signature error entry so a
+    deterministic failure cannot consume every timer pass forever.
     """
     candidates = []
     failures = []
     warnings = []
     for slug in project_slugs(selected):
-        try:
-            raw_jobs, project_warnings = job._linetype_jobs(slug)
-        except Exception as exc:                              # noqa: BLE001
-            warnings.append(f"{slug}: inventory failed: "
-                            f"{type(exc).__name__}: {exc}")
-            continue
-        warnings.extend(f"{slug}: {message}"
-                        for message in (project_warnings or ()))
-        for raw_job in raw_jobs:
-            row, failure = _candidate(slug, raw_job)
-            if failure is not None:
-                failures.append(failure)
-            elif row is not None:
-                candidates.append(row)
-    candidates.sort(key=lambda row: (row.slug, row.page))
-    failures.sort(key=lambda row: (row["slug"], row["page"]))
+        channels = (
+            ("arrow", job._linetype_jobs, _candidate),
+            ("legend", job._legend_linetype_jobs, _legend_candidate),
+        )
+        for channel, jobs_fn, candidate_fn in channels:
+            try:
+                raw_jobs, project_warnings = jobs_fn(slug)
+            except Exception as exc:                          # noqa: BLE001
+                prefix = (f"{slug}: inventory failed: " if channel == "arrow"
+                          else f"{slug}: legend inventory failed: ")
+                warnings.append(
+                    f"{prefix}{type(exc).__name__}: {exc}")
+                continue
+            warnings.extend(f"{slug}: {message}"
+                            for message in (project_warnings or ()))
+            for raw_job in raw_jobs:
+                row, failure = candidate_fn(slug, raw_job)
+                if failure is not None:
+                    # The ordinary helper predates channels; add its identity
+                    # here without changing its standalone test/API contract.
+                    failure.setdefault("channel", channel)
+                    failures.append(failure)
+                elif row is not None:
+                    candidates.append(row)
+    candidates.sort(key=lambda row: (row.slug, row.page, row.channel))
+    failures.sort(key=lambda row: (
+        row["slug"], row["page"], row.get("channel", "arrow")))
     return Inventory(candidates, failures, warnings)
 
 
@@ -269,77 +318,112 @@ class RefreshRunner:
             "remaining": 0, "foreground_waits": 0,
         }
 
-    def _candidate_for_page(self, slug, page):
+    def _candidate_for_page(self, slug, page, channel="arrow"):
         """Re-read production prerequisites immediately before a page starts."""
+        if channel == "arrow":
+            jobs_fn, candidate_fn = job._linetype_jobs, _candidate
+        elif channel == "legend":
+            jobs_fn, candidate_fn = (
+                job._legend_linetype_jobs, _legend_candidate)
+        else:
+            return None, f"unknown line-type refresh channel: {channel}"
         try:
-            raw_jobs, _warnings = job._linetype_jobs(slug)
+            raw_jobs, _warnings = jobs_fn(slug)
         except Exception:                                      # noqa: BLE001
             return None, "prerequisite inventory failed"
         for raw in raw_jobs:
             if int(raw[0]) != int(page):
                 continue
-            row, failure = _candidate(slug, raw)
+            row, failure = candidate_fn(slug, raw)
             if failure is not None:
                 return None, "current-signature failure"
             return row, None
         return None, "no longer stale/missing with current prerequisites"
 
+    def _revalidate(self, row):
+        # Preserve the ordinary helper's historical two-argument invocation;
+        # a number of offline callers patch this boundary directly.
+        if row.channel == "arrow":
+            return self._candidate_for_page(row.slug, row.page)
+        return self._candidate_for_page(row.slug, row.page, row.channel)
+
     def _run_candidate(self, row):
         started = self.clock()
         try:
-            page, count, error = job._linetype_one(
-                row.slug, row.page, row.items, row.arrow_entry, row.sig)
+            if row.channel == "legend":
+                page, count, error = job._legend_linetype_one(
+                    row.slug, row.page, row.samples, row.sig)
+            else:
+                page, count, error = job._linetype_one(
+                    row.slug, row.page, row.items, row.arrow_entry, row.sig)
         except Exception as exc:                              # noqa: BLE001
             return PageResult(
                 row.slug, row.page, "failed", error=(
                     f"{type(exc).__name__}: {exc}"),
-                seconds=self.clock() - started)
+                seconds=self.clock() - started,
+                channel=row.channel)
         if error:
             return PageResult(row.slug, page, "failed", error=str(error),
-                              seconds=self.clock() - started)
-        entry = linetypes.load_page(row.slug, page)
-        if not linetypes.has_current_linetypes(entry, row.sig):
-            newer, reason = self._candidate_for_page(row.slug, page)
+                              seconds=self.clock() - started,
+                              channel=row.channel)
+        if row.channel == "legend":
+            entry = legend_linetypes.load_page(row.slug, page)
+            is_current = legend_linetypes.has_current(entry, row.sig)
+        else:
+            entry = linetypes.load_page(row.slug, page)
+            is_current = linetypes.has_current_linetypes(entry, row.sig)
+        if not is_current:
+            newer, reason = self._revalidate(row)
             if newer is not None and newer.sig != row.sig:
                 return PageResult(
                     row.slug, page, "skipped",
                     error="prerequisites changed while the page ran",
-                    seconds=self.clock() - started)
+                    seconds=self.clock() - started,
+                    channel=row.channel)
             if reason == "no longer stale/missing with current prerequisites":
                 return PageResult(
                     row.slug, page, "skipped",
                     error="captured page was superseded while it ran",
-                    seconds=self.clock() - started)
+                    seconds=self.clock() - started,
+                    channel=row.channel)
             return PageResult(
                 row.slug, page, "failed",
-                error=("post-write validation rejected the line-type cache"
+                error=(("post-write validation rejected the line-type cache"
+                        if row.channel == "arrow" else
+                        "post-write validation rejected the legend "
+                        "line-type cache")
                        if newer is not None
                        else reason or "post-write validation failed"),
-                seconds=self.clock() - started)
+                seconds=self.clock() - started,
+                channel=row.channel)
         # If a concurrent project update changed the expected signature while
         # this page ran, _linetype_jobs will queue it again.  Do not claim the
         # old-input result repaired the live page; the next timer pass can pick
         # up the new candidate.
-        newer, reason = self._candidate_for_page(row.slug, page)
+        newer, reason = self._revalidate(row)
         if newer is not None:
             return PageResult(
                 row.slug, page, "skipped",
                 error=("prerequisites changed while the page ran"
                        if newer.sig != row.sig
                        else "page remains stale after a validated write"),
-                seconds=self.clock() - started)
+                seconds=self.clock() - started,
+                channel=row.channel)
         if reason == "current-signature failure":
             return PageResult(
                 row.slug, page, "failed",
                 error="page produced a current-signature failure entry",
-                seconds=self.clock() - started)
+                seconds=self.clock() - started,
+                channel=row.channel)
         if reason != "no longer stale/missing with current prerequisites":
             return PageResult(
                 row.slug, page, "failed",
                 error=reason or "post-write prerequisite validation failed",
-                seconds=self.clock() - started)
+                seconds=self.clock() - started,
+                channel=row.channel)
         return PageResult(row.slug, page, "completed", count=count,
-                          seconds=self.clock() - started)
+                          seconds=self.clock() - started,
+                          channel=row.channel)
 
     def _public_queue(self, pending):
         return [row.public() for row in pending]
@@ -435,12 +519,12 @@ class RefreshRunner:
                         if foreground:
                             break
                         original = pending.popleft()
-                        row, reason = self._candidate_for_page(
-                            original.slug, original.page)
+                        row, reason = self._revalidate(original)
                         if row is None:
                             self._record(PageResult(
                                 original.slug, original.page, "skipped",
-                                error=reason))
+                                error=reason,
+                                channel=original.channel))
                             continue
                         # The prerequisite scan can touch several cache files.
                         # Close the gap between its earlier probe and the
@@ -491,7 +575,8 @@ class RefreshRunner:
                     except Exception as exc:                  # noqa: BLE001
                         result = PageResult(
                             row.slug, row.page, "failed",
-                            error=f"{type(exc).__name__}: {exc}")
+                            error=f"{type(exc).__name__}: {exc}",
+                            channel=row.channel)
                     self._record(result)
 
         failures = self._progress["failed"]

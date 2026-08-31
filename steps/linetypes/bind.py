@@ -1,14 +1,15 @@
 """箭头末端 → 唯一线型 的绑定与投票（纯函数，无引擎依赖、无 IO）.
 
-核心判据（**不是**「最近的线型」）：
+核心判据：
 
-    一个末端的线型 = **拥有离 tip 最近那条 path op 的那个簇**；
-    那条 op 不属于任何簇时，答案是「这里没有线型」。
+    一个有效箭头末端的线型 = **离 tip 最近的已识别线型**；
+    直接命中允许 36 pt，越过 residual 寻找时只允许 12 pt。
 
-为什么不是「最近的线型」：实测 gladstone P2 的 3414 条 path op 里只有 38% 属于
-任何一个全局簇。取"最近的簇"时，经常出现 tip 底下那段 ink 明明是 residual、而
-几 pt 之外有个真簇被选中的情况 —— 截图上完全看不出错，是最坏的一类失败。让
-「没有线型」成为一等答案，比硬凑一个近的出来正确。
+``nearest_op`` 仍保留作几何审计，但 residual 不再否决附近的已识别线型。真实图纸
+里箭头尖端经常先碰到围栏的载线、边框或其他未聚类 ink，而周期图案本身在几 pt
+之外；final_plans P3 的 ``8' H FENCE`` 就是这种情况：最近 residual 为 0.334 pt，
+正确的 Method 2 线型为 3.437 pt。只要最近的有主 op 在 12 pt fallback 护栏内，就采信它；
+没有任何有主 op 时才保留 residual 结论。
 
 另外两条同源的硬要求（都在边车里先做掉）：
 
@@ -36,12 +37,18 @@ from __future__ import annotations
 import re
 import unicodedata
 
-# tip 到最近那条 op 的最大可接受距离，单位 **PDF 点**（边车在等向的 IR 帧里算，
+# tip 直接命中有主 op 的最大可接受距离，单位 **PDF 点**（边车在等向的 IR 帧里算，
 # 见 tools/linetype_sidecar/run.py 的说明；0-1000 页帧是逐轴归一的，各向异性
 # 可达 1.5 倍，在那里比距离会系统性偏爱横向偏移的簇）。
-# 超了说明箭头末端其实没落在任何图元上（引线追歪、末端框飘）。36 pt ≈ 0.5 英寸，
-# 已经很宽松 —— 实测真实末端到正确图元是 0.5~4.3 pt 量级。
+# 超了说明箭头末端离任何已识别线型都太远（引线追歪、末端框飘）。36 pt ≈ 0.5 英寸，
+# 已经很宽松；final_plans P3 两个正确 Method 2 目标分别仅 3.437 / 6.838 pt。
 MAX_BIND_DISTANCE = 36.0
+
+# residual → 最近已识别线型是较弱证据，不能沿用 direct owner 的 36 pt。现有 plan
+# 页旧规则已确认绑定的 fallback 距离 p95=2.537 pt、最大 2.970 pt；final_plans P3
+# 两个确定正确的 Method 2 目标是 3.437 / 6.838 pt。12 pt 给已知正确最大值留约
+# 1.75 倍余量，同时挡住审计中 25 个 12~36 pt 的高风险远距候选。
+MAX_FALLBACK_BIND_DISTANCE = 12.0
 
 # gate / fence 分类。门在图上是单独画的符号，不是周期重复的线型图案，所以
 # **纯 gate 类别不去找线**（产品口径）。但一句话同时明确写了 fence 与 gate
@@ -93,14 +100,13 @@ def verdict_of(row, tip_precision_pt=0.0):
     state ∈
       no-geometry  这页没有任何可比的 path 几何（纯图片页之类）
       too-far      最近的 op 也在 MAX_BIND_DISTANCE 之外，末端没落在图元上
-      residual     tip 指的那段 ink 不属于任何线型
+      residual     附近没有任何已识别线型
       bound        拿到线型
 
-    ``tip_precision_pt``：tip 自身的量化精度（边车按页算，arrows.json 的 tip 是
-    0-1000 页帧整数，半个单位换成 PDF 点）。最近的 op 是 residual、但最近的
-    **有主** op 与它的差距小于这个精度时，二者在输入分辨率之下无法区分，采信
-    有主的那个。这不是调参 —— 是输入格式决定的下限：实测 gladstone P2 上
-    tip 精度 1.22 pt，而 anchor 5 的 residual op 在 0.581 pt、有主 op 在 1.069 pt。
+    ``tip_precision_pt`` 为旧调用协议保留；新口径不再用「有主 op 与 residual 的
+    距离差必须小于 tip 精度」作否决条件。direct owner 仍由
+    ``MAX_BIND_DISTANCE``（36 pt）控制；residual fallback 使用更严格的
+    ``MAX_FALLBACK_BIND_DISTANCE``（12 pt）。
     """
     nearest = row.get("nearest_op")
     if not isinstance(nearest, dict):
@@ -122,8 +128,7 @@ def verdict_of(row, tip_precision_pt=0.0):
         except (TypeError, ValueError):
             owned_distance = None
         if owned_distance is not None \
-                and owned_distance - distance <= float(tip_precision_pt or 0.0) \
-                and owned_distance <= MAX_BIND_DISTANCE:
+                and owned_distance <= MAX_FALLBACK_BIND_DISTANCE:
             return "bound", int(owned["owner"]), owned_distance
     return "residual", None, distance
 

@@ -416,6 +416,49 @@ class TestPipeline(JobTestBase):
         self.assertEqual(job.JOBS["alpha"]["warnings"],
                          ["P3 文字 VLM 失败：boom"])
 
+    def test_linetypes_runs_for_legend_when_arrows_toggle_is_off(self):
+        fake = _FakeStages(self)
+        stage_state = []
+
+        def line_stage(slug, **_kwargs):
+            stage_state.append((job.JOBS[slug]["stage"],
+                                job.JOBS[slug]["progress"]))
+            return []
+
+        with mock.patch.object(job.arrows, "ENABLED", False), \
+                mock.patch.object(job.linetypes, "ENABLED", True), \
+                mock.patch.object(job, "_stage_arrows") as arrow_stage, \
+                mock.patch.object(job, "_stage_linetypes",
+                                  side_effect=line_stage) as line_types:
+            job._run_pipeline("alpha", None, lambda: False)
+
+        self.assertEqual(fake.calls, ["_stage_text", "_stage_symbols",
+                                      "_stage_views", "_stage_placements"])
+        arrow_stage.assert_not_called()
+        line_types.assert_called_once()
+        self.assertEqual(stage_state, [("linetypes", 0.98)])
+        self.assertEqual(job.JOBS["alpha"]["progress"], 1.0)
+
+    def test_full_local_chain_keeps_existing_progress_slices(self):
+        _FakeStages(self)
+        stages = []
+
+        def local_stage(name):
+            def run(slug, **_kwargs):
+                stages.append((name, job.JOBS[slug]["progress"]))
+                return []
+            return run
+
+        with mock.patch.object(job.arrows, "ENABLED", True), \
+                mock.patch.object(job.linetypes, "ENABLED", True), \
+                mock.patch.object(job, "_stage_arrows",
+                                  side_effect=local_stage("arrows")), \
+                mock.patch.object(job, "_stage_linetypes",
+                                  side_effect=local_stage("linetypes")):
+            job._run_pipeline("alpha", None, lambda: False)
+
+        self.assertEqual(stages, [("arrows", 0.96), ("linetypes", 0.98)])
+
 
 class TestRun(JobTestBase):
 
@@ -1325,6 +1368,142 @@ class TestLinetypeCompletionBounds(JobTestBase):
         persist.assert_called_once_with(self.slug, 1, canonical)
         self.assertTrue(job._linetype_page_lock_path(
             self.slug, 1).is_file())
+
+
+class TestLegendLinetypeOrchestration(JobTestBase):
+    """Legend swatches are a supervised line-type channel, not arrow jobs."""
+
+    def setUp(self):
+        super().setUp()
+        self.slug = job.create_project(b"%PDF-1.4 fake", "legend-lines.pdf")
+        self.rec = _page_rec()
+        self.items = store.items_of(self.rec)
+        self.revision = store.pdf_revision(store.pdf_path(self.slug))
+        self.symbol_sig = store.sig_of(self.items, self.revision)
+        store.save_json(store.results_path(self.slug), {
+            "slug": self.slug, "fused_v": 2, "page_count": 1,
+            "pages": {"1": self.rec},
+        })
+        symbol_entry = _symbol_entry(
+            self.symbol_sig, [dict(LINE_SYM)], [LEGEND_GROUP])
+        store.save_json(store.slug_dir(self.slug) / "symbols.json", {
+            "1": symbol_entry,
+        })
+        self.samples = job.legend_linetypes.samples_of(symbol_entry["result"])
+        self.sig = job.legend_linetypes.signature(
+            self.revision, self.samples)
+
+    def test_jobs_need_current_line_symbols_but_no_arrows_or_placements(self):
+        self.assertFalse((store.slug_dir(self.slug) / "arrows.json").exists())
+        self.assertNotIn("placements", self.samples[0])
+
+        jobs, warnings = job._legend_linetype_jobs(self.slug)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(jobs, [(1, self.samples, self.sig)])
+
+    def test_current_success_cache_skips_job(self):
+        job.legend_linetypes.save_page(self.slug, 1, {
+            "sig": self.sig, "v": job.legend_linetypes.VERSION,
+            "ok": True, "line_types": [], "bindings": [],
+        })
+        self.assertEqual(job._legend_linetype_jobs(self.slug), ([], []))
+
+    def test_one_success_uses_pdf_geometry_timeout_and_saves(self):
+        success = {
+            "sig": self.sig, "v": job.legend_linetypes.VERSION,
+            "ok": True, "line_types": [{"line_type_number": 7}],
+            "bindings": [{"key": "s0:0"}],
+        }
+        geometry = {"vector_paths": job.LINETYPE_DENSE_PATHS}
+        with mock.patch.object(job.arrows, "page_geometry_status",
+                               return_value=geometry) as page_geometry, \
+                mock.patch.object(job.legend_linetypes, "compute_page",
+                                  return_value=success) as compute:
+            result = job._legend_linetype_one(
+                self.slug, 1, self.samples, self.sig)
+
+        self.assertEqual(result, (1, 1, None))
+        page_geometry.assert_called_once_with(store.pdf_path(self.slug), 0)
+        compute.assert_called_once_with(
+            store.pdf_path(self.slug), 1, self.samples, sig=self.sig,
+            timeout=job.LINETYPE_DENSE_TIMEOUT)
+        self.assertEqual(
+            job.legend_linetypes.load_page(self.slug, 1), success)
+
+    def test_one_failure_saves_retryable_non_success_shape(self):
+        with mock.patch.object(job.arrows, "page_geometry_status",
+                               return_value={"vector_paths": 1}), \
+                mock.patch.object(
+                    job.legend_linetypes, "compute_page",
+                    side_effect=RuntimeError(
+                        "SourceAlignmentError: source paints disagree")) \
+                as compute:
+            page, count, error = job._legend_linetype_one(
+                self.slug, 1, self.samples, self.sig)
+
+        self.assertEqual((page, count), (1, None))
+        self.assertIn("SourceAlignmentError", error)
+        compute.assert_called_once()
+        failed = job.legend_linetypes.load_page(self.slug, 1)
+        self.assertEqual(failed["sig"], self.sig)
+        self.assertEqual(failed["v"], job.legend_linetypes.VERSION)
+        self.assertIn("SourceAlignmentError", failed["error"])
+        self.assertNotIn("ok", failed)
+        self.assertFalse(job.legend_linetypes.has_current(failed, self.sig))
+
+    def test_stage_schedules_both_channels_with_combined_progress_warning(self):
+        arrow_job = (1, self.items, {"items": {}}, "arrow-sig")
+        legend_job = (1, self.samples, self.sig)
+        progress = []
+        with mock.patch.object(job.arrows, "ENABLED", True), \
+                mock.patch.object(job, "_linetype_jobs",
+                                  return_value=([arrow_job], [])), \
+                mock.patch.object(job, "_legend_linetype_jobs",
+                                  return_value=([legend_job], [])), \
+                mock.patch.object(job, "_linetype_one",
+                                  return_value=(1, 2, None)) as ordinary, \
+                mock.patch.object(
+                    job, "_legend_linetype_one",
+                    return_value=(1, None, "RuntimeError: no match")) as legend:
+            warnings = job._stage_linetypes(
+                self.slug, on_progress=lambda done, total:
+                progress.append((done, total)))
+
+        ordinary.assert_called_once_with(self.slug, *arrow_job, None)
+        legend.assert_called_once_with(self.slug, *legend_job, None)
+        self.assertEqual(progress[0], (0, 2))
+        self.assertEqual(progress[-1], (2, 2))
+        self.assertEqual(len(progress), 3)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("legend line-type matching failed", warnings[0])
+
+    def test_stage_with_arrows_toggle_off_dispatches_only_legend(self):
+        legend_job = (1, self.samples, self.sig)
+        with mock.patch.object(job.arrows, "ENABLED", False), \
+                mock.patch.object(job, "_linetype_jobs") as ordinary_jobs, \
+                mock.patch.object(job, "_legend_linetype_jobs",
+                                  return_value=([legend_job], [])), \
+                mock.patch.object(job, "_linetype_one") as ordinary, \
+                mock.patch.object(job, "_legend_linetype_one",
+                                  return_value=(1, 1, None)) as legend:
+            warnings = job._stage_linetypes(self.slug)
+
+        self.assertEqual(warnings, [])
+        ordinary_jobs.assert_not_called()
+        ordinary.assert_not_called()
+        legend.assert_called_once_with(self.slug, *legend_job, None)
+
+    def test_cancelled_legend_work_stops_before_geometry_or_compute(self):
+        with mock.patch.object(job.arrows, "page_geometry_status") as geometry, \
+                mock.patch.object(job.legend_linetypes,
+                                  "compute_page") as compute:
+            with self.assertRaises(job.Cancelled):
+                job._legend_linetype_one(
+                    self.slug, 1, self.samples, self.sig,
+                    should_cancel=lambda: True)
+        geometry.assert_not_called()
+        compute.assert_not_called()
 
 
 class TestRemoteModelTimeoutBounds(JobTestBase):

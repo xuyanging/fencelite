@@ -1139,7 +1139,8 @@ for (const rel of urls) {
     "({cur:CUR,page:PAGE,epoch,all:ALL_LT,key:ALL_LT_KEY,state:ALL_LT_STATE,"
     + "detail:ALL_LT_DETAIL,focus:ALL_FOCUS,filter:ALL_FILTER,inflight:ALL_LT_INFLIGHT,"
     + "selectedScope,selectedRow,ltChecked:$('tgLt').querySelector('input').checked,"
-    + "allChecked:$('tgAll').querySelector('input').checked})", context);
+    + "allChecked:$('tgAll').querySelector('input').checked,"
+    + "provChecked:$('tgLtSrc').querySelector('input').checked})", context);
   let skipped = false;
   try {
     const fixture = saved.page ? JSON.parse(JSON.stringify(saved.page)) : null;
@@ -1181,7 +1182,14 @@ for (const rel of urls) {
         groups:[{group:"t:"+scopeToken,text:scopeText,
           visible_line_type_number:target.line_type_number,in_plan_count:1,
           votes_in_plan:{}}],
-        line_types:[target],bindings:[],page:{line_types:1},
+        line_types:[target],bindings:[
+          {visible:true,line_type_number:target.line_type_number,key:0,ti:0},
+          {visible:true,line_type_number:target.line_type_number,key:"s2:1",ti:0},
+          {visible:true,line_type_number:target.line_type_number,key:"s0:0",ti:0,
+            source:"legend_template"},
+          // 同编号但最终不可见的 binding 不能污染 provenance。
+          {visible:false,line_type_number:target.line_type_number,key:"s9:9",ti:0},
+        ],page:{line_types:1},
       };
 
       context.__patternPage = fixture;
@@ -1191,6 +1199,7 @@ for (const rel of urls) {
         + "ALL_LT_STATE='idle';ALL_LT_DETAIL='';ALL_LT_INFLIGHT=null;ALL_FOCUS=null;"
         + "$('tgLt').querySelector('input').checked=true;"
         + "$('tgAll').querySelector('input').checked=false;"
+        + "$('tgLtSrc').querySelector('input').checked=false;"
         + "makeScopeModel();build();renderList();syncLayers();", context,
         {filename:"method2-pattern-normal"});
       context.__patternNumber = target.line_type_number;
@@ -1233,6 +1242,38 @@ for (const rel of urls) {
           !String(node.innerHTML).includes("Method 2")
           || !String(node.innerHTML).includes("2 confirmed patterns boxed")))
         problems.push("normal 列表来源/框数量文案缺失");
+
+      const provenanceKinds = JSON.parse(vm.runInContext(
+        "JSON.stringify(lineTypeProvenance(__patternNumber))", context));
+      if (provenanceKinds.join("|")
+          !== "Text callout|Symbol callout|Legend line sample")
+        problems.push(`binding provenance 分类/顺序错误: ${provenanceKinds.join("|")}`);
+      if (normalListRows.some((node) => String(node.innerHTML).includes("Matched via"))
+          || normal.nodes.some((node) => node.cls === "lt-prov-label"))
+        problems.push("provenance 默认关闭时仍泄露到普通列表/画布");
+
+      const provenanceInput = context.document.getElementById("tgLtSrc")
+        .querySelector("input");
+      provenanceInput.checked = true;
+      provenanceInput.dispatchEvent({type:"change"});
+      const provenanceOn = JSON.parse(vm.runInContext(
+        "(()=>{const row=(LT_INDEX.rows||[]).find(r=>r.number===__patternNumber);"
+        + "if(row)selectScope(row.scopeId,false);"
+        + "const label=(LT_NODES.get(__patternNumber)||[]).find(n=>"
+        + "n.getAttribute('class')==='lt-prov-label');"
+        + "const item=($('list').children||[]).find(n=>n.dataset&&"
+        + "Number(n.dataset.lt)===__patternNumber);"
+        + "return JSON.stringify({row:item?item.innerHTML:'',detail:$('sel').innerHTML,"
+        + "label:label?label.textContent:'',focus:!!(label&&"
+        + "label.classList.contains('lt-focus'))});})()", context));
+      const allProvenance = "Matched via Text callout + Symbol callout + Legend line sample";
+      if (!provenanceOn.row.includes(allProvenance)
+          || !provenanceOn.detail.includes(allProvenance)
+          || !provenanceOn.label.includes(allProvenance)
+          || !provenanceOn.focus)
+        problems.push("provenance 开启后普通列表/选择详情/聚焦标签未同时显示三类来源");
+      provenanceInput.checked = false;
+      provenanceInput.dispatchEvent({type:"change"});
 
       const targetRow = normal.rows[0];
       if (targetRow) {
@@ -1321,6 +1362,26 @@ for (const rel of urls) {
       if (!m1Item || !String(m1Item.innerHTML).includes("Method 1"))
         problems.push("All 列表没有 Method 1 来源");
 
+      provenanceInput.checked = true;
+      vm.runInContext(
+        "drawAllLinetypes();renderList();showAllTypeDetail(__patternAll.types[0]);",
+        context, {filename:"linetype-provenance-all"});
+      const provenanceAll = JSON.parse(vm.runInContext(
+        "(()=>{const label=(ALL_NODES.get(701)||[]).find(n=>"
+        + "n.getAttribute('class')==='al-prov-label');"
+        + "const item=($('list').children||[]).find(n=>n.dataset&&Number(n.dataset.al)===701);"
+        + "return JSON.stringify({row:item?item.innerHTML:'',detail:$('sel').innerHTML,"
+        + "label:label?label.textContent:'',focus:!!(label&&"
+        + "label.classList.contains('al-focus'))});})()", context));
+      if (!provenanceAll.row.includes(allProvenance)
+          || !provenanceAll.detail.includes(allProvenance)
+          || !provenanceAll.label.includes(allProvenance)
+          || !provenanceAll.focus)
+        problems.push("provenance 开启后 All 列表/详情/聚焦标签未显示三类来源");
+      provenanceInput.checked = false;
+      vm.runInContext("drawAllLinetypes();renderList();", context,
+        {filename:"linetype-provenance-all-off"});
+
       let networkCalls = 0;
       context.fetch = async () => {
         networkCalls += 1;
@@ -1365,6 +1426,7 @@ for (const rel of urls) {
       + "selectedRow=__patternSaved.selectedRow;"
       + "$('tgLt').querySelector('input').checked=__patternSaved.ltChecked;"
       + "$('tgAll').querySelector('input').checked=__patternSaved.allChecked;"
+      + "$('tgLtSrc').querySelector('input').checked=__patternSaved.provChecked;"
       + "if(PAGE){makeScopeModel();build();renderList();syncLayers();}", context,
       {filename:"method2-pattern-restore"});
   }
@@ -1372,7 +1434,7 @@ for (const rel of urls) {
     console.log(`  FAIL Method 2 pattern 框: ${problems.join("; ")}`);
     failures += 1;
   } else if (!skipped) {
-    console.log("  OK   普通框详情已隐藏；Method 2 normal/All 来源、pattern、focus、开关缓存通过");
+    console.log("  OK   普通框详情已隐藏；Method 2 pattern 与三类 binding provenance 开关通过");
   }
 }
 

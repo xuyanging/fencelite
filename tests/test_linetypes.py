@@ -1,6 +1,6 @@
 """线型层的判据用例 —— 全部是纯函数，不起边车、不读 PDF、零花费.
 
-覆盖：核心判据（拥有最近 op 的簇 / residual 是一等答案）、三条产品口径、
+覆盖：核心判据（36 pt 内最近的已识别线型 / 无已识别线型时 residual）、三条产品口径、
 plan 只当显示闸这一条设计决定，以及一条跨模块一致性（归一化必须和
 steps/arrows.py 的同文判据完全一致 —— 两处各写一份是有意的，一致性靠这里保证）。
 """
@@ -207,6 +207,29 @@ class AllGeometryVerificationTests(unittest.TestCase):
         self.assertIsNone(linetypes.validated_all_page(
             corrupt, main, main["sig"]))
 
+    def test_all_payload_rechecks_retained_binding_evidence_and_labels_origin(self):
+        main, fresh = all_geometry_pair()
+        main["page"]["tip_precision_pt"] = 0.1
+        main["bindings"] = [{
+            "key": 4, "ti": 0,
+            "nearest_op": {"distance": 0.2, "owner": None},
+            "nearest_owned_op": {"distance": 3.4, "owner": 2},
+        }, {
+            "key": "s3:0", "ti": 0,
+            "nearest_op": {"distance": 0.1, "owner": 2},
+            "line_type_number": 2, "distance_to_type": 0.1,
+        }, {
+            "source": "legend_template", "key": "s5:0", "ti": 0,
+            "nearest_op": {"distance": 0.0, "owner": 2},
+        }]
+        payload = linetypes.all_payload(fresh, main)
+        target = next(row for row in payload["types"]
+                      if row["line_type_number"] == 2)
+        self.assertEqual(
+            [row["binding_kind"] for row in target["bound_by"]],
+            ["text_callout", "symbol_callout", "legend_sample"])
+        self.assertEqual(target["bound_by"][0]["distance"], 3.4)
+
 
 def row(key, ti, tip, *, near=None, dist=0.2, ranked=(), own_ops=0):
     """构造一条边车 binding。near=None 表示最近的 op 是 residual。"""
@@ -217,6 +240,19 @@ def row(key, ti, tip, *, near=None, dist=0.2, ranked=(), own_ops=0):
         "ranked": [{"line_type_number": number, "distance": value}
                    for number, value in ranked],
     }
+
+
+def legend_row(symbol_index, tip, *, tips=None, matched_runs=(), near=None,
+               dist=0.2, ranked=()):
+    """构造一份 legend 模板 binding；多个 tips 仍只是一份 symbol 证据。"""
+    out = row(f"s{symbol_index}:0", 0, tip, near=near, dist=dist,
+              ranked=ranked)
+    out.update({
+        "source": "legend_template",
+        "tips": [list(value) for value in (tips or ())],
+        "matched_runs": list(matched_runs),
+    })
+    return out
 
 
 ITEMS = [
@@ -255,17 +291,45 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual((state, number), ("bound", 3))
         self.assertAlmostEqual(distance, 0.4)
 
-    def test_residual_is_a_first_class_answer(self):
-        """tip 底下那段 ink 不属于任何簇时，正确答案是「这里没有线型」。
-
-        不能退回「最近的簇」—— 实测一页只有 38% 的 path op 属于任何簇，
-        那样会稳定地给出看着对的错高亮。
-        """
+    def test_residual_without_an_authoritative_nearest_owned_op(self):
+        """ranked 只是候选表；没有 nearest_owned_op 时不能凭候选硬绑定。"""
         state, number, _ = bind.verdict_of(
             row("0", 0, (11, 11), near=None, dist=0.1,
                 ranked=((3, 8.2), (4, 31.9))))
         self.assertEqual(state, "residual")
         self.assertIsNone(number)
+
+    def test_nearest_recognised_type_wins_over_closer_residual_ink(self):
+        """final_plans P3 key 1：旧 tip-precision 闸误杀了 Method 2 #2。"""
+        target = row("1", 0, (173, 656), near=None, dist=0.334,
+                     ranked=((2, 3.437), (5, 4.042), (40, 108.474)))
+        target["nearest_owned_op"] = {
+            "op_index": 9290, "distance": 3.437, "owner": 2,
+            "run_id": "83", "group_id": "197",
+        }
+        state, number, distance = bind.verdict_of(target, 1.512)
+        self.assertEqual((state, number), ("bound", 2))
+        self.assertAlmostEqual(distance, 3.437)
+
+    def test_nearest_recognised_fallback_obeys_the_12pt_guard(self):
+        for owned_distance, expected in (
+                (bind.MAX_FALLBACK_BIND_DISTANCE, "bound"),
+                (bind.MAX_FALLBACK_BIND_DISTANCE + 0.001, "residual")):
+            with self.subTest(owned_distance=owned_distance):
+                target = row("0", 0, (11, 11), near=None, dist=0.1)
+                target["nearest_owned_op"] = {
+                    "op_index": 2, "distance": owned_distance, "owner": 7,
+                }
+                state, number, _ = bind.verdict_of(target, 0.0)
+                self.assertEqual(state, expected)
+                self.assertEqual(number, 7 if expected == "bound" else None)
+
+    def test_direct_owner_keeps_the_existing_36pt_guard(self):
+        state, number, distance = bind.verdict_of(
+            row("0", 0, (11, 11), near=7,
+                dist=bind.MAX_BIND_DISTANCE))
+        self.assertEqual((state, number), ("bound", 7))
+        self.assertEqual(distance, bind.MAX_BIND_DISTANCE)
 
     def test_too_far_when_the_tip_touches_nothing(self):
         state, number, distance = bind.verdict_of(
@@ -470,6 +534,23 @@ class PlanDisplayGateTests(unittest.TestCase):
         self.assertFalse(group["plan_fallback"])
         self.assertEqual(out["bindings"][0]["state"], "residual")
 
+    def test_inside_terminal_uses_nearest_owned_type_despite_closer_residual(self):
+        target = row("0", 0, (173, 656), near=None, dist=0.334,
+                     ranked=((2, 3.437), (5, 4.042)))
+        target["nearest_owned_op"] = {
+            "op_index": 9290, "distance": 3.437, "owner": 2,
+            "run_id": "83", "group_id": "197",
+        }
+        entry = entry_of([target], precision=1.512)
+        out = regroup.resolve(entry, [[40, 90, 960, 840]], ITEMS)
+        self.assertEqual(out["visible"], [2])
+        self.assertEqual(out["groups"][0]["engine_runs"], ["83"])
+        binding = out["bindings"][0]
+        self.assertTrue(binding["in_plan"])
+        self.assertEqual(binding["state"], "bound")
+        self.assertEqual(binding["line_type_number"], 2)
+        self.assertAlmostEqual(binding["distance_to_type"], 3.437)
+
 
 class SymbolAnchorGroupingTests(unittest.TestCase):
     """放置锚必须归到「它所属图例那一行文字」的组里（与前端 SCOPE_BY_SYMBOL 一致）。
@@ -530,6 +611,161 @@ class SymbolAnchorGroupingTests(unittest.TestCase):
         keys = sorted(g["group"] for g in out["groups"])
         self.assertEqual(keys, ["s:3", "s:4"])
         self.assertEqual(out["visible"], [5, 6])
+
+
+class LegendTemplateBindingTests(unittest.TestCase):
+    """明确的 legend 线型模板优先于启发式箭头，但冲突时必须 fail closed。"""
+
+    ITEMS = [
+        {"text": "8' CHAIN LINK FENCE", "box_2d": [10, 10, 20, 90]},
+        {"text": "DOUBLE SWING GATE", "box_2d": [30, 10, 40, 90]},
+    ]
+
+    def test_unique_template_overrides_arrow_majority_and_adds_matched_runs(self):
+        entry = entry_of([
+            row("0", 0, (100, 100), near=9, dist=0.10),
+            row("0", 1, (110, 110), near=9, dist=0.20),
+            legend_row(0, (120, 120), tips=((120, 120),), near=3,
+                       dist=0.05, matched_runs=("legend-match-a",
+                                                "legend-match-b")),
+        ])
+        out = regroup.resolve(entry, [[0, 0, 500, 500]], self.ITEMS, {0: 0})
+        group = out["groups"][0]
+        self.assertEqual(group["votes_in_plan"], {"3": 1, "9": 2})
+        self.assertEqual(group["legend_votes_in_plan"], {"3": 1})
+        self.assertEqual(group["legend_line_type_number"], 3)
+        self.assertFalse(group["legend_conflict"])
+        self.assertEqual(group["visible_line_type_number"], 3)
+        self.assertEqual(group["engine_runs"],
+                         ["legend-match-a", "legend-match-b"])
+        self.assertEqual(out["visible"], [3])
+
+    def test_many_occurrence_tips_from_one_symbol_cast_exactly_one_vote(self):
+        entry = entry_of([
+            legend_row(0, (900, 900),
+                       tips=((900, 900), (100, 100), (200, 200)),
+                       near=3, dist=0.05,
+                       matched_runs=("run-1", "run-2", "run-3")),
+        ])
+        out = regroup.resolve(entry, [[0, 0, 500, 500]], self.ITEMS, {0: 0})
+        group = out["groups"][0]
+        self.assertTrue(out["bindings"][0]["in_plan"])
+        self.assertEqual(group["in_plan_count"], 1)
+        self.assertEqual(group["votes_in_plan"], {"3": 1})
+        self.assertEqual(group["legend_votes_in_plan"], {"3": 1})
+
+    def test_duplicate_rows_for_one_symbol_are_still_only_one_vote(self):
+        entry = entry_of([
+            legend_row(0, (100, 100), tips=((100, 100),), near=3,
+                       dist=0.20),
+            legend_row(0, (200, 200), tips=((200, 200),), near=3,
+                       dist=0.10),
+        ])
+        out = regroup.resolve(entry, [[0, 0, 500, 500]], self.ITEMS, {0: 0})
+        self.assertEqual(out["groups"][0]["votes_in_plan"], {"3": 1})
+        self.assertEqual(out["groups"][0]["legend_votes_in_plan"], {"3": 1})
+
+    def test_plan_uses_any_tip_and_falls_back_to_compatibility_tip(self):
+        with_tips = entry_of([
+            legend_row(0, (900, 900),
+                       tips=((900, 900), (100, 100)), near=3, dist=0.05),
+        ])
+        out = regroup.resolve(with_tips, [[0, 0, 500, 500]], self.ITEMS,
+                              {0: 0})
+        self.assertTrue(out["bindings"][0]["in_plan"])
+        self.assertEqual(out["visible"], [3])
+
+        compatibility = legend_row(0, (100, 100), near=3, dist=0.05)
+        compatibility.pop("tips")
+        out = regroup.resolve(entry_of([compatibility]), [[0, 0, 500, 500]],
+                              self.ITEMS, {0: 0})
+        self.assertTrue(out["bindings"][0]["in_plan"])
+        self.assertEqual(out["visible"], [3])
+
+    def test_two_template_conclusions_in_one_group_fail_closed(self):
+        entry = entry_of([
+            legend_row(0, (100, 100), tips=((100, 100),), near=3,
+                       dist=0.05, matched_runs=("run-three",)),
+            legend_row(1, (200, 200), tips=((200, 200),), near=7,
+                       dist=0.06, matched_runs=("run-seven",)),
+        ])
+        # 两个 symbol 都继承同一行文字，故意制造同组模板冲突。
+        out = regroup.resolve(entry, [[0, 0, 500, 500]], self.ITEMS,
+                              {0: 0, 1: 0})
+        group = out["groups"][0]
+        self.assertTrue(group["legend_conflict"])
+        self.assertEqual(group["legend_line_type_numbers_in_plan"], [3, 7])
+        self.assertIsNone(group["legend_line_type_number"])
+        self.assertIsNone(group["visible_line_type_number"])
+        self.assertFalse(group["plan_fallback"])
+        self.assertEqual(group["engine_runs"], [])
+        self.assertEqual(out["visible"], [])
+        self.assertTrue(all(row["state"] == "hidden"
+                            for row in out["bindings"]))
+
+    def test_gate_wins_over_a_valid_legend_template(self):
+        entry = entry_of([
+            legend_row(0, (100, 100), tips=((100, 100),), near=3,
+                       dist=0.05, matched_runs=("must-not-show",)),
+        ])
+        out = regroup.resolve(entry, [[0, 0, 500, 500]], self.ITEMS, {0: 1})
+        group = out["groups"][0]
+        self.assertEqual(group["scope"], "gate")
+        self.assertIsNone(group["visible_line_type_number"])
+        self.assertEqual(group["engine_runs"], [])
+        self.assertEqual(out["visible"], [])
+        self.assertEqual(out["bindings"][0]["state"], "gate")
+
+    def test_out_of_plan_template_does_not_override_an_inside_arrow(self):
+        entry = entry_of([
+            row("0", 0, (100, 100), near=9, dist=0.10),
+            legend_row(0, (900, 900), tips=((900, 900),), near=3,
+                       dist=0.05),
+        ])
+        out = regroup.resolve(entry, [[0, 0, 500, 500]], self.ITEMS, {0: 0})
+        group = out["groups"][0]
+        self.assertEqual(group["legend_votes_in_plan"], {})
+        self.assertEqual(group["visible_line_type_number"], 9)
+        self.assertEqual(out["visible"], [9])
+
+    def test_residual_template_does_not_override_an_inside_arrow(self):
+        entry = entry_of([
+            row("0", 0, (100, 100), near=9, dist=0.10),
+            legend_row(0, (110, 110), tips=((110, 110),), near=None,
+                       dist=0.05, ranked=((3, 0.10),)),
+        ])
+        out = regroup.resolve(entry, [[0, 0, 500, 500]], self.ITEMS, {0: 0})
+        group = out["groups"][0]
+        self.assertEqual(group["legend_votes_in_plan"], {})
+        self.assertEqual(group["visible_line_type_number"], 9)
+        self.assertEqual(out["visible"], [9])
+
+    def test_template_uses_the_same_nearest_owned_distance_guard_as_arrows(self):
+        template = legend_row(0, (100, 100), tips=((100, 100),), near=None,
+                              dist=0.10)
+        template["nearest_owned_op"] = {
+            "op_index": 1, "distance": 3.15, "owner": 3,
+        }
+        entry = entry_of([template], precision=0.01)
+        out = regroup.resolve(entry, [[0, 0, 500, 500]], self.ITEMS, {0: 0})
+        self.assertEqual(out["groups"][0]["legend_votes_in_plan"], {"3": 1})
+        self.assertEqual(out["visible"], [3])
+        self.assertEqual(out["bindings"][0]["state"], "bound")
+
+    def test_plain_old_cache_keeps_its_original_output_schema(self):
+        entry = entry_of([row("0", 0, (100, 100), near=3, dist=0.1)])
+        out = regroup.resolve(entry, [[0, 0, 500, 500]], self.ITEMS)
+        group = out["groups"][0]
+        self.assertEqual(set(group), {
+            "group", "text", "scope", "keys", "votes_all",
+            "votes_in_plan", "line_type_number_all",
+            "visible_line_type_number", "tie", "plan_fallback",
+            "in_plan_count", "engine_runs",
+        })
+        self.assertEqual(group["votes_all"], {"3": 1})
+        self.assertEqual(group["visible_line_type_number"], 3)
+        self.assertNotIn("legend_conflict", group)
+        self.assertEqual(out["visible"], [3])
 
 
 class ReassignReachTests(unittest.TestCase):

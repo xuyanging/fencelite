@@ -118,6 +118,80 @@ def tip_in_any(tip, regions):
     return any(r[0] <= y <= r[2] and r[1] <= x <= r[3] for r in regions or ())
 
 
+def _is_legend_template(row):
+    return row.get("source") == "legend_template"
+
+
+def _in_plan(row, regions):
+    """Legend 模板的多个命中点只共用一个显示闸。"""
+    if not _is_legend_template(row):
+        return tip_in_any(row.get("tip"), regions)
+    tips = row.get("tips")
+    if not isinstance(tips, (list, tuple)) or not tips:
+        # ``tip`` 是协议的向后兼容字段；旧生产者没有 ``tips`` 时仍可读。
+        tips = (row.get("tip"),)
+    return any(tip_in_any(tip, regions) for tip in tips)
+
+
+def _legend_identity(row):
+    """同一份 symbol 无论带多少 occurrence，都只能投一票。"""
+    index = symbol_index_of(row.get("key"))
+    return f"s:{index}" if index is not None else f"k:{row.get('key')}"
+
+
+def _legend_summary(rows, precision):
+    """汇总有效 legend 结论，并对同一 symbol 去重。
+
+    一个异常缓存若给同一 symbol 写了两个不同结论，也必须 fail closed，不能靠输入
+    顺序选中其中一个。``numbers`` 保留这类冲突的完整证据供读盘审计。
+    """
+    by_symbol = {}
+    for row in rows:
+        if not _is_legend_template(row):
+            continue
+        state, number, distance = verdict_of(row, precision)
+        if state != "bound":
+            continue
+        identity = _legend_identity(row)
+        record = by_symbol.setdefault(identity, {})
+        old = record.get(number)
+        if old is None or (distance is not None and distance < old):
+            record[number] = distance or 0.0
+
+    numbers = sorted({number for record in by_symbol.values()
+                      for number in record})
+    votes = {}
+    weight = {}
+    ambiguous = []
+    for identity, record in sorted(by_symbol.items()):
+        if len(record) != 1:
+            ambiguous.append(identity)
+            continue
+        number, distance = next(iter(record.items()))
+        votes[number] = votes.get(number, 0) + 1
+        weight[number] = weight.get(number, 0.0) + distance
+    return {
+        "votes": votes,
+        "weight": weight,
+        "numbers": numbers,
+        "conflict": len(numbers) > 1,
+        "winner": numbers[0] if len(numbers) == 1 else None,
+        "ambiguous_symbols": ambiguous,
+    }
+
+
+def _tally_with_legend_dedup(rows, precision):
+    """普通末端逐条计票；legend 按 symbol 计票。"""
+    ordinary = [row for row in rows if not _is_legend_template(row)]
+    votes, weight = _tally(ordinary, precision)
+    legend = _legend_summary(rows, precision)
+    for number, count in legend["votes"].items():
+        votes[number] = votes.get(number, 0) + count
+        weight[number] = weight.get(number, 0.0) \
+            + legend["weight"].get(number, 0.0)
+    return votes, weight, legend
+
+
 def resolve(entry, plan_regions, items=None, symbol_owners=None):
     """从缓存的 bindings 重新分组 + 投票 + 过 gate / plan 闸.
 
@@ -146,7 +220,7 @@ def resolve(entry, plan_regions, items=None, symbol_owners=None):
         group, text = group_of(items, row["key"], symbol_owners)
         row["group"] = group
         row["group_text"] = text
-        row["in_plan"] = tip_in_any(row.get("tip"), plan_regions)
+        row["in_plan"] = _in_plan(row, plan_regions)
         rows.append(row)
 
     buckets = {}
@@ -161,26 +235,66 @@ def resolve(entry, plan_regions, items=None, symbol_owners=None):
         text = next((m["group_text"] for m in members if m.get("group_text")), "")
         gate = is_gate_text(text)
         inside = [row for row in members if row["in_plan"]]
-        votes_all, weight_all = _tally(members, precision)
-        votes, weight = _tally(inside, precision)
-        winner = None if gate else _winner(votes, weight)
+        legend_members = [row for row in members
+                          if _is_legend_template(row)]
+        if legend_members:
+            votes_all, weight_all, legend_all = \
+                _tally_with_legend_dedup(members, precision)
+            votes, weight, legend_inside = \
+                _tally_with_legend_dedup(inside, precision)
+            if gate or legend_inside["conflict"]:
+                winner = None
+            elif legend_inside["winner"] is not None:
+                # 图例样例是明确模板，不参加普通箭头的多数票：唯一有效结论直接胜出。
+                winner = legend_inside["winner"]
+            else:
+                winner = _winner(votes, weight)
+            if gate or legend_all["conflict"]:
+                winner_all = None
+            elif legend_all["winner"] is not None:
+                winner_all = legend_all["winner"]
+            else:
+                winner_all = _winner(votes_all, weight_all)
+        else:
+            # 旧缓存走原来的逐行投票路径，输出字段和排序均保持不变。
+            votes_all, weight_all = _tally(members, precision)
+            votes, weight = _tally(inside, precision)
+            winner = None if gate else _winner(votes, weight)
+            winner_all = _winner(votes_all, weight_all) if not gate else None
         if winner is not None and winner not in have_geometry:
             missing.add(winner)
             winner = None
-        groups.append({
+        group_row = {
             "group": group,
             "text": text,
             "scope": "gate" if gate else "fence",
             "keys": sorted({str(m["key"]) for m in members}),
             "votes_all": {str(n): c for n, c in sorted(votes_all.items())},
             "votes_in_plan": {str(n): c for n, c in sorted(votes.items())},
-            "line_type_number_all": _winner(votes_all, weight_all) if not gate else None,
+            "line_type_number_all": winner_all,
             "visible_line_type_number": winner,
             "tie": bool(votes) and len([n for n, c in votes.items()
                                         if c == max(votes.values())]) > 1,
-            "plan_fallback": winner is None and not gate and bool(votes_all),
+            "plan_fallback": winner is None and not gate and bool(votes_all)
+                and not (legend_members and legend_inside["conflict"]),
             "in_plan_count": len(inside),
-        })
+        }
+        if legend_members:
+            # 只在新协议存在时追加审计字段，确保普通旧缓存的 JSON 语义不变。
+            group_row.update({
+                "legend_template_keys": sorted({str(m["key"])
+                                                for m in legend_members}),
+                "legend_votes_all": {
+                    str(n): c for n, c in sorted(legend_all["votes"].items())},
+                "legend_votes_in_plan": {
+                    str(n): c
+                    for n, c in sorted(legend_inside["votes"].items())},
+                "legend_line_type_numbers_in_plan": legend_inside["numbers"],
+                "legend_line_type_number": legend_inside["winner"],
+                "legend_conflict": legend_inside["conflict"],
+                "legend_ambiguous_symbols": legend_inside["ambiguous_symbols"],
+            })
+        groups.append(group_row)
         if winner is not None:
             visible.add(winner)
         engine_runs = []
@@ -219,8 +333,13 @@ def resolve(entry, plan_regions, items=None, symbol_owners=None):
                                   and row["in_plan"])
             row["visible_line_type_number"] = (winner if row["visible"] else None)
             row["engine_run"] = engine_run_of(row, row["line_type_number"])
-            if row["visible"] and row["engine_run"] is not None                     and row["engine_run"] not in engine_runs:
+            if row["visible"] and row["engine_run"] is not None \
+                    and row["engine_run"] not in engine_runs:
                 engine_runs.append(row["engine_run"])
+            if row["visible"] and _is_legend_template(row):
+                for run_id in row.get("matched_runs") or ():
+                    if run_id is not None and run_id not in engine_runs:
+                        engine_runs.append(run_id)
         # 这一组 callout 真正指到的走线 —— 高亮只画这些，同型但没接上的不画。
         groups[-1]["engine_runs"] = engine_runs
 

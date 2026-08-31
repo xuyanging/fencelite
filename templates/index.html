@@ -195,6 +195,12 @@ rect.bx.bx-plc:hover,rect.bx.bx-plc.pick{fill:rgba(124,58,237,.62);
 .lt-pattern.lt-focus{stroke-width:3.4;stroke-opacity:1;
                      filter:drop-shadow(0 0 2px rgba(15,23,42,.5))}
 .lt-pattern.lt-dim{stroke-opacity:0;fill-opacity:0}
+/* 绑定来源只在调试开关打开、且该线型被聚焦时贴在图上。默认完全不画文字，
+   避免普通用户看到算法诊断，也避免密图同时出现几十个标签。 */
+.lt-prov-label,.al-prov-label{display:none;fill:#0f172a;
+  font:700 11px/1.2 ui-monospace,Consolas,monospace;paint-order:stroke;
+  stroke:#fff;stroke-width:3.5px;stroke-linejoin:round;pointer-events:none}
+.lt-prov-label.lt-focus,.al-prov-label.al-focus{display:block}
 /* 判据可视化：末端 → 它最近的那条线，标出实际用来判断的距离。
    开 Debug 才显示 —— 平时不该挡住图。 */
 /* 全部线型（调试层）。这是**旁路视图**，不参与产品口径：正常视图只画被指到
@@ -463,6 +469,7 @@ svg polyline.scope-focus{stroke-width:3.2;opacity:1;filter:drop-shadow(0 0 2px r
   <label class="lay dash" id="tgPlan"><input type="checkbox" checked><i style="border-top-color:var(--c-plan)"></i>plan view boxes</label>
   <label class="lay dash off" id="tgGrp"><input type="checkbox"><i style="border-top-color:var(--c-grp)"></i>Sheet regions</label>
   <span class="sp"></span>
+  <label class="lay off" id="tgLtSrc" title="Show whether a line type was linked by a text callout, symbol callout, or legend line sample"><input type="checkbox">Debug: line-type provenance</label>
   <label class="lay off" id="tgDbg"><input type="checkbox">Debug (split source + stripped symbols)</label>
 </div>
 
@@ -640,7 +647,74 @@ function lineTypeSourceLabel(type){
   const source=String((type&&type.recognition_source)||'').toLowerCase();
   if(source==='method1')return 'Method 1';
   if(source==='method2')return 'Method 2';
+  if(source==='legend_template'){
+    const raw=type&&type.matched_cluster_sources;
+    const sources=new Set(Object.values(raw&&typeof raw==='object'?raw:{}).map(
+      value=>String(value||'').toLowerCase()));
+    if(!sources.size&&type&&type.base_recognition_source)
+      sources.add(String(type.base_recognition_source).toLowerCase());
+    const methods=[];
+    if(sources.has('method1'))methods.push('Method 1');
+    if(sources.has('method2'))methods.push('Method 2');
+    return 'Legend template'+(methods.length?' · '+methods.join(' + '):'');
+  }
   return source||'Source unknown';
+}
+
+/* “Method 1 / Method 2”描述的是算法；这里描述的是最终结果由哪一种页面锚
+   绑定出来。必须读 PAGE 里已经过 regroup 重判的 bindings，而不是 All 缓存里
+   可能过期的 bound_by。legend 的 key 也长得像 s0:0，所以 source 必须先判。 */
+const LT_PROV=()=>$('tgLtSrc').querySelector('input').checked;
+const LT_PROVENANCE_ORDER=[
+  ['text_callout','Text callout'],
+  ['symbol_callout','Symbol callout'],
+  ['legend_sample','Legend line sample'],
+];
+function lineTypeProvenance(number){
+  const kinds=new Set();
+  const lt=(PAGE&&PAGE.record&&PAGE.record.linetypes)||{};
+  for(const binding of (lt.bindings||[])){
+    if(!binding||!binding.visible||binding.line_type_number==null
+       ||Number(binding.line_type_number)!==Number(number))continue;
+    const source=String(binding.source||'').trim().toLowerCase();
+    const key=String(binding.key==null?'':binding.key).trim();
+    if(source==='legend_template')kinds.add('legend_sample');
+    else if(/^s\d+:\d+$/.test(key))kinds.add('symbol_callout');
+    else if(/^\d+$/.test(key))kinds.add('text_callout');
+  }
+  return LT_PROVENANCE_ORDER.filter(([kind])=>kinds.has(kind))
+    .map(([,label])=>label);
+}
+function lineTypeProvenanceLabel(number){
+  const labels=lineTypeProvenance(number);
+  return labels.length?('Matched via '+labels.join(' + ')):'';
+}
+
+function appendLineTypeProvenanceLabel(parent,type,cls,W,H,dataKey,nodes){
+  if(!LT_PROV())return null;
+  const provenance=lineTypeProvenanceLabel(type&&type.line_type_number);
+  if(!provenance)return null;
+  let x=null,y=null;
+  const box=type&&type.bbox;
+  if(Array.isArray(box)&&box.length===4&&box.map(Number).every(Number.isFinite)){
+    x=Number(box[1])/1000*W;
+    y=Number(box[0])/1000*H-6;
+  }else{
+    const first=(type&&type.polylines||[]).find(
+      line=>Array.isArray(line)&&Array.isArray(line[0])&&line[0].length===2);
+    if(first){x=Number(first[0][1])/1000*W;y=Number(first[0][0])/1000*H-6}
+  }
+  if(!Number.isFinite(x)||!Number.isFinite(y))return null;
+  const tx=document.createElementNS(NS,'text');
+  tx.setAttribute('x',Math.max(4,Math.min(W-4,x)).toFixed(1));
+  tx.setAttribute('y',Math.max(13,Math.min(H-4,y)).toFixed(1));
+  tx.setAttribute('class',cls);
+  tx.dataset[dataKey]=type.line_type_number;
+  tx.dataset.provenance='binding';
+  tx.textContent='#'+type.line_type_number+' · '+provenance;
+  parent.appendChild(tx);
+  nodes.push(tx);
+  return tx;
 }
 
 /* pattern_instances 是后端从 Method 2 audit 中只投影
@@ -648,7 +722,13 @@ function lineTypeSourceLabel(type){
    地限定 source=method2 和合法页面帧 bbox：即使 Method 1 类型意外带了
    同名字段，也不会被画成 Method 2。 */
 function method2PatternInstances(type){
-  if(String((type&&type.recognition_source)||'').toLowerCase()!=='method2')return [];
+  const source=String((type&&type.recognition_source)||'').toLowerCase();
+  const matched=type&&type.matched_cluster_sources;
+  const method2=(source==='method2')||(source==='legend_template'&&(
+    String((type&&type.base_recognition_source)||'').toLowerCase()==='method2'
+    ||Object.values(matched&&typeof matched==='object'?matched:{}).some(
+      value=>String(value||'').toLowerCase()==='method2')));
+  if(!method2)return [];
   const instances=Array.isArray(type&&type.pattern_instances)
     ?type.pattern_instances:[];
   return instances.filter(instance=>{
@@ -709,6 +789,7 @@ function buildLinetypeIndex(){
         scopeId:null, text:String(g.text||'(No text)'), number:number,
         family:meta0.signature_family||'', segments:meta0.segment_count||0,
         source:lineTypeSourceLabel(meta0),
+        provenance:lineTypeProvenanceLabel(number),
         patternCount:method2PatternInstances(meta0).length,
         terminals:(g.in_plan_count||0),
       });
@@ -726,6 +807,7 @@ function buildLinetypeIndex(){
       family:meta.signature_family||'', segments:meta.segment_count||0,
       recovered:!!meta.recovered_from_fusion,
       source:lineTypeSourceLabel(meta),
+      provenance:lineTypeProvenanceLabel(number),
       patternCount:method2PatternInstances(meta).length,
       terminals:(g.in_plan_count||0), votes:g.votes_in_plan||{},
       // 同型但没接上的走线，没被任何末端指到（不画，但要说出来）。
@@ -1786,11 +1868,16 @@ function renderSteps(){
   const lTxt = lst.state==='ok'
       ? ((lst.visible||[]).length+'/'+(lst.clusters!==undefined?lst.clusters:'?'))
       : lmeta[0];
+  const targetParts=[];
+  if(lst.callout_targets!=null)targetParts.push(lst.callout_targets+' callout targets');
+  if(lst.legend_samples)targetParts.push(lst.legend_samples+' legend line samples');
+  const targetSummary=targetParts.length?targetParts.join(' + ')
+    : ((lst.targets||0)+' targets');
   parts.push(chip('⑥Line types', lTxt, lmeta[2],
       lst.state==='ok'
         ? ((lst.visible||[]).length+'  line types are pointed at, out of  '+lst.clusters
            +'  (residual '+lst.residual_ops+'  commands are not line types); '
-           +lst.targets+'  terminals, clustering  '+lst.seconds+'s')
+           +targetSummary+', clustering  '+lst.seconds+'s')
         : (lmeta[1]+(lst.detail?(' — '+lst.detail):''))));
   el.innerHTML=parts.join('');
 }
@@ -1901,10 +1988,14 @@ function build(){
         gLt,instance,'lt-pattern',color,t.line_type_number,W,H,'lt');
       nodes.push(rc);
     }
+    appendLineTypeProvenanceLabel(
+      gLt,t,'lt-prov-label',W,H,'lt',nodes);
+    const provenance=LT_PROV()?lineTypeProvenanceLabel(t.line_type_number):'';
     const ti=document.createElementNS(NS,'title');
     ti.textContent='Line types #'+t.line_type_number+' · '+(t.signature_family||'')
       +' · '+(t.segment_count||0)+'  segments'
       +' · '+lineTypeSourceLabel(t)
+      +(provenance?(' · '+provenance):'')
       +(patternInstances.length?(' · '+patternInstances.length+' confirmed patterns'):'');
     gLt.appendChild(ti);
     LT_NODES.set(t.line_type_number,nodes);
@@ -2050,6 +2141,7 @@ function build(){
 const LAYERS=[['tgTxt',['gUni','gVlm','gAdd','gCov']],['tgSym',['gSym']],
               ['tgPlc',['gPlc']],['tgPlan',['gPlan']],['tgGrp',['gGrp']],
               ['tgDbg',['gDrop','gMark','gProbe']],['tgArw',['gArw']],
+              ['tgLtSrc',[]],
               ['tgLt',['gLt']],
               ['tgAll',['gAll']],['tgResid',['gResid']]];
 function syncLayers(){
@@ -2066,7 +2158,12 @@ function syncLayers(){
 }
 for(const [tg] of LAYERS){
   $(tg).querySelector('input').addEventListener('change',()=>{
-    if(tg==='tgDbg'){ if(PAGE){build();renderList()} return; }   // 重画：拆分/合并文字层
+    if(tg==='tgDbg'||tg==='tgLtSrc'){
+      // 这两个调试开关都只重画现有 payload，不触发识别或 All API 请求。
+      if(PAGE){build();renderList()}
+      syncLayers();
+      return;
+    }
     // 全部线型是**按需拉**的（rapid_city_2 P11 实测 5.8 MB），不能挂进
     // /api/page —— 那是给所有人付调试的代价。打开时才去取。
     if(tg==='tgAll'&&$('tgAll').querySelector('input').checked){
@@ -2078,6 +2175,17 @@ for(const [tg] of LAYERS){
 }
 
 /* =============== 选中 / 详情 =============== */
+function showLineTypeProvenanceDetail(number){
+  const provenance=lineTypeProvenanceLabel(number);
+  if(!LT_PROV()||!provenance)return;
+  $('sel').classList.add('has');
+  $('sel').innerHTML='<div class="scope-detail fence">'
+    +'<div><i class="scope-dot" style="background:'
+    +(LT_COLOR_BY_NUMBER[number]||'var(--c-fence)')
+    +'"></i><b>Line type #'+esc(String(number))+' provenance</b></div>'
+    +'<p>'+esc(provenance)+'</p></div>';
+}
+
 function selectScope(id,fly,rowKey){
   const g=SCOPE_GROUPS.find(x=>x.id===id);
   if(!g||!svg)return;
@@ -2138,6 +2246,7 @@ function selectScope(id,fly,rowKey){
      所以这里改成**清空并隐藏**，而不是留着上一次的内容。 */
   $('sel').classList.remove('has');
   $('sel').innerHTML='';
+  if(withLines)showLineTypeProvenanceDetail(ltNumber);
   for(const n of focused){
     if(n.tagName.toLowerCase()!=='rect')continue;
     n.classList.remove('flash'); void n.getBoundingClientRect(); n.classList.add('flash');
@@ -2322,6 +2431,8 @@ function drawAllLinetypes(){
         gAll,instance,'al-pattern',color,t.line_type_number,W,H,'al');
       nodes.push(rc);
     }
+    appendLineTypeProvenanceLabel(
+      gAll,t,'al-prov-label',W,H,'al',nodes);
     ALL_NODES.set(t.line_type_number,nodes);
   }
   applyAllFocus();
@@ -2376,6 +2487,7 @@ function focusAllType(number,fly){
 function showAllTypeDetail(t){
   const bound=(t.bound_by||[]);
   const patternCount=method2PatternInstances(t).length;
+  const provenance=LT_PROV()?lineTypeProvenanceLabel(t.line_type_number):'';
   const bits=[(t.signature_family||'?'),
               'source '+lineTypeSourceLabel(t),
               (t.op_count||0)+' op',(t.segment_count||0)+'  segments',
@@ -2383,6 +2495,7 @@ function showAllTypeDetail(t){
               'members '+(t.member_count||0),
               'min_sim '+(t.minimum_pair_similarity==null?'?'
                           :Number(t.minimum_pair_similarity).toFixed(4))];
+  if(provenance)bits.push(provenance);
   if(patternCount)bits.push(patternCount+' confirmed pattern instances boxed');
   if(t.support_only)bits.push('support only — no vector stroke to draw');
   if(t.clipped_ops)bits.push(t.clipped_ops+' op  clipped');
@@ -2453,7 +2566,9 @@ function renderAllSection(box){
       ||String(t.line_type_number)===needle
       ||String(t.line_type_number).includes(needle)
       ||String(t.signature_family||'').toLowerCase().includes(needle)
-      ||String(t.recognition_source||'').toLowerCase().includes(needle));
+      ||String(t.recognition_source||'').toLowerCase().includes(needle)
+      ||(LT_PROV()&&lineTypeProvenanceLabel(t.line_type_number)
+          .toLowerCase().includes(needle)));
   for(const t of rows){
     const b=document.createElement('button');
     b.type='button'; b.className='scope-item fence al-item';
@@ -2466,6 +2581,10 @@ function renderAllSection(box){
                               :(t.segment_count||0)+'  segments'];
     if((t.runs||[]).length>1)meta.push((t.runs||[]).length+'  runs');
     meta.push(lineTypeSourceLabel(t));
+    if(LT_PROV()){
+      const provenance=lineTypeProvenanceLabel(t.line_type_number);
+      if(provenance)meta.push(provenance);
+    }
     const patternCount=method2PatternInstances(t).length;
     if(patternCount)meta.push(patternCount+' confirmed patterns boxed');
     const bound=(t.bound_by||[]).length;
@@ -2537,6 +2656,7 @@ function renderList(){
       if(row.family)meta.push(row.family);
       meta.push(row.segments+'  segments');
       meta.push(row.source);
+      if(LT_PROV()&&row.provenance)meta.push(row.provenance);
       if(row.patternCount)meta.push(row.patternCount+' confirmed patterns boxed');
       if(row.terminals)meta.push(row.terminals+'  terminals');
       // 这个线型是 fusion 连带丢弃后补回来的（method1 认领、
@@ -2560,6 +2680,7 @@ function renderList(){
       d.innerHTML='<i class="scope-dot fence"></i><span class="scope-copy">'
         +'<span class="scope-text">'+esc(row.text)+'</span><span class="scope-meta">'
         +esc(['Line types #'+row.number,row.family,row.segments+'  segments',row.source,
+              LT_PROV()?row.provenance:'',
               row.patternCount?(row.patternCount+' confirmed patterns boxed'):'',
               'text not in the scope list'].filter(Boolean).join(' · '))
         +'</span></span><span class="scope-n">#'+row.number+'</span>';

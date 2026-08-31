@@ -36,7 +36,9 @@ from PIL import Image
 import job
 from core.config import BASE_DIR, MODEL_NAME, PRICING
 from core.pdfio import render_pdf_page
-from steps import arrows, linetypes, store
+from steps import arrows, legend_linetypes, linetypes, store
+from steps.legend_linetypes.merge import (
+    LegendMergeError, debug_types as legend_debug_types, merge_entries)
 from steps.linetypes import refresh_state as linetype_refresh_state
 from steps.placements import has_current_placements
 from steps.symbols import (has_current_symbols, marker_code_indices,
@@ -279,37 +281,69 @@ def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
     if not linetypes.ENABLED:
         record["linetypes_status"] = {"state": "disabled"}
         return
+
+    # The two producers are independent: arrow terminals may be absent while
+    # a confirmed legend swatch is still a complete supervised query.
+    symbol_entry = store.load_json(
+        store.slug_dir(slug) / "symbols.json", {}).get(str(page))
+    # Keep the reader on the exact prerequisite contract used by
+    # job._legend_linetype_jobs.  A stale symbol result may still contain old
+    # line boxes (and even an old matching legend cache), but neither is
+    # publishable against the current symbol detector/version.
+    symbols_result = ((symbol_entry or {}).get("result") or {}
+                      if _symbols_publishable(
+                          symbol_entry, store.sig_of(items, revision)) else {})
+    owners = linetypes.symbol_owners_of(symbols_result)
+    legend_samples = legend_linetypes.samples_of(symbols_result)
+    legend_entry = None
+    legend_current = False
+    legend_error = None
+    if legend_samples:
+        legend_sig = legend_linetypes.signature(revision, legend_samples)
+        legend_entry = legend_linetypes.load_page(slug, page)
+        legend_current = legend_linetypes.has_current(legend_entry, legend_sig)
+        if (isinstance(legend_entry, dict)
+                and legend_entry.get("sig") == legend_sig
+                and legend_entry.get("error")):
+            legend_error = str(legend_entry["error"])
+
     extra = _placement_anchors_for(slug, page)
     arrows_sig = arrows.arrows_signature(items, revision, extra)
     arrow_entry = store.load_json(
         store.slug_dir(slug) / "arrows.json", {}).get(str(page))
-    if not arrows.has_current_arrows(arrow_entry, arrows_sig):
-        record["linetypes_status"] = {"state": "no-arrows"}
-        return
-    anchors = linetypes.anchors_of(arrow_entry)
-    if not anchors:
-        record["linetypes_status"] = {"state": "no-arrows"}
-        return
-    sig = linetypes.linetypes_signature(arrows_sig)
-    entry = linetypes.load_page(slug, page)
+    arrows_current = arrows.has_current_arrows(arrow_entry, arrows_sig)
+    anchors = linetypes.anchors_of(arrow_entry) if arrows_current else []
+    sig = linetypes.linetypes_signature(arrows_sig) if anchors else None
+    entry = linetypes.load_page(slug, page) if anchors else None
     # Signature mismatch is never publishable, including an error produced by
     # an older engine.  The low-priority refresh worker will replace it
     # atomically; keep text/arrows visible and tell the browser to poll instead
     # of silently presenting an empty FENCELINE section.
-    signature_matches = bool(
-        isinstance(entry, dict) and entry.get("sig") == sig)
+    signature_matches = bool(sig and isinstance(entry, dict)
+                             and entry.get("sig") == sig)
     retry_with_larger_budget = bool(
         signature_matches and entry.get("error")
         and job._linetype_failure_budget_increased(
             slug, page, arrow_entry, entry.get("error")))
-    if signature_matches and entry.get("error") \
-            and not retry_with_larger_budget:
+    main_error = (str(entry["error"])
+                  if signature_matches and entry.get("error")
+                  and not retry_with_larger_budget else None)
+    main_current = bool(sig and linetypes.has_current_linetypes(entry, sig))
+
+    if not main_current and not legend_current and (main_error or legend_error):
         record["linetypes_status"] = {"state": "failed",
-                                     "detail": str(entry["error"])[:200]}
+                                     "detail": (legend_error or main_error)[:200]}
         return
-    if (not signature_matches
-            or not linetypes.has_current_linetypes(entry, sig)):
-        refresh = linetype_refresh_state.page_refresh_status(slug, page)
+    expected = len(anchors) + len(legend_samples)
+    if not main_current and not legend_current:
+        if not expected:
+            record["linetypes_status"] = {"state": "no-arrows"}
+            return
+        refresh_channel = (
+            "legend" if legend_samples and not anchors else
+            ("arrow" if anchors and not legend_samples else None))
+        refresh = linetype_refresh_state.page_refresh_status(
+            slug, page, channel=refresh_channel)
         detail = {
             "running": "Current line-type engine is refreshing this sheet",
             "waiting": "Queued; a foreground upload/rerun has priority",
@@ -317,20 +351,37 @@ def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
         }.get(refresh, "Queued for the next automatic line-type refresh scan")
         record["linetypes_status"] = {
             "state": "updating", "refresh": refresh or "queued",
-            "detail": detail, "targets": len(anchors)}
+            "detail": detail, "targets": expected,
+            "callout_targets": len(anchors),
+            "legend_samples": len(legend_samples)}
         return
 
-    owners = linetypes.symbol_owners_of(
-        (store.load_json(store.slug_dir(slug) / "symbols.json", {})
-         .get(str(page)) or {}).get("result") or {})
-    payload = linetypes.page_payload(entry, plan_regions or [], items, owners)
+    try:
+        combined = merge_entries(
+            entry if main_current else None,
+            legend_entry if legend_current else None)
+    except LegendMergeError as error:
+        record["linetypes_status"] = {
+            "state": "failed", "detail": str(error)[:200]}
+        return
+    payload = linetypes.page_payload(
+        combined, plan_regions or [], items, owners)
     record["linetypes"] = payload
     page_info = payload.get("page") or {}
-    status = {"targets": len(anchors),
-              "bound": len(entry.get("used_all") or ()),
-              "clusters": page_info.get("line_types"),
+    status = {"targets": expected,
+              "callout_targets": len(anchors),
+              "bound": len(payload.get("visible") or ()),
+              "clusters": (page_info.get("line_types")
+                           or page_info.get("base_line_types")),
               "residual_ops": page_info.get("residual_ops"),
               "seconds": page_info.get("seconds_cluster")}
+    if legend_samples:
+        status["legend_state"] = (
+            "ok" if legend_current else
+            ("failed" if legend_error else "updating"))
+        status["legend_samples"] = len(legend_samples)
+        if legend_current:
+            status["legend_matches"] = page_info.get("legend_matches", 0)
     if payload.get("needs_recompute"):
         # 旧缓存按当时的分组裁剪过折线，换了分组口径之后新的胜出线型没有几何
         # 可画。显式说出来 —— 静默画不出线是最误导的失败方式。
@@ -1176,16 +1227,43 @@ def linetypes_all(slug, page):
     # 锚的就是这个列表，用别的口径算出来的签名一定对不上。
     items = store.items_of(record)
     revision = res.get("pdf_revision")
+    symbol_entry = store.load_json(
+        store.slug_dir(slug) / "symbols.json", {}).get(str(page))
+    symbols_result = ((symbol_entry or {}).get("result") or {}
+                      if _symbols_publishable(
+                          symbol_entry, store.sig_of(items, revision)) else {})
+    legend_samples = legend_linetypes.samples_of(symbols_result)
+    legend_entry = None
+    legend_current = False
+    if legend_samples:
+        legend_sig = legend_linetypes.signature(revision, legend_samples)
+        legend_entry = legend_linetypes.load_page(slug, page)
+        legend_current = legend_linetypes.has_current(legend_entry, legend_sig)
     extra = _placement_anchors_for(slug, page)
     arrows_sig = arrows.arrows_signature(items, revision, extra)
     arrow_entry = store.load_json(
         store.slug_dir(slug) / "arrows.json", {}).get(str(page))
-    if not arrows.has_current_arrows(arrow_entry, arrows_sig):
-        return jsonify({"state": "no-arrows"})
-    sig = linetypes.linetypes_signature(arrows_sig)
-    main_entry = linetypes.load_page(slug, page)
-    if not linetypes.has_current_linetypes(main_entry, sig):
-        return jsonify({"state": "no-arrows", "detail": "main result not current"})
+    arrows_current = arrows.has_current_arrows(arrow_entry, arrows_sig)
+    sig = linetypes.linetypes_signature(arrows_sig) if arrows_current else None
+    main_entry = linetypes.load_page(slug, page) if sig else None
+    main_current = bool(
+        sig and linetypes.has_current_linetypes(main_entry, sig))
+    if not main_current:
+        if legend_current:
+            try:
+                types = legend_debug_types(legend_entry)
+            except LegendMergeError:
+                return jsonify({"state": "stale"})
+            return jsonify({
+                "state": "ok", "partial": True,
+                "detail": "supervised legend line types",
+                "page": legend_entry.get("page") or {},
+                "engine": legend_entry.get("engine") or {},
+                "types": types, "residual": None,
+                "legend_samples": legend_entry.get("samples") or [],
+            })
+        return jsonify({"state": "no-arrows",
+                        "detail": "no current arrow or legend result"})
 
     stored_entry = linetypes.load_all_page(slug, page)
     all_entry = linetypes.validated_all_page(
@@ -1210,7 +1288,29 @@ def linetypes_all(slug, page):
     if all_entry is None:
         return jsonify({"state": "not-run" if stored_entry is None
                         else "stale"})
-    payload = linetypes.all_payload(all_entry, main_entry)
+    try:
+        combined = merge_entries(
+            main_entry, legend_entry if legend_current else None)
+    except LegendMergeError:
+        return jsonify({"state": "stale",
+                        "detail": "line-type cache identity mismatch"})
+    payload = linetypes.all_payload(all_entry, combined)
+    if legend_current:
+        supervised = {row["line_type_number"]: row
+                      for row in legend_debug_types(legend_entry)}
+        ordinary = {row["line_type_number"]: row
+                    for row in payload.get("types") or ()}
+        for number, row in supervised.items():
+            # all_payload has already re-evaluated every retained arrow and
+            # legend binding under the current cheap binding rule.  Preserve
+            # that complete audit when supervised semantic geometry replaces
+            # the ordinary same-number row.
+            if number in ordinary:
+                row["bound_by"] = list(
+                    ordinary[number].get("bound_by") or ())
+        ordinary.update(supervised)
+        payload["types"] = [ordinary[number] for number in sorted(ordinary)]
+        payload["legend_samples"] = legend_entry.get("samples") or []
     payload["state"] = "ok"
     return jsonify(payload)
 
