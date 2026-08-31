@@ -182,6 +182,17 @@ def snap_symbol_boxes(pdf_path, page_index, symbols):
         if symbol not in want:
             summary["snap_skipped"] += 1
             continue
+        # A schedule row-code sample deliberately has no outline in the
+        # legend: its frame was synthesized from a vector-verified N.0 parent
+        # and the exact glyph lives separately in glyph_box_2d.  Collapsing
+        # it to the glyph here would lose the inherited dimensions that let
+        # symbolmatch recover the real enclosing marker on plan instances.
+        if (symbol.get("source") == "row_code"
+                and symbol.get("snap") == "inherited"
+                and isinstance(symbol.get("glyph_box_2d"), (list, tuple))
+                and len(symbol["glyph_box_2d"]) == 4):
+            summary["snap_skipped"] += 1
+            continue
         glyph = _code_glyph(symbol.get("value"), list(base), texts)
         marker = _marker_box(glyph, shapes) if glyph is not None else None
         if marker is not None:

@@ -385,6 +385,31 @@ def entry_of(rows, line_types=None, precision=0.0):
             "page": {"tip_precision_pt": precision}}
 
 
+class GateTextClassificationTests(unittest.TestCase):
+    def test_pure_gate_text_remains_gate(self):
+        for text in ("GATE", "DOUBLE SWING GATE", "EXISTING GATES"):
+            with self.subTest(text=text):
+                self.assertTrue(bind.is_gate_text(text))
+        self.assertFalse(bind.is_gate_text("AGGREGATE BASE"))
+
+    def test_explicit_fence_wins_over_gate_in_the_same_text(self):
+        for text in ("5' ORNAMENTAL STEEL FENCE & GATE",
+                     "FENCING / GATES", "FENCED ACCESS GATE",
+                     "FENCES AND GATES"):
+            with self.subTest(text=text):
+                self.assertFalse(bind.is_gate_text(text))
+
+    def test_fence_and_gate_group_remains_eligible_for_a_line_type(self):
+        items = [{"text": "5' ORNAMENTAL STEEL FENCE & GATE",
+                  "box_2d": [10, 10, 20, 90]}]
+        entry = entry_of([row("0", 0, (100, 100), near=7, dist=0.1)])
+        out = regroup.resolve(entry, [[0, 0, 1000, 1000]], items)
+        self.assertEqual(out["groups"][0]["scope"], "fence")
+        self.assertEqual(out["groups"][0]["visible_line_type_number"], 7)
+        self.assertEqual(out["bindings"][0]["state"], "bound")
+        self.assertEqual(out["visible"], [7])
+
+
 class PlanDisplayGateTests(unittest.TestCase):
     def _entry(self):
         return entry_of([
@@ -457,8 +482,11 @@ class SymbolAnchorGroupingTests(unittest.TestCase):
     ITEMS = [
         {"text": "6' CHAIN LINK FENCE", "box_2d": [10, 10, 20, 90]},   # 0
         {"text": "DOUBLE SWING GATE", "box_2d": [30, 10, 40, 90]},     # 1
+        {"text": "5' ORNAMENTAL STEEL FENCE & GATE",
+         "box_2d": [50, 10, 60, 90]},                                  # 2
     ]
-    OWNERS = {0: 1, 1: 0}       # symbol 0 属于 GATE 那行；symbol 1 属于 FENCE 那行
+    # symbol 0 属于纯 GATE；symbol 1 属于纯 FENCE；symbol 2 属于复合文字。
+    OWNERS = {0: 1, 1: 0, 2: 2}
 
     def test_two_placements_of_one_symbol_vote_together(self):
         entry = entry_of([
@@ -482,6 +510,15 @@ class SymbolAnchorGroupingTests(unittest.TestCase):
         self.assertEqual(out["groups"][0]["scope"], "gate")
         self.assertEqual(out["visible"], [])
         self.assertEqual(out["bindings"][0]["state"], "gate")
+
+    def test_placement_inherits_fence_priority_from_compound_legend_text(self):
+        entry = entry_of([row("s2:0", 0, (100, 100), near=21, dist=0.05)])
+        out = regroup.resolve(entry, [[0, 0, 1000, 1000]], self.ITEMS,
+                              self.OWNERS)
+        self.assertEqual(out["groups"][0]["scope"], "fence")
+        self.assertEqual(out["groups"][0]["visible_line_type_number"], 21)
+        self.assertEqual(out["visible"], [21])
+        self.assertEqual(out["bindings"][0]["state"], "bound")
 
     def test_placement_without_owner_groups_by_symbol_index(self):
         entry = entry_of([

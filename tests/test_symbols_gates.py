@@ -15,9 +15,11 @@ import types
 import unittest
 
 from core.config import MODEL_NAME
-from steps.symbols import (SOURCE_PAGE, SOURCE_SWEEP, classify_symbols,
+from steps.symbols import (SOURCE_PAGE, SOURCE_ROW_CODE, SOURCE_SWEEP,
+                           classify_symbols,
                            dedupe_symbols, filter_owned_group_symbols,
-                           has_current_symbols, merge_sweep,
+                           has_current_symbols, inherit_row_code_symbols,
+                           merge_sweep,
                            symbol_group_verdict, symbol_in_allowed_group,
                            symbols_dropped_view, sweep_version)
 from steps.versions import SYMBOL_PROMPT_V, SYMBOL_VERSION
@@ -240,6 +242,151 @@ class TestDeterministicDedupe(unittest.TestCase):
         reason = view["dropped"][0]["reason"]
         self.assertIn("view", reason)
         self.assertIn("in-group check", reason)
+
+
+# --------------------------------------- 4.0 章节行号继承为 4.6 symbol
+
+class TestInheritedRowCodeSymbols(unittest.TestCase):
+    GROUPS = [{"kind": "schedule", "box_2d": [660, 61, 955, 570]}]
+    PARENT_BOX = [706, 238, 717, 247]
+    HEADER_GLYPH = [708.0, 239.6, 714.7, 244.5]
+    ROW_GLYPH = [760.5, 256.1, 767.1, 261.0]
+
+    def _items(self, *, vector_backed=True):
+        return [
+            {"text": "WALLS RAILINGS & FENCING",
+             "box_2d": [708.0, 256.2, 714.7, 302.7],
+             "source": "vector"},
+            {"text": "5' ORNAMENTAL STEEL FENCE & GATE",
+             "box_2d": [760.5, 275.0, 767.2, 335.5],
+             "source": "vlm", "vec_backed": vector_backed},
+        ]
+
+    def _entry(self, *, snap="shape", value="4.0"):
+        return {
+            "result": {
+                "groups": copy.deepcopy(self.GROUPS),
+                "plc_v": 99,
+                "symbols": [{
+                    "box_2d": list(self.PARENT_BOX),
+                    "category": "shape", "value": value,
+                    "type": f"shape {value}", "text_index": 0,
+                    "claimed_group_index": 0, "source": SOURCE_PAGE,
+                    "snap": snap,
+                }],
+            }
+        }
+
+    def _lines(self, row_box=None, row_text="4.6"):
+        return [
+            {"text": "4.0", "box_2d": list(self.HEADER_GLYPH)},
+            {"text": row_text,
+             "box_2d": list(row_box or self.ROW_GLYPH)},
+        ]
+
+    def test_inherits_verified_parent_frame_and_exact_glyph(self):
+        entry = self._entry()
+        self.assertEqual(
+            inherit_row_code_symbols(entry, self._items(), self._lines()), 1)
+        symbols = entry["result"]["symbols"]
+        self.assertEqual(len(symbols), 2)
+        derived = symbols[1]
+        self.assertEqual(derived["source"], SOURCE_ROW_CODE)
+        self.assertEqual(derived["text_index"], 1)
+        self.assertEqual(derived["value"], "4.6")
+        self.assertEqual(derived["type"], "shape 4.6")
+        self.assertEqual(derived["category"], "shape")
+        self.assertEqual(derived["glyph_box_2d"], self.ROW_GLYPH)
+        # 4.0 真实六边形 11x9，平移到 4.6 glyph 中心；不是 glyph 紧框。
+        self.assertEqual(derived["box_2d"], [758.3, 254.1, 769.3, 263.1])
+        self.assertEqual(derived["snap"], "inherited")
+        self.assertEqual(derived["match_mode"], "exact_vector_text")
+        self.assertEqual(derived["inherited_from"],
+                         {"value": "4.0", "box_2d": self.PARENT_BOX,
+                          "text_index": 0})
+        self.assertNotIn("plc_v", entry["result"])
+
+        snapshot = copy.deepcopy(entry)
+        self.assertEqual(
+            inherit_row_code_symbols(entry, self._items(), self._lines()), 0)
+        self.assertEqual(entry, snapshot)
+
+    def test_parent_must_be_a_vector_verified_closed_shape(self):
+        for snap in (None, "glyph", "no_code_glyph"):
+            with self.subTest(snap=snap):
+                entry = self._entry(snap=snap)
+                self.assertEqual(inherit_row_code_symbols(
+                    entry, self._items(), self._lines()), 0)
+                self.assertEqual(len(entry["result"]["symbols"]), 1)
+
+        # Column fallback also identifies a real closed vector outline.
+        entry = self._entry(snap="column")
+        self.assertEqual(inherit_row_code_symbols(
+            entry, self._items(), self._lines()), 1)
+
+    def test_owner_must_be_native_text_and_immediately_right_of_code(self):
+        entry = self._entry()
+        self.assertEqual(inherit_row_code_symbols(
+            entry, self._items(vector_backed=False), self._lines()), 0)
+
+        too_far = [760.5, 190.0, 767.1, 195.0]
+        entry = self._entry()
+        self.assertEqual(inherit_row_code_symbols(
+            entry, self._items(), self._lines(too_far)), 0)
+
+    def test_major_mismatch_and_missing_native_header_are_rejected(self):
+        entry = self._entry()
+        self.assertEqual(inherit_row_code_symbols(
+            entry, self._items(), self._lines(row_text="5.6")), 0)
+
+        entry = self._entry()
+        self.assertEqual(inherit_row_code_symbols(
+            entry, self._items(), [self._lines()[1]]), 0)
+
+    def test_an_intervening_section_header_closes_the_parent_section(self):
+        lines = self._lines() + [
+            {"text": "5.0", "box_2d": [735.0, 250.0, 742.0, 255.0]}]
+        entry = self._entry()
+        self.assertEqual(
+            inherit_row_code_symbols(entry, self._items(), lines), 0)
+
+    def test_ambiguous_row_codes_fail_closed(self):
+        lines = self._lines() + [
+            {"text": "4.7", "box_2d": [760.5, 264.0, 767.1, 269.0]}]
+        entry = self._entry()
+        self.assertEqual(
+            inherit_row_code_symbols(entry, self._items(), lines), 0)
+
+    def test_stale_derived_row_is_removed_and_rebuilt(self):
+        entry = self._entry()
+        self.assertEqual(inherit_row_code_symbols(
+            entry, self._items(), self._lines()), 1)
+        entry["result"]["symbols"][1]["box_2d"] = [1, 1, 2, 2]
+        entry["result"]["symbols"][1]["placements"] = [[3, 3, 4, 4]]
+        entry["result"]["plc_v"] = 123
+        # Same current evidence reconstructs the deterministic box and drops
+        # downstream fields that must be recomputed for that new sample.
+        self.assertEqual(inherit_row_code_symbols(
+            entry, self._items(), self._lines()), 1)
+        derived = entry["result"]["symbols"][1]
+        self.assertEqual(derived["box_2d"], [758.3, 254.1, 769.3, 263.1])
+        self.assertNotIn("placements", derived)
+        self.assertNotIn("plc_v", entry["result"])
+
+        # If the parent is no longer a verified outline, stale derived data
+        # is removed instead of surviving forever.
+        entry["result"]["symbols"][0]["snap"] = "glyph"
+        self.assertEqual(inherit_row_code_symbols(
+            entry, self._items(), self._lines()), 0)
+        self.assertEqual(len(entry["result"]["symbols"]), 1)
+
+    def test_parent_frame_must_not_swallow_owner_text(self):
+        entry = self._entry()
+        entry["result"]["symbols"][0]["box_2d"] = [706, 238, 717, 300]
+        # Keep the exact 4.0 glyph inside the now-too-wide parent.
+        self.assertEqual(inherit_row_code_symbols(
+            entry, self._items(), self._lines()), 0)
+        self.assertEqual(len(entry["result"]["symbols"]), 1)
 
 
 # --------------------------------------------------- 4. 步骤②b 补扫结果合并

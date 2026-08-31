@@ -73,6 +73,10 @@ DUP_OVERLAP_MAX = 0.5
 # 发布结果里的来源标签（前端 / 调试用来区分「全页那次推理」和「裁剪补扫」）。
 SOURCE_PAGE = "page"
 SOURCE_SWEEP = "sweep"
+# 原生 PDF 文字层确定性补出的「章节行号」样例。它不是模型猜出的框：只有当
+# 已发布的父级 shape（如 4.0）与 fence 描述同行左侧的同章节编号（如 4.6）
+# 同时成立时才生成；步骤4仍把它当 shape 模板，因此会继续走全页矢量匹配。
+SOURCE_ROW_CODE = "row_code"
 
 
 # ------------------------------------------------------------------ 几何工具
@@ -750,6 +754,299 @@ def _symbol_ids(symbols):
     """
     return [(tuple(s.get("box_2d") or ()), s.get("text_index"))
             for s in symbols or [] if isinstance(s, dict)]
+
+
+_DECIMAL_ROW_CODE = _re.compile(r"^(\d{1,3})\.(\d{1,3})$")
+ROW_CODE_MAX_GAP = 40.0
+ROW_CODE_MAX_OVERLAP = 12.0
+ROW_CODE_MIN_Y_OVERLAP = 0.45
+ROW_CODE_MAX_HEADER_DISTANCE = 300.0
+ROW_CODE_MAX_COLUMN_SHIFT = 60.0
+ROW_CODE_HEADER_GLYPH_PAD = 4.0
+
+
+def _decimal_row_code(value):
+    match = _DECIMAL_ROW_CODE.fullmatch(str(value or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), match.group(0)
+
+
+def _allowed_group_indices(box, groups):
+    return {
+        index for index, group in enumerate(groups or [])
+        if isinstance(group, dict)
+        and group.get("kind") in SYMBOL_GROUP_KINDS
+        and _center_in(box, group.get("box_2d"))
+    }
+
+
+def _row_aligned(code_box, text_box):
+    """A native code token and its owner description occupy the same row."""
+    if not (_valid_box(code_box) and _valid_box(text_box)):
+        return False
+    overlap = max(0.0, min(code_box[2], text_box[2])
+                  - max(code_box[0], text_box[0]))
+    shortest = min(code_box[2] - code_box[0], text_box[2] - text_box[0])
+    return shortest > 0 and overlap / shortest >= ROW_CODE_MIN_Y_OVERLAP
+
+
+def _centered_like(glyph_box, parent_box):
+    """Move the verified parent marker's dimensions onto an exact code glyph."""
+    cy = (glyph_box[0] + glyph_box[2]) / 2.0
+    cx = (glyph_box[1] + glyph_box[3]) / 2.0
+    height = parent_box[2] - parent_box[0]
+    width = parent_box[3] - parent_box[1]
+    if height <= 0 or width <= 0:
+        return None
+    return [round(max(0.0, cy - height / 2.0), 1),
+            round(max(0.0, cx - width / 2.0), 1),
+            round(min(1000.0, cy + height / 2.0), 1),
+            round(min(1000.0, cx + width / 2.0), 1)]
+
+
+def _vector_backed(item):
+    """Step-1 item is backed by native PDF text, rather than image OCR only."""
+    return bool(isinstance(item, dict)
+                and (item.get("vec_backed") is True
+                     or item.get("source") == "vector"))
+
+
+def inherit_row_code_symbols(entry, items, vector_lines):
+    """Derive owned decimal row-code symbols from exact native PDF text.
+
+    This covers hierarchical schedules such as Ponderosa's ``4.0 WALLS ...``
+    header followed by ``4.6  5' ORNAMENTAL STEEL FENCE & GATE``.  The page
+    model reliably found the closed 4.0 header marker, while 4.1..4.10 are
+    deliberately plain text and therefore were missed as shapes.
+
+    A derived symbol is published only when all of these deterministic facts
+    hold:
+
+    * its owner is already a step-1 target item;
+    * the exact native token is ``section.row`` with a non-zero row;
+    * it is row-aligned and immediately to the owner's left;
+    * token and owner share one legend/schedule/note-cluster group;
+    * an already-published ``section.0`` shape lies above them in that group.
+
+    The parent must already carry ``snap=shape`` or ``snap=column``: both are
+    produced only after the local vector layer finds a real closed outline
+    (``column`` is the same-outline fallback when the model misread its code).
+    The new record keeps the exact native text box in ``glyph_box_2d``, while
+    ``box_2d`` is the verified parent's width/height translated onto that
+    glyph.  That inherited frame lets the existing placement matcher use the
+    exact text identity and still grow plan hits to their enclosing outline.
+    It remains a normal shape for full-page matching → plan filtering →
+    arrows → line types.
+
+    Returns the number of newly published symbols and is idempotent.
+    """
+    if not isinstance(entry, dict):
+        return 0
+    result = entry.get("result")
+    if not isinstance(result, dict):
+        return 0
+    items = items if isinstance(items, list) else []
+    lines = vector_lines if isinstance(vector_lines, list) else []
+    groups = result.get("groups") if isinstance(result.get("groups"), list) else []
+    published = [s for s in (result.get("symbols") or [])
+                 if isinstance(s, dict)]
+    # Derived rows are a materialized view of the current parent geometry and
+    # current vector text.  Rebuild that view on every placement-version run;
+    # otherwise a future threshold/parent-box change would leave a stale 4.6
+    # forever merely because (owner,value) already existed on disk.
+    before = [s for s in published if s.get("source") != SOURCE_ROW_CODE]
+
+    def reconcile(additions):
+        kept, _dropped = classify_symbols(before + additions, groups,
+                                          len(items), items, None)
+        if kept != published:
+            result["symbols"] = kept
+            result.pop("plc_v", None)
+        old_ids = set(_symbol_ids(published))
+        new_ids = set(_symbol_ids(kept))
+        return len(new_ids - old_ids)
+
+    if not items or not lines or not groups or not before:
+        return reconcile([])
+
+    native_codes = []
+    seen_native = set()
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        parsed = _decimal_row_code(line.get("text"))
+        box = line.get("box_2d")
+        if not parsed or not _valid_box(box):
+            continue
+        identity = (parsed[2], tuple(round(float(v), 3) for v in box))
+        if identity in seen_native:
+            continue
+        seen_native.add(identity)
+        native_codes.append({"section": parsed[0], "row": parsed[1],
+                             "value": parsed[2],
+                             "box": [float(v) for v in box],
+                             "groups": _allowed_group_indices(box, groups),
+                             "identity": identity})
+    if not native_codes:
+        return reconcile([])
+
+    parents = []
+    for symbol in before:
+        parsed = _decimal_row_code(symbol.get("value"))
+        box = symbol.get("box_2d")
+        if (not parsed or parsed[1] != 0 or symbol.get("category") != "shape"
+                or symbol.get("snap") not in ("shape", "column")
+                or not _valid_box(box)):
+            continue
+        # The value must also exist as an exact native PDF token inside the
+        # snapped outline.  This prevents a hallucinated VLM value from
+        # becoming the root of an inherited numeric family.
+        header_tokens = [code for code in native_codes
+                         if code["section"] == parsed[0] and code["row"] == 0
+                         and _center_in(code["box"], box,
+                                        ROW_CODE_HEADER_GLYPH_PAD)]
+        if not header_tokens:
+            continue
+        group_ids = _allowed_group_indices(box, groups)
+        if not group_ids:
+            owner = _owner_item(symbol, items)
+            group_ids = _allowed_group_indices(
+                owner.get("box_2d") if owner else None, groups)
+        if group_ids:
+            parents.append({"symbol": symbol, "section": parsed[0],
+                            "groups": group_ids, "box": list(box),
+                            "glyph": min(header_tokens,
+                                         key=lambda code: abs(
+                                             (code["box"][0] + code["box"][2]) / 2
+                                             - (box[0] + box[2]) / 2))})
+    if not parents:
+        return reconcile([])
+
+    candidates = [code for code in native_codes if code["row"] != 0]
+    if not candidates:
+        return reconcile([])
+
+    existing = {
+        (s.get("text_index"), str(s.get("value") or "").strip().upper())
+        for s in before
+    }
+    proposals = []
+    for item_index, item in enumerate(items):
+        if (not isinstance(item, dict) or not _valid_box(item.get("box_2d"))
+                or not _vector_backed(item)):
+            continue
+        item_box = [float(v) for v in item["box_2d"]]
+        item_groups = _allowed_group_indices(item_box, groups)
+        if not item_groups:
+            continue
+        for candidate in candidates:
+            code_box = candidate["box"]
+            gap = item_box[1] - code_box[3]
+            if (gap < -ROW_CODE_MAX_OVERLAP or gap > ROW_CODE_MAX_GAP
+                    or (code_box[1] + code_box[3]) / 2.0
+                    >= (item_box[1] + item_box[3]) / 2.0
+                    or not _row_aligned(code_box, item_box)):
+                continue
+            common = item_groups & candidate["groups"]
+            if not common:
+                continue
+            cy = (code_box[0] + code_box[2]) / 2.0
+            eligible_parents = []
+            for parent in parents:
+                py = (parent["box"][0] + parent["box"][2]) / 2.0
+                px = (parent["box"][1] + parent["box"][3]) / 2.0
+                code_x = (code_box[1] + code_box[3]) / 2.0
+                shared = common & parent["groups"]
+                if (parent["section"] == candidate["section"]
+                        and py <= cy + 2.0
+                        and cy - py <= ROW_CODE_MAX_HEADER_DISTANCE
+                        and abs(code_x - px) <= ROW_CODE_MAX_COLUMN_SHIFT
+                        and shared):
+                    # A later N.0/M.0 header in the same visual column closes
+                    # the previous section.  Never inherit across it.
+                    blocked = False
+                    for header in native_codes:
+                        if header["row"] != 0:
+                            continue
+                        hy = (header["box"][0] + header["box"][2]) / 2.0
+                        hx = (header["box"][1] + header["box"][3]) / 2.0
+                        if (py + 2.0 < hy < cy - 2.0
+                                and abs(hx - code_x)
+                                <= ROW_CODE_MAX_COLUMN_SHIFT
+                                and shared & header["groups"]):
+                            blocked = True
+                            break
+                    if blocked:
+                        continue
+                    eligible_parents.append((cy - py, parent, min(shared)))
+            if not eligible_parents:
+                continue
+            parent_distance, parent, group_index = min(
+                eligible_parents, key=lambda row: (row[0], row[2]))
+            if (item_index, candidate["value"].upper()) in existing:
+                continue
+            text_cy = (item_box[0] + item_box[2]) / 2.0
+            score = (round(abs(text_cy - cy), 3), round(abs(gap), 3),
+                     round(parent_distance, 3), item_index,
+                     candidate["identity"])
+            proposals.append((score, item_index, candidate, parent,
+                              group_index))
+
+    # Ambiguity is a hard stop: a row code must have exactly one possible
+    # owner and an owner exactly one possible code.  We prefer missing one
+    # rare schedule over publishing an unrelated decimal as a symbol.
+    owner_counts = {}
+    candidate_counts = {}
+    for _score, item_index, candidate, _parent, _group_index in proposals:
+        owner_counts[item_index] = owner_counts.get(item_index, 0) + 1
+        candidate_counts[candidate["identity"]] = \
+            candidate_counts.get(candidate["identity"], 0) + 1
+
+    additions = []
+    used_items = set()
+    used_candidates = set()
+    for _score, item_index, candidate, parent, group_index in sorted(proposals):
+        if (owner_counts.get(item_index) != 1
+                or candidate_counts.get(candidate["identity"]) != 1):
+            continue
+        if item_index in used_items or candidate["identity"] in used_candidates:
+            continue
+        inherited_box = _centered_like(candidate["box"], parent["box"])
+        if not _valid_box(inherited_box):
+            continue
+        glyph_height = candidate["box"][2] - candidate["box"][0]
+        glyph_width = candidate["box"][3] - candidate["box"][1]
+        inherited_height = inherited_box[2] - inherited_box[0]
+        inherited_width = inherited_box[3] - inherited_box[1]
+        # The inherited frame must contain the exact code and must not reach
+        # into the description text.  A wide rectangular parent would turn
+        # the owner's first word into template content and make matching both
+        # brittle and semantically wrong.
+        if (inherited_height + 1e-6 < glyph_height
+                or inherited_width + 1e-6 < glyph_width
+                or inherited_box[3] > items[item_index]["box_2d"][1] + 2.0):
+            continue
+        additions.append({
+            "box_2d": inherited_box,
+            "glyph_box_2d": list(candidate["box"]),
+            "category": "shape",
+            "value": candidate["value"],
+            "type": f"shape {candidate['value']}",
+            "text_index": item_index,
+            "claimed_group_index": group_index,
+            "source": SOURCE_ROW_CODE,
+            "inherited_from": {
+                "value": str(parent["symbol"].get("value") or ""),
+                "box_2d": list(parent["box"]),
+                "text_index": parent["symbol"].get("text_index"),
+            },
+            "match_mode": "exact_vector_text",
+            "snap": "inherited",
+        })
+        used_items.add(item_index)
+        used_candidates.add(candidate["identity"])
+    return reconcile(additions)
 
 
 def merge_sweep(entry, items, sweep):

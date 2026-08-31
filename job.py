@@ -1625,7 +1625,7 @@ def _stage_placements(slug, on_progress=None, should_cancel=None):
     """
     from steps.placements import has_current_placements, match_placements
     from steps.snap_boxes import snap_symbol_boxes, text_trim_boxes
-    from steps.symbols import has_current_symbols
+    from steps.symbols import has_current_symbols, inherit_row_code_symbols
     from steps.views import (groups_need_classification,
                              has_current_view_types, merge_view_types)
 
@@ -1640,6 +1640,15 @@ def _stage_placements(slug, on_progress=None, should_cancel=None):
         return warnings
     revision = pdf_revision(pdf)
     views = load_json(slug_dir(slug) / "view_types.json", {})
+    vec_cache = load_json(slug_dir(slug) / "vec.json", {})
+    vec_pages = vec_cache.get("pages") or {}
+    vec_current = bool(
+        isinstance(vec_pages, dict)
+        and vec_cache.get("schema") == VEC_SCHEMA
+        and vec_cache.get("pdf_mtime") == pdf.stat().st_mtime
+        and not vec_cache.get("partial")
+        and vec_cache.get("page_count") == res.get("page_count")
+        and len(vec_pages) == vec_cache.get("page_count"))
     pages = sorted(cache, key=lambda p: int(p))
     total = len(pages)
     if on_progress:
@@ -1661,6 +1670,7 @@ def _stage_placements(slug, on_progress=None, should_cancel=None):
             continue
         result = entry.get("result") or {}
         groups = result.get("groups") or []
+        page_items = items_of(rec)
         # plan 过滤要求带 classifier 出处的 view_type：缺分类就不猜 plan
         # （fail-closed，与参考实现同一条政策）。
         # 只有 line 样例（或压根没有样例）的页不需要 plan 取景框：line 不做匹配，
@@ -1699,23 +1709,73 @@ def _stage_placements(slug, on_progress=None, should_cancel=None):
         # 放置匹配照样用模型的框跑下去 —— 所以单独 try，失败只记在这一页的
         # result.snap_error 上，不升级成作业级 warning（那是"需要人处理"的语义）。
         symbols_now = result.get("symbols") or []
+        may_have_row_code = (
+            any(isinstance(s, dict) and s.get("category") == "shape"
+                and re.fullmatch(r"\d{1,3}\.0", str(s.get("value") or "").strip())
+                for s in symbols_now)
+            and any(isinstance(item, dict)
+                    and (item.get("vec_backed") is True
+                         or item.get("source") == "vector")
+                    for item in page_items))
+        vector_page = vec_pages.get(pstr) if isinstance(vec_pages, dict) else None
+        vector_lines = ((vector_page or {}).get("lines")
+                        if isinstance(vector_page, dict) else None)
+        if may_have_row_code and (not vec_current
+                                  or not isinstance(vector_lines, list)):
+            error = ("current native vector text is unavailable; refusing to "
+                     "stamp row-code placement cache as complete")
+            result["row_code_error"] = error
+            warnings.append(f"P{pstr} skipped placement matching: {error}")
+            dirty = True
+            if on_progress:
+                on_progress(number, total)
+            continue
         snap_summary = {}
+        snap_failed = False
         try:
             snap_summary = dict(snap_symbol_boxes(pdf, int(pstr) - 1,
                                                  symbols_now))
-            trims = text_trim_boxes(pdf, int(pstr) - 1,
-                                    items_of(rec), symbols_now)
+            # 只在父级 N.0 已经被矢量层证实是闭合 shape 后，才从同一
+            # schedule 行左侧的原生 PDF 文字派生 N.k。新样例会继承父级
+            # 外框尺寸，但保留精确 glyph 框作为文字身份；下面的生产
+            # matcher 会和其他 shape 一样全页扫描并做 plan 过滤。
+            inherited = inherit_row_code_symbols(
+                entry, page_items,
+                vector_lines if isinstance(vector_lines, list) else [])
+            if inherited:
+                snap_summary["snap_inherited"] = inherited
+            symbols_now = result.get("symbols") or []
+            result.pop("row_code_error", None)
             result.pop("snap_error", None)
-            if trims:
-                # 文字框的裁剪结果单独存表，不去改 results.json 里的 item ——
-                # 那会动 store.sig_of，让整页的步骤② 重新付费。
-                result["text_trim"] = {str(k): v for k, v in trims.items()}
-            else:
-                result.pop("text_trim", None)
         except Exception as exc:                                # noqa: BLE001
             result["snap_error"] = f"{type(exc).__name__}: {exc}"
+            snap_failed = True
             print(f"  [snap] P{pstr} skipped sample-box calibration: {result['snap_error']}",
                   flush=True)
+        if snap_failed and may_have_row_code:
+            error = ("row-code inheritance could not be verified: "
+                     f"{result['snap_error']}")
+            result["row_code_error"] = error
+            warnings.append(f"P{pstr} skipped placement matching: {error}")
+            dirty = True
+            if on_progress:
+                on_progress(number, total)
+            continue
+        if not snap_failed:
+            try:
+                trims = text_trim_boxes(pdf, int(pstr) - 1,
+                                        page_items, symbols_now)
+                result.pop("trim_error", None)
+                if trims:
+                    # 文字框的裁剪结果单独存表，不去改 results.json 里的 item ——
+                    # 那会动 store.sig_of，让整页的步骤② 重新付费。
+                    result["text_trim"] = {str(k): v for k, v in trims.items()}
+                else:
+                    result.pop("text_trim", None)
+            except Exception as exc:                            # noqa: BLE001
+                # 文字框裁剪是显示优化，不是 row-code 继承的证据；
+                # 失败时不得挡住已验证的 symbol 进入生产 matcher。
+                result["trim_error"] = f"{type(exc).__name__}: {exc}"
         try:
             summary = dict(snap_summary)
             summary.update(match_placements(pdf, int(pstr) - 1, symbols_now,

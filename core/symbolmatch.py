@@ -207,9 +207,16 @@ def match_template(prims, by_class, grid, sel, seltext, prim_allow=None,
             "template_prims": m, "single": False}
 
 
-def find_symbol_placements(pdf_path, page_index, box_norm):
+def find_symbol_placements(pdf_path, page_index, box_norm, *,
+                           content_box_norm=None):
     """Top-level entry: VLM legend-symbol box (0-1000 page-normalized) →
     every placement of that symbol on the page via vector matching.
+
+    ``content_box_norm`` optionally narrows which primitives form the
+    template while ``box_norm`` remains the marker-size reference and legend
+    exclusion frame.  Derived schedule row codes use this split: exact 4.6
+    glyph content for identity, inherited 4.0 outline dimensions for deciding
+    whether a plan hit really sits inside the expected marker.
 
     Returns {placements: [[ymin,xmin,ymax,xmax] normalized, ...], count,
     rescued, template_prims, template_texts, period, single} or {error}.
@@ -224,6 +231,18 @@ def find_symbol_placements(pdf_path, page_index, box_norm):
     by0, bx0, by1, bx1 = [float(v) for v in box_norm]
     px0, py0 = bx0 / 1000 * w, by0 / 1000 * h
     px1, py1 = bx1 / 1000 * w, by1 / 1000 * h
+    if content_box_norm is None:
+        cpx0, cpy0, cpx1, cpy1 = px0, py0, px1, py1
+    else:
+        try:
+            cby0, cbx0, cby1, cbx1 = [float(v)
+                                      for v in content_box_norm]
+        except (TypeError, ValueError):
+            return {"error": "invalid content_box_norm"}
+        if cbx1 <= cbx0 or cby1 <= cby0:
+            return {"error": "invalid content_box_norm"}
+        cpx0, cpy0 = cbx0 / 1000 * w, cby0 / 1000 * h
+        cpx1, cpy1 = cbx1 / 1000 * w, cby1 / 1000 * h
 
     prims, by_class, grid = _get_prims(pdf_path, page_index)
 
@@ -237,7 +256,8 @@ def find_symbol_placements(pdf_path, page_index, box_norm):
     allow = []
     has_marker_content = False
     for pad in (2.0, 8.0):
-        ax0, ay0, ax1, ay1 = px0 - pad, py0 - pad, px1 + pad, py1 + pad
+        ax0, ay0 = cpx0 - pad, cpy0 - pad
+        ax1, ay1 = cpx1 + pad, cpy1 + pad
         inside = [i for i, p in enumerate(prims)
                   if ax0 <= p["x"] <= ax1 and ay0 <= p["y"] <= ay1]
         if inside:

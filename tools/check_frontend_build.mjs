@@ -813,6 +813,56 @@ let failures = 0;
   }
 }
 
+// ---- fence + gate 同句必须由 fence 语义优先 -------------------------------
+// 后端的同名判据决定是否允许绑定线型；这里钉住前端颜色/scope 的镜像规则，
+// 防止只改一边后再次出现“文字是蓝色 fence，线型却被 gate 闸掉”的分裂状态。
+{
+  const samples = [
+    ["GATE", true],
+    ["DOUBLE SWING GATE", true],
+    ["EXISTING GATES", true],
+    ["5' ORNAMENTAL STEEL FENCE & GATE", false],
+    ["FENCING / GATES", false],
+    ["FENCED ACCESS GATE", false],
+    ["FENCES AND GATES", false],
+    ["AGGREGATE BASE", false],
+  ];
+  const problems = [];
+  try {
+    for (const [value, expected] of samples) {
+      context.__gateProbe = value;
+      const actual = vm.runInContext("isGateText(__gateProbe)", context,
+        { filename: "fence-gate-priority" });
+      if (actual !== expected)
+        problems.push(`${JSON.stringify(value)} -> ${actual}, expected ${expected}`);
+    }
+    context.__scopePriorityPage = {
+      items: [
+        {text:"5' ORNAMENTAL STEEL FENCE & GATE",box_2d:[10,10,20,90]},
+        {text:"DOUBLE SWING GATE",box_2d:[30,10,40,90]},
+      ],
+      marker_codes:[],suppressed_items:[],symbols:{symbols:[]},record:{},
+    };
+    const scopes = JSON.parse(vm.runInContext(
+      "(()=>{const saved=PAGE;PAGE=__scopePriorityPage;makeScopeModel();"
+      + "const out=SCOPE_GROUPS.map(g=>({text:g.text,gate:g.gate,cls:scopeClass(g)}));"
+      + "PAGE=saved;makeScopeModel();return JSON.stringify(out)})()",
+      context, { filename: "fence-gate-scope-priority" }));
+    if (scopes.length !== 2
+        || scopes[0].gate !== false || scopes[0].cls !== "fence"
+        || scopes[1].gate !== true || scopes[1].cls !== "gate")
+      problems.push(`scope 分类错误: ${JSON.stringify(scopes)}`);
+  } catch (error) {
+    problems.push(`抛出 -> ${String(error).slice(0, 160)}`);
+  }
+  if (problems.length) {
+    console.log(`  FAIL fence/gate 优先级: ${problems.join("; ")}`);
+    failures += 1;
+  } else {
+    console.log("  OK   fence/gate 优先级: 同句显式 fence 胜过 gate，纯 gate 保持 gate");
+  }
+}
+
 for (const rel of urls) {
   const url = rel.startsWith("http") ? rel : BASE + rel;
   let payload;

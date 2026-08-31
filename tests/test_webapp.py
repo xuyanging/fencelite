@@ -781,9 +781,9 @@ class AllLineTypesRouteTests(WebappCase):
 
 
 class LineTypeRefreshStatusTests(WebappCase):
-    def _attach(self, entry, refresh="running"):
+    def _attach(self, entry, refresh="running", text="PROPOSED FENCE"):
         record = {}
-        items = [{"text": "PROPOSED FENCE",
+        items = [{"text": text,
                   "box_2d": [100, 100, 120, 180]}]
         with mock.patch.object(webapp.linetypes, "ENABLED", True), \
                 mock.patch.object(webapp.arrows, "arrows_signature",
@@ -832,6 +832,35 @@ class LineTypeRefreshStatusTests(WebappCase):
         self.assertEqual(status["state"], "updating")
         self.assertEqual(status["refresh"], "running")
         self.assertEqual(status["targets"], 1)
+
+    @staticmethod
+    def _owned_entry():
+        return {
+            "sig": "lt-current",
+            "bindings": [{
+                "key": "0", "ti": 0, "tip": [200, 300], "own_ops": 0,
+                "nearest_op": {"op_index": 8, "distance": 0.1, "owner": 7},
+                "ranked": [{"line_type_number": 7, "distance": 0.1}],
+            }],
+            "line_types": [{
+                "line_type_number": 7,
+                "signature_family": "compound_path_periodic",
+                "polylines": [[[200, 300], [210, 320]]],
+            }],
+            "used_all": [7],
+            "page": {"line_types": 1, "residual_ops": 0,
+                     "seconds_cluster": 1.0},
+        }
+
+    def test_fence_and_gate_text_is_not_mislabeled_all_gate(self):
+        status = self._attach(
+            self._owned_entry(), text="5' ORNAMENTAL STEEL FENCE & GATE")
+        self.assertEqual(status["state"], "ok")
+        self.assertEqual(status["visible"], [7])
+
+    def test_pure_gate_text_remains_all_gate(self):
+        status = self._attach(self._owned_entry(), text="DOUBLE SWING GATE")
+        self.assertEqual(status["state"], "all-gate")
 
 
 class ImageTests(WebappCase):

@@ -837,6 +837,73 @@ class TestPlacementsStage(JobTestBase):
         self.assertEqual(job._stage_placements(self.slug), [])
         self.assertEqual(len(self.seen), 1)
 
+    def test_verified_row_code_is_added_before_the_production_matcher(self):
+        rec = _page_rec()
+        rec["vlm_items"][0]["vec_backed"] = True
+        sig = store.sig_of(store.items_of(rec), self.revision)
+        parent = {**SHAPE_SYM, "value": "4.0", "type": "shape 4.0"}
+        store.save_json(store.results_path(self.slug),
+                        {"slug": self.slug, "fused_v": 2, "page_count": 1,
+                         "pages": {"1": rec}})
+        store.save_json(self.cache_path,
+                        {"1": _symbol_entry(sig, [parent], self.groups)})
+        store.save_json(store.slug_dir(self.slug) / "view_types.json",
+                        {"1": _view_entry(self.groups, self.revision)})
+        pdf = store.pdf_path(self.slug)
+        lines = [{"text": "4.0", "box_2d": [100, 100, 110, 110]},
+                 {"text": "4.6", "box_2d": [10, 20, 20, 30]}]
+        store.save_json(store.slug_dir(self.slug) / "vec.json", {
+            "schema": job.VEC_SCHEMA, "pdf_mtime": pdf.stat().st_mtime,
+            "page_count": 1, "pages": {"1": {"lines": lines}}})
+
+        def fake_snap(_pdf, _page, symbols):
+            symbols[0]["snap"] = "shape"
+            return {"snap_shape": 1}
+
+        def fake_inherit(entry, items, vector_lines):
+            self.assertEqual(items, store.items_of(rec))
+            self.assertEqual(vector_lines, lines)
+            entry["result"]["symbols"].append({
+                "box_2d": [10, 20, 20, 30], "category": "shape",
+                "value": "4.6", "text_index": 0, "source": "row_code",
+                "snap": "inherited"})
+            return 1
+
+        with mock.patch("steps.snap_boxes.snap_symbol_boxes",
+                        side_effect=fake_snap), \
+                mock.patch("steps.symbols.inherit_row_code_symbols",
+                           side_effect=fake_inherit) as inherit:
+            self.assertEqual(job._stage_placements(self.slug), [])
+        inherit.assert_called_once()
+        result = store.load_json(self.cache_path, {})["1"]["result"]
+        self.assertEqual([s["value"] for s in result["symbols"]],
+                         ["4.0", "4.6"])
+        # fake_match in setUp sees both formal symbols and runs the same
+        # production-stage placement path on the derived one.
+        self.assertEqual(result["symbols"][1]["placements"],
+                         [[500, 500, 520, 520]])
+        self.assertEqual(result["snap_inherited"], 1)
+
+    def test_missing_vector_cache_does_not_stamp_row_code_page_current(self):
+        rec = _page_rec()
+        rec["vlm_items"][0]["vec_backed"] = True
+        sig = store.sig_of(store.items_of(rec), self.revision)
+        parent = {**SHAPE_SYM, "value": "4.0", "type": "shape 4.0"}
+        store.save_json(store.results_path(self.slug),
+                        {"slug": self.slug, "fused_v": 2, "page_count": 1,
+                         "pages": {"1": rec}})
+        store.save_json(self.cache_path,
+                        {"1": _symbol_entry(sig, [parent], self.groups)})
+        store.save_json(store.slug_dir(self.slug) / "view_types.json",
+                        {"1": _view_entry(self.groups, self.revision)})
+        warnings = job._stage_placements(self.slug)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("native vector text is unavailable", warnings[0])
+        result = store.load_json(self.cache_path, {})["1"]["result"]
+        self.assertNotIn("plc_v", result)
+        self.assertIn("row_code_error", result)
+        self.assertEqual(self.seen, [])
+
     def test_missing_view_classification_is_fail_closed(self):
         warnings = job._stage_placements(self.slug)
         self.assertEqual(self.seen, [])

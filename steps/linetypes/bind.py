@@ -44,18 +44,22 @@ import unicodedata
 MAX_BIND_DISTANCE = 36.0
 
 # gate / fence 分类。门在图上是单独画的符号，不是周期重复的线型图案，所以
-# **gate 类别不去找线**（产品口径）。判据与前端 templates/index.html 的
-# isGateText 完全一致（JS 里是 /\bGATES?\b/i）—— 两处各写一份，一致性由
-# tests/test_linetypes.py 的对齐用例保证。
+# **纯 gate 类别不去找线**（产品口径）。但一句话同时明确写了 fence 与 gate
+# 时，它描述的仍是围栏系统，必须由 fence 语义优先；否则
+# ``5' ORNAMENTAL STEEL FENCE & GATE`` 会仅因末尾的 GATE 被错误剥掉线型。
+# 判据与前端 templates/index.html 的 isGateText 完全一致——两处各写一份，
+# 一致性由 tests/test_linetypes.py 和 tools/check_frontend_build.mjs 钉住。
 #
 # 这条判定放在**读盘期**（resolve_visible），不进缓存：gate 与否是对文字的
 # 判断，将来可能换更好的判据，而重算一页聚类要 100 s 以上。和 plan 显示闸
 # 同一个道理。
+FENCE_PATTERN = re.compile(r"\bFENC(?:E[DS]?|ING)\b", re.I)
 GATE_PATTERN = re.compile(r"\bGATES?\b", re.I)
 
 
 def is_gate_text(text):
-    return bool(GATE_PATTERN.search(str(text or "")))
+    value = str(text or "")
+    return bool(GATE_PATTERN.search(value) and not FENCE_PATTERN.search(value))
 
 
 def text_token(text):

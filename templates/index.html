@@ -414,7 +414,7 @@ body{background:#eef1f4;overflow:hidden}
 #hint{background:linear-gradient(135deg,#f8fafc,#edf2f7)}
 .viewer-badge{position:absolute;left:14px;bottom:14px;z-index:5;display:flex;gap:6px;pointer-events:none}
 
-/* Scope classification and linked-callout emphasis. Gate always wins. */
+/* Scope classification and linked-callout emphasis. Fence wins for mixed FENCE & GATE rows. */
 rect.bx.scope-fence{stroke:var(--c-fence);fill:rgba(25,118,210,.07)}
 rect.bx.scope-gate{stroke:var(--c-gate);fill:rgba(229,57,53,.07)}
 rect.bx.bx-plc.scope-fence,.arw-mask.scope-fence{stroke:var(--c-fence);fill:rgba(25,118,210,.22)}
@@ -569,7 +569,11 @@ let THUMB_OBSERVER=null;
    标点、尺寸与 detail 编号，避免 4'/5' 或不同 keynote 被误并。 */
 const scopeKey=s=>String(s==null?'':s).normalize('NFKC')
   .replace(/\s+/g,' ').trim().toLocaleUpperCase();
-const isGateText=s=>/\bGATES?\b/i.test(String(s||''));
+// fence 语义优先：``FENCE & GATE`` 描述的是带门的围栏系统，不是纯 gate。
+// 必须与 steps/linetypes/bind.py:is_gate_text 完全一致；否则前端会画成 gate，
+// 后端却可能按 fence 绑定线型（或反过来）。
+const isFenceText=s=>/\bFENC(?:E[DS]?|ING)\b/i.test(String(s||''));
+const isGateText=s=>/\bGATES?\b/i.test(String(s||''))&&!isFenceText(s);
 const scopeClass=g=>g&&g.gate?'gate':'fence';
 const scopeColor=g=>g&&g.gate?'#e53935':'#1976d2';
 

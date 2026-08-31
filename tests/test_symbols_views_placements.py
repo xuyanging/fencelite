@@ -42,7 +42,7 @@ REF_PAGES = (
     # slug, page(1-based), shape_symbols, placed_in_plan, dropped_outside_plan
     ("koch_tennis_center", 3, 2, 533, 0),
     # P4 曾经是 (2, 370, 14)：同一个样例框 [384,115,398,136] 被配给了两个
-    # text_index，于是整批放置被算了两遍。SYMBOL_VERSION=19 的同框去重把它
+    # text_index，于是整批放置被算了两遍。SYMBOL_VERSION>=19 的同框去重把它
     # 收敛成一条，数字正好减半 —— 这是修正，不是回归。
     ("koch_tennis_center", 4, 1, 185, 7),
     ("koch_tennis_center", 7, 3, 322, 0),
@@ -73,13 +73,17 @@ class _ReplayMatcher:
         self.by_box = {tuple(box): list(placements)
                        for box, placements in by_box}
         self.calls = []
+        self.kwargs = []
 
-    def find_symbol_placements(self, pdf_path, page_index, box_norm):
+    def find_symbol_placements(self, pdf_path, page_index, box_norm, **kwargs):
         self.calls.append(tuple(box_norm))
+        self.kwargs.append(dict(kwargs))
         key = tuple(box_norm)
         if key not in self.by_box:
             return {"error": "no recorded matcher output for this box"}
-        return {"placements": self.by_box[key]}
+        return {"placements": self.by_box[key],
+                "template_texts": 1, "template_prims": 1,
+                "content_box_norm": kwargs.get("content_box_norm")}
 
 
 def _install_matcher(test, matcher):
@@ -445,8 +449,28 @@ class TestPlacements(unittest.TestCase):
         self.assertNotIn("placement_note", symbols[0])
         self.assertEqual(summary, {"shape": 1, "line": 0, "placed": 2,
                                    "dropped_outside_plan": 2,
+                                   "dropped_without_outline": 0,
                                    "plan_groups": 1,
                                    "plc_v": PLACEMENT_VERSION})
+
+    def test_inherited_row_code_requires_a_real_enclosing_outline(self):
+        sample = [700, 700, 710, 709]       # inherited parent frame: 10x9
+        matcher = _ReplayMatcher([(sample, [
+            [100, 100, 106, 105],            # exact naked 4.6 glyph: reject
+            [200, 200, 211, 209],            # enclosing hex: keep
+        ])])
+        _install_matcher(self, matcher)
+        symbols = [{"box_2d": sample, "glyph_box_2d": [702, 702, 708, 707],
+                    "category": "shape", "value": "4.6", "text_index": 0,
+                    "source": "row_code", "snap": "inherited"}]
+        summary = match_placements("x.pdf", 0, symbols, PLAN_GROUPS)
+        self.assertEqual(symbols[0]["placements"],
+                         [[200.0, 200.0, 211.0, 209.0]])
+        self.assertEqual(symbols[0]["dropped_without_outline"], 1)
+        self.assertEqual(summary["placed"], 1)
+        self.assertEqual(summary["dropped_without_outline"], 1)
+        self.assertEqual(matcher.kwargs,
+                         [{"content_box_norm": [702, 702, 708, 707]}])
 
     def test_no_plan_view_keeps_nothing(self):
         matcher = _ReplayMatcher([(SAMPLE_BOX, [[100, 100, 110, 120]] * 3)])
@@ -547,6 +571,7 @@ class TestPlacements(unittest.TestCase):
                                    "value": "12", "sample_box": SAMPLE_BOX,
                                    "placements": 1,
                                    "dropped_outside_plan": 1,
+                                   "dropped_without_outline": 0,
                                    "status": "accepted"})
         self.assertEqual(rows[1]["status"], LINE_NOTE)
 

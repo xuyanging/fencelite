@@ -26,7 +26,26 @@ NO_PLAN_NOTE = "no_plan_view"
 # Written afresh on every run so a reused cache entry never keeps a stale
 # placement field from an older algorithm version.
 _STALE_KEYS = ("placements", "placement_error", "placement_note",
-               "dropped_outside_plan")
+               "dropped_outside_plan", "dropped_without_outline")
+
+# A derived row-code template is intentionally a native text glyph inside a
+# parent-sized virtual frame.  A real plan symbol must therefore grow back to
+# roughly that inherited frame; a naked decimal elsewhere on the plan is not
+# a symbol even though its exact text class matches.
+INHERITED_OUTLINE_MIN_RATIO = 0.75
+
+
+def _has_inherited_outline(box, sample):
+    if not (isinstance(box, (list, tuple)) and len(box) == 4
+            and isinstance(sample, (list, tuple)) and len(sample) == 4):
+        return False
+    height = float(box[2]) - float(box[0])
+    width = float(box[3]) - float(box[1])
+    sample_height = float(sample[2]) - float(sample[0])
+    sample_width = float(sample[3]) - float(sample[1])
+    return (sample_height > 0 and sample_width > 0
+            and height >= sample_height * INHERITED_OUTLINE_MIN_RATIO
+            and width >= sample_width * INHERITED_OUTLINE_MIN_RATIO)
 
 
 def _center_in_plan(box, plans):
@@ -59,23 +78,39 @@ def match_placements(pdf_path, page_index, symbols, typed_groups, *, dbg=None):
 
     plans = plan_boxes(typed_groups)
     shape_count = line_count = placed = dropped_total = 0
+    outline_dropped_total = 0
     for symbol_index, s in enumerate(symbols or []):
         for key in _STALE_KEYS:
             s.pop(key, None)              # idempotent on reused cache entries
         dropped = 0
+        outline_dropped = 0
         if s.get("category") == "shape":
             shape_count += 1
             try:
                 # shape sample → production compact-symbol template matcher:
                 # every same-looking placement on the page (legend excluded)
+                matcher_kwargs = {}
+                if s.get("source") == "row_code":
+                    matcher_kwargs["content_box_norm"] = s.get("glyph_box_2d")
                 r = find_symbol_placements(str(pdf_path), page_index,
-                                           s["box_2d"])
+                                           s["box_2d"], **matcher_kwargs)
                 if r.get("error"):
                     s["placement_error"] = r["error"]
+                elif (s.get("source") == "row_code"
+                      and (r.get("template_texts") != 1
+                           or r.get("template_prims") != 1)):
+                    s["placement_error"] = (
+                        "derived row-code template is not exactly one native "
+                        "text primitive")
                 else:
                     kept = []
                     for raw_box in r.get("placements") or []:
                         box = [round(float(v), 1) for v in raw_box]
+                        if (s.get("source") == "row_code"
+                                and not _has_inherited_outline(
+                                    box, s.get("box_2d"))):
+                            outline_dropped += 1
+                            continue
                         if _center_in_plan(box, plans):
                             kept.append(box)
                         else:
@@ -83,6 +118,8 @@ def match_placements(pdf_path, page_index, symbols, typed_groups, *, dbg=None):
                     s["placements"] = kept
                     if dropped:
                         s["dropped_outside_plan"] = dropped
+                    if outline_dropped:
+                        s["dropped_without_outline"] = outline_dropped
                     if not plans:
                         s["placement_note"] = NO_PLAN_NOTE
             except Exception as e:                          # noqa: BLE001
@@ -95,6 +132,7 @@ def match_placements(pdf_path, page_index, symbols, typed_groups, *, dbg=None):
             s["placement_note"] = LINE_NOTE
         placed += len(s.get("placements") or [])
         dropped_total += dropped
+        outline_dropped_total += outline_dropped
         if dbg is not None:
             dbg.add("placements", {
                 "symbol_index": symbol_index,
@@ -103,11 +141,13 @@ def match_placements(pdf_path, page_index, symbols, typed_groups, *, dbg=None):
                 "sample_box": s.get("box_2d"),
                 "placements": len(s.get("placements") or []),
                 "dropped_outside_plan": dropped,
+                "dropped_without_outline": outline_dropped,
                 "status": (s.get("placement_error") or s.get("placement_note")
                            or "accepted"),
             })
     return {"shape": shape_count, "line": line_count, "placed": placed,
             "dropped_outside_plan": dropped_total, "plan_groups": len(plans),
+            "dropped_without_outline": outline_dropped_total,
             "plc_v": PLACEMENT_VERSION}
 
 

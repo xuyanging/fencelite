@@ -109,6 +109,18 @@ class SnapBoxesTests(unittest.TestCase):
         snap_symbol_boxes(self.pdf, 0, symbols)
         self.assertEqual(symbols[0]["box_2d"], before)
 
+    def test_inherited_row_code_keeps_parent_sized_frame(self):
+        """Plain schedule glyph has no outline; never collapse its virtual frame."""
+        symbol = {"category": "shape", "value": "4.6", "text_index": 0,
+                  "source": "row_code", "snap": "inherited",
+                  "box_2d": [300, 300, 330, 340],
+                  "glyph_box_2d": [308, 310, 322, 330]}
+        before = list(symbol["box_2d"])
+        summary = snap_symbol_boxes(self.pdf, 0, [symbol])
+        self.assertEqual(symbol["box_2d"], before)
+        self.assertEqual(symbol["snap"], "inherited")
+        self.assertEqual(summary["snap_skipped"], 1)
+
     def test_text_box_left_edge_is_trimmed_past_the_marker(self):
         code, x, y = ROWS[0]
         symbols = [self._wrong_symbol(code, x, y)]

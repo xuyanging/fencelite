@@ -55,4 +55,8 @@ VIEW_VERSION = 1
 #     模型在整页图上给的框会漂（实测 drawings_volume_4_binder P4 九个样例整列
 #     偏左 ~10 单位、两个纵向偏 6 单位），拿漂了的框当模板去匹配自然也差；
 #     顺带产出「图例行文字框裁掉行首编码」的 text_trim 表。
-PLACEMENT_VERSION = 3
+#   4：本地放置前增加「分节行号继承」。只有 N.0 父级样例已被矢量层
+#     吸附成真实闭合 shape，且已识别的 fence 行左侧有同行原生 PDF
+#     文字 N.k 时，才派生该行的 shape symbol。样例框继承 N.0 尺寸，
+#     精确 glyph 框单独留痕，然后照常走全页矢量匹配、plan 过滤和后续链。
+PLACEMENT_VERSION = 4
