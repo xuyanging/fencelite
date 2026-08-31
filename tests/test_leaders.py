@@ -235,6 +235,29 @@ class ArrowsWiringTests(unittest.TestCase):
         self.assertNotEqual(arrows_signature(callout, "rev"),
                             arrows_signature(title, "rev"))
 
+    def test_arrow_signature_signs_effective_plan_gate_geometry(self):
+        from steps import arrows
+
+        items = [{"text": "FENCE", "box_2d": [1, 2, 3, 4],
+                  "label": "callout"}]
+        first = [[0, 0, 100, 100], [200, 200, 300, 300]]
+        reordered = list(reversed(first))
+        changed = [[0, 0, 101, 100], [200, 200, 300, 300]]
+        with patch.object(arrows, "PLAN_GATE", False):
+            self.assertEqual(
+                arrows.arrows_signature(items, "rev", plan_regions=first),
+                arrows.arrows_signature(items, "rev", plan_regions=changed))
+        with patch.object(arrows, "PLAN_GATE", True):
+            with self.assertRaises(TypeError):
+                arrows.arrows_signature(items, "rev")
+            self.assertEqual(
+                arrows.arrows_signature(items, "rev", plan_regions=first),
+                arrows.arrows_signature(
+                    items, "rev", plan_regions=reordered))
+            self.assertNotEqual(
+                arrows.arrows_signature(items, "rev", plan_regions=first),
+                arrows.arrows_signature(items, "rev", plan_regions=changed))
+
     def test_placement_and_text_fallbacks_keep_separate_key_spaces(self):
         # str 键仍只走 marker 外圈兜底；int 文字键走文字框端点图。
         import inspect

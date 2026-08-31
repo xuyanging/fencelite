@@ -47,10 +47,14 @@ const makeNode = (tag) => {
     remove() {},
     setAttribute(k, v) {
       this.attributes[k] = v;
+      if (String(k).toLowerCase() === "id") this.id = String(v || "");
       if (String(k).toLowerCase() === "class") this.className = String(v || "");
     },
     getAttribute(k) { return this.attributes[k]; },
-    removeAttribute(k) { delete this.attributes[k]; },
+    removeAttribute(k) {
+      delete this.attributes[k];
+      if (String(k).toLowerCase() === "id") this.id = "";
+    },
     addEventListener(type, fn) {
       this._listeners = this._listeners || new Map();
       const key = String(type || "");
@@ -113,6 +117,16 @@ const makeNode = (tag) => {
     set className(v) {
       this.classList._set = new Set(String(v || "").split(/\s+/).filter(Boolean));
     },
+    // Browser DOM keeps the id property and getElementById registry in sync.
+    // build() creates SVG groups with `g.id=id`; without this setter the test
+    // would inspect a different empty stub node and could report false results.
+    get id() { return this._id || ""; },
+    set id(v) {
+      const next = String(v || "");
+      if (this._id && registry.get(this._id) === this) registry.delete(this._id);
+      this._id = next;
+      if (next) registry.set(next, this);
+    },
     checked: false,
     scrollLeft: 0,
     scrollTop: 0,
@@ -126,7 +140,10 @@ const makeNode = (tag) => {
 
 const registry = new Map();
 const byId = (id) => {
-  if (!registry.has(id)) registry.set(id, makeNode("div"));
+  if (!registry.has(id)) {
+    const node = makeNode("div");
+    node.id = id;
+  }
   return registry.get(id);
 };
 
@@ -336,12 +353,18 @@ let failures = 0;
   const problems = [];
   const source = scripts.join("\n");
   const inputTag = (html.match(/<input\b[^>]*\bid=["']upFile["'][^>]*>/i) || [""])[0];
+  const folderTag = (html.match(/<input\b[^>]*\bid=["']upFolder["'][^>]*>/i) || [""])[0];
+  const folderButtonTag = (html.match(
+    /<button\b[^>]*\bid=["']upPickFolder["'][^>]*>[\s\S]*?<\/button>/i) || [""])[0];
   const savedPollState = vm.runInContext(
     "({jobs:JOBS,poll:POLL,timer:POLL_TIMER,inflight:POLL_INFLIGHT,seq:POLL_SEQ})",
     context);
   const oldUploadPdfFile = context.uploadPdfFile;
   const oldLoadOverview = context.loadOverview;
   const upFile = context.document.getElementById("upFile");
+  const upFolder = context.document.getElementById("upFolder");
+  const oldUpFileClick = upFile.click;
+  const oldUpFolderClick = upFolder.click;
   const upRun = context.document.getElementById("upRun");
   const upName = context.document.getElementById("upName");
   const upErr = context.document.getElementById("upErr");
@@ -349,17 +372,35 @@ let failures = 0;
   try {
     if (!/\bmultiple\b/i.test(inputTag)) problems.push("#upFile 没有 multiple");
     if (!/\.pdf|application\/pdf/i.test(inputTag)) problems.push("#upFile 没有限定 PDF");
+    for (const attr of ["webkitdirectory", "directory", "multiple"])
+      if (!new RegExp(`\\b${attr}\\b`, "i").test(folderTag))
+        problems.push(`#upFolder 缺少 ${attr}`);
+    if (!/\.pdf|application\/pdf/i.test(folderTag))
+      problems.push("#upFolder 没有限定 PDF");
+    if (!/Choose Folder/i.test(folderButtonTag))
+      problems.push("HTML 缺少 Choose Folder 按钮");
     if (typeof context.enqueuePdfUploads !== "function")
       problems.push("没有 enqueuePdfUploads()");
+
+    let filePickerClicks = 0, folderPickerClicks = 0;
+    upFile.click = () => { filePickerClicks += 1; };
+    upFolder.click = () => { folderPickerClicks += 1; };
+    context.document.getElementById("upPick").onclick();
+    context.document.getElementById("upPickFolder").onclick();
+    if (filePickerClicks !== 1) problems.push("Choose PDFs 没有触发 #upFile");
+    if (folderPickerClicks !== 1) problems.push("Choose Folder 没有触发 #upFolder");
 
     const calls = [];
     let overviewCalls = 0;
     context.__batchUploadMock = async (file, target) => {
-      calls.push({name:file.name,target});
+      const relative = String(file.webkitRelativePath || file.relativePath || file.name);
+      calls.push({name:file.name,path:relative,target});
       if (file.name === "broken.pdf")
         return {ok:false,status:400,body:{error:"not a PDF file"}};
-      return {ok:true,status:200,body:{slug:file.name.replace(/\.pdf$/i, ""),
-        job:{slug:file.name.replace(/\.pdf$/i, ""),stage:"queued",done:false}}};
+      const slug = relative.replace(/\.pdf$/i, "").replace(/[^a-z0-9]+/gi, "_")
+        .replace(/^_+|_+$/g, "").toLowerCase();
+      return {ok:true,status:200,body:{slug,
+        job:{slug,stage:"queued",done:false}}};
     };
     let overviewThrows = false;
     context.__batchOverviewMock = async () => {
@@ -370,6 +411,83 @@ let failures = 0;
       "uploadPdfFile = __batchUploadMock; loadOverview = __batchOverviewMock; "
       + "JOBS = {}; POLL = {}; POLL_TIMER = null; POLL_INFLIGHT = false;",
       context, { filename: "batch-upload-mocks" });
+
+    // A recursive directory FileList can contain arbitrary depths and files
+    // ignored by accept=.pdf. Same basenames in different subdirectories are
+    // distinct uploads and must also have distinct idempotency fingerprints.
+    const folderA = {name:"same.pdf",type:"application/pdf",size:101,lastModified:7,
+      webkitRelativePath:"root/area_a/same.pdf"};
+    const folderB = {name:"same.pdf",type:"application/pdf",size:101,lastModified:7,
+      webkitRelativePath:"root/area_b/deep/same.pdf"};
+    const folderUpper = {name:"UPPER.PDF",type:"",size:202,lastModified:8,
+      webkitRelativePath:"root/area_b/deep/UPPER.PDF"};
+    const folderIgnored = {name:"notes.txt",type:"text/plain",size:303,lastModified:9,
+      webkitRelativePath:"root/area_b/deep/notes.txt"};
+    upFolder.files = [folderA,folderB,folderUpper,folderIgnored];
+    upFolder.onchange();
+    const selectedFolder = vm.runInContext(
+      "selectedPdfFiles().map(f=>uploadRelativePath(f))", context);
+    if (Array.from(selectedFolder).join("|")
+        !== "root/area_a/same.pdf|root/area_b/deep/same.pdf|root/area_b/deep/UPPER.PDF")
+      problems.push(`目录递归 PDF 过滤/顺序错误: ${Array.from(selectedFolder).join("|")}`);
+    if (!upName.textContent.includes("3 PDFs selected")
+        || !upName.title.includes("root/area_b/deep/UPPER.PDF")
+        || !upErr.textContent.includes("1 non-PDF file was ignored"))
+      problems.push("目录选择没有显示层级路径、大小写 PDF 数量或非 PDF 过滤摘要");
+    context.__folderTokenA = folderA;
+    context.__folderTokenB = folderB;
+    const fingerprints = vm.runInContext(
+      "[uploadFileFingerprint(__folderTokenA,'folder target'),"
+      + "uploadFileFingerprint(__folderTokenB,'folder target')]", context);
+    const folderTokenA = context.uploadTokenFor(folderA,"folder target");
+    const folderTokenB = context.uploadTokenFor(folderB,"folder target");
+    if (fingerprints[0] === fingerprints[1] || folderTokenA === folderTokenB)
+      problems.push("同名不同目录 PDF 错误复用 fingerprint/token");
+
+    // Cancelling the native directory picker dispatches an empty change in
+    // some browsers. It must be a no-op, preserving both the recursive set and
+    // an independent Choose PDFs selection.
+    const loosePdf = {name:"loose.pdf",type:"application/pdf",size:404,lastModified:10};
+    upFile.files = [loosePdf];
+    upFile.onchange();
+    upFolder.files = [];
+    upFolder.onchange();
+    const afterFolderCancel = vm.runInContext(
+      "selectedPdfFiles().map(f=>uploadRelativePath(f))", context);
+    if (Array.from(afterFolderCancel).join("|")
+        !== "loose.pdf|root/area_a/same.pdf|root/area_b/deep/same.pdf|root/area_b/deep/UPPER.PDF"
+        || upRun.disabled)
+      problems.push("取消 Choose Folder 后改动了文件/目录选择或禁用了 Start");
+    upFile.files = [];
+    upFile.onchange();
+    const folderOnlyAfterFileReset = vm.runInContext(
+      "selectedPdfFiles().map(f=>uploadRelativePath(f))", context);
+    if (Array.from(folderOnlyAfterFileReset).join("|") !== Array.from(selectedFolder).join("|"))
+      problems.push("清空 Choose PDFs 入口时误清空了目录选择");
+
+    modal.style.display = "flex";
+    context.document.getElementById("upTarget").value = "folder target";
+    await upRun.onclick();
+    const folderCalls = calls.map(x=>x.path).join("|");
+    if (folderCalls
+        !== "root/area_a/same.pdf|root/area_b/deep/same.pdf|root/area_b/deep/UPPER.PDF")
+      problems.push(`目录 PDF 没有逐份排队或同名文件被覆盖: ${folderCalls}`);
+    const folderQueued = vm.runInContext("Object.keys(JOBS).sort()", context);
+    if (Array.from(folderQueued).join("|")
+        !== "root_area_a_same|root_area_b_deep_same|root_area_b_deep_upper")
+      problems.push(`同名不同目录 PDF 没有形成三个任务: ${Array.from(folderQueued).join("|")}`);
+    if (overviewCalls !== 1) problems.push(`目录批次 overview 刷新 ${overviewCalls} 次，不是 1 次`);
+    const resetState = vm.runInContext(
+      "({selected:selectedPdfFiles().length,file:UPLOAD_FILE_SELECTION.length,"
+      + "folder:UPLOAD_FOLDER_SELECTION.length})", context);
+    if (resetState.selected || resetState.file || resetState.folder
+        || (upFile.files || []).length || (upFolder.files || []).length)
+      problems.push("目录批次完成后没有同时 reset 两个上传入口");
+
+    calls.length = 0;
+    overviewCalls = 0;
+    vm.runInContext("JOBS = {}; POLL = {}; POLL_TIMER = null; POLL_INFLIGHT = false;",
+      context, {filename:"batch-upload-after-folder"});
 
     upFile.files = [{name:"alpha.pdf"},{name:"broken.pdf"},{name:"charlie.pdf"}];
     upFile.onchange();
@@ -471,10 +589,11 @@ let failures = 0;
     upFile.onchange();
     context.setUploadBusy(true);
     if (!context.document.getElementById("upPick").disabled
+        || !context.document.getElementById("upPickFolder").disabled
         || !context.document.getElementById("upTarget").disabled
         || upRun.disabled !== true
         || context.document.getElementById("upCancel").textContent !== "Hide")
-      problems.push("上传忙碌态没有锁住选择/target 或缺少 Hide");
+      problems.push("上传忙碌态没有同时锁住文件/目录选择、target 或缺少 Hide");
     modal.style.display = "flex";
     context.document.getElementById("upCancel").onclick();
     if (modal.style.display !== "none") problems.push("上传中无法隐藏弹窗");
@@ -482,6 +601,17 @@ let failures = 0;
     if (modal.style.display !== "flex") problems.push("上传中无法从顶栏找回弹窗");
     context.setUploadBusy(false);
     context.clearUploadResultPending();
+    upFolder.files = [folderA];
+    upFolder.onchange();
+    context.resetUploadSelections();
+    context.renderUploadSelection();
+    const manualReset = vm.runInContext(
+      "({selected:selectedPdfFiles().length,file:UPLOAD_FILE_SELECTION.length,"
+      + "folder:UPLOAD_FOLDER_SELECTION.length})", context);
+    if (manualReset.selected || manualReset.file || manualReset.folder
+        || (upFile.files || []).length || (upFolder.files || []).length
+        || !upRun.disabled)
+      problems.push("resetUploadSelections 没有同时清空文件/目录两个入口");
 
     // 多任务顶栏优先显示真正运行的任务，不被更新但仍 queued 的 0% 卡盖住。
     context.renderTopJobStatus([
@@ -505,8 +635,15 @@ let failures = 0;
       + "POLL_TIMER = __savedPollState.timer; "
       + "POLL_INFLIGHT = __savedPollState.inflight; POLL_SEQ = __savedPollState.seq;",
       context, { filename: "restore-batch-upload" });
+    context.setUploadBusy(false);
+    context.clearUploadResultPending();
+    context.resetUploadSelections();
+    upFile.click = oldUpFileClick;
+    upFolder.click = oldUpFolderClick;
     upFile.files = [];
     upFile.value = "";
+    upFolder.files = [];
+    upFolder.value = "";
     modal.style.display = "none";
     context.toggleProjectDrawer(false);
     context.renderJobs();
@@ -515,7 +652,7 @@ let failures = 0;
     console.log(`  FAIL 批量上传: ${problems.join("; ")}`);
     failures += 1;
   } else {
-    console.log("  OK   批量上传: 多选、逐份排队、失败隔离和防重复重试均正常");
+    console.log("  OK   批量上传: 文件/递归目录、多级路径、过滤、逐份隔离和防重复均正常");
   }
 }
 
@@ -825,6 +962,8 @@ let failures = 0;
     ["FENCING / GATES", false],
     ["FENCED ACCESS GATE", false],
     ["FENCES AND GATES", false],
+    ["FENCELINE GATE", false],
+    ["FENCE LINE / GATE", false],
     ["AGGREGATE BASE", false],
   ];
   const problems = [];
@@ -923,6 +1062,8 @@ for (const rel of urls) {
             "CUR = {slug: __slug, page: PAGE.page};"
             + "ALL_LT = __all; ALL_LT_KEY = allKey(); ALL_LT_STATE = 'ok';"
             + "ALL_FOCUS = null; ALL_FILTER = '';"
+            + "$('bar').classList.remove('tucked');"
+            + "$('tgLtMeta').querySelector('input').checked = true;"
             + "$('tgAll').querySelector('input').checked = true;",
             context, { filename: "inject-all" });
           context.drawAllLinetypes();
@@ -1140,7 +1281,9 @@ for (const rel of urls) {
     + "detail:ALL_LT_DETAIL,focus:ALL_FOCUS,filter:ALL_FILTER,inflight:ALL_LT_INFLIGHT,"
     + "selectedScope,selectedRow,ltChecked:$('tgLt').querySelector('input').checked,"
     + "allChecked:$('tgAll').querySelector('input').checked,"
-    + "provChecked:$('tgLtSrc').querySelector('input').checked})", context);
+    + "provChecked:$('tgLtSrc').querySelector('input').checked,"
+    + "metaChecked:$('tgLtMeta').querySelector('input').checked,"
+    + "barTucked:$('bar').classList.contains('tucked')})", context);
   let skipped = false;
   try {
     const fixture = saved.page ? JSON.parse(JSON.stringify(saved.page)) : null;
@@ -1200,6 +1343,8 @@ for (const rel of urls) {
         + "$('tgLt').querySelector('input').checked=true;"
         + "$('tgAll').querySelector('input').checked=false;"
         + "$('tgLtSrc').querySelector('input').checked=false;"
+        + "$('tgLtMeta').querySelector('input').checked=false;"
+        + "$('bar').classList.add('tucked');"
         + "makeScopeModel();build();renderList();syncLayers();", context,
         {filename:"method2-pattern-normal"});
       context.__patternNumber = target.line_type_number;
@@ -1218,7 +1363,8 @@ for (const rel of urls) {
         + "nodes:(LT_NODES.get(__patternNumber)||[]).map(n=>({tag:n.tagName,"
         + "cls:n.getAttribute('class'),pattern:n.dataset.pattern,lt:n.dataset.lt,"
         + "x:n.getAttribute('x'),y:n.getAttribute('y'),w:n.getAttribute('width'),"
-        + "h:n.getAttribute('height')})),"
+        + "h:n.getAttribute('height'),title:((n.children||[]).find(c=>"
+        + "c.tagName==='TITLE')||{}).textContent||''})),"
         + "rows:(LT_INDEX.rows||[]).filter(r=>r.number===__patternNumber),"
         + "method1Leak:method2PatternInstances({recognition_source:'method1',"
         + "pattern_instances:__patternPage.record.linetypes.line_types.find("
@@ -1228,20 +1374,99 @@ for (const rel of urls) {
         problems.push(`normal 画了 ${normalBoxes.length} 个框，应为 2`);
       if (normalBoxes.some((node) => node.tag !== "RECT"
           || node.pattern !== "confirmed" || Number(node.lt) !== target.line_type_number
-          || !(Number(node.w) > 0) || !(Number(node.h) > 0)))
+          || !(Number(node.w) > 0) || !(Number(node.h) > 0)
+          || node.title !== "Fenceline pattern"))
         problems.push("normal pattern 框的 rect/data/尺寸不完整");
       if (normal.method1Leak !== 0)
         problems.push("Method 1 误带 pattern_instances 时仍会画框");
       if (!normal.rows.length || normal.rows.some((row) =>
           row.source !== "Method 2" || row.patternCount !== 2))
-        problems.push("normal FENCELINE 没展示 Method 2 / confirmed pattern 数");
+        problems.push("normal FENCELINE 内部索引丢失 Method 2 / pattern 数据");
       const normalListRows = (context.document.getElementById("list").children || [])
         .filter((node) => node.dataset
           && Number(node.dataset.lt) === target.line_type_number);
+      const customerLeaks = ["#701", "Line type", "synthetic_method2", "segments",
+        "Method 2", "confirmed pattern", "terminals"];
       if (!normalListRows.length || normalListRows.some((node) =>
-          !String(node.innerHTML).includes("Method 2")
-          || !String(node.innerHTML).includes("2 confirmed patterns boxed")))
-        problems.push("normal 列表来源/框数量文案缺失");
+          !String(node.innerHTML).includes(scopeText)))
+        problems.push("默认 FENCELINE 没保留识别出的客户可读文字");
+      if (normalListRows.some((node) => customerLeaks.some((token) =>
+          String(node.innerHTML).includes(token))))
+        problems.push("默认 FENCELINE 泄漏编号/family/算法/几何/pattern/terminal 元数据");
+      const currentLtTitles = () => JSON.parse(vm.runInContext(
+        "JSON.stringify((((svg&&svg.children)||[]).find(n=>n.id==='gLt')||"
+        + "{children:[]}).children.filter(n=>n.tagName==='TITLE').map(n=>n.textContent))",
+        context));
+      const currentPatternTitles = () => JSON.parse(vm.runInContext(
+        "JSON.stringify((((svg&&svg.children)||[]).find(n=>n.id==='gLt')||"
+        + "{children:[]}).children.filter(n=>n.getAttribute&&"
+        + "n.getAttribute('class')==='lt-pattern').map(n=>"
+        + "(((n.children||[]).find(c=>c.tagName==='TITLE')||{}).textContent||'')))",
+        context));
+      const defaultTitles = currentLtTitles();
+      if (!defaultTitles.length || defaultTitles.some((value) => value !== "Fenceline"))
+        problems.push(`客户视图 SVG tooltip 仍含算法详情: ${defaultTitles.join(" | ")}`);
+      if (currentPatternTitles().some((value) => value !== "Fenceline pattern"))
+        problems.push("客户视图 pattern tooltip 仍含 Method/group/source 算法详情");
+
+      // 线型诊断必须同时满足“Debug Console 已展开”和显式 checkbox。关闭
+      // Console 后 checkbox 可以保留，但客户视图必须立即恢复为纯文字。
+      const metaTag = (html.match(
+        /<label\b[^>]*\bid=["']tgLtMeta["'][\s\S]*?<\/label>/i) || [""])[0];
+      if (!metaTag || !/line-type diagnostics/i.test(metaTag))
+        problems.push("Debug Console 缺少 line-type diagnostics 开关");
+      if (/<input\b[^>]*\bchecked\b/i.test(metaTag))
+        problems.push("line-type diagnostics 开关在 HTML 中不是默认关闭");
+      const metaInput = context.document.getElementById("tgLtMeta").querySelector("input");
+      const normalNodeCount = vm.runInContext(
+        "(LT_NODES.get(__patternNumber)||[]).length", context);
+      const toggleConsole = () => vm.runInContext(
+        "__patternOv=OV;OV=[];$('bLayers').onclick();OV=__patternOv;", context,
+        {filename:"line-type-diagnostics-console"});
+      toggleConsole();
+      metaInput.checked = true;
+      metaInput.dispatchEvent({type:"change"});
+      const debugRows = (context.document.getElementById("list").children || [])
+        .filter((node) => node.dataset
+          && Number(node.dataset.lt) === target.line_type_number);
+      const debugTitles = currentLtTitles();
+      if (!debugRows.length || debugRows.some((node) =>
+          !String(node.innerHTML).includes("#701")
+          || !String(node.innerHTML).includes("synthetic_method2")
+          || !String(node.innerHTML).includes("segments")
+          || !String(node.innerHTML).includes("Method 2")
+          || !String(node.innerHTML).includes("confirmed patterns boxed")))
+        problems.push("诊断开关开启后没有恢复 FENCELINE 技术元数据");
+      if (!debugTitles.some((value) => value.includes("#701")
+          && value.includes("Method 2") && value.includes("segments")))
+        problems.push("诊断开关开启后没有恢复 SVG 技术 tooltip");
+      if (!currentPatternTitles().some((value) =>
+          value.includes("Method 2 confirmed repeated pattern")))
+        problems.push("诊断开关开启后没有恢复 pattern 技术 tooltip");
+      toggleConsole();
+      const collapsedRows = (context.document.getElementById("list").children || [])
+        .filter((node) => node.dataset
+          && Number(node.dataset.lt) === target.line_type_number);
+      const collapsedTitles = currentLtTitles();
+      if (collapsedRows.some((node) => customerLeaks.some((token) =>
+          String(node.innerHTML).includes(token)))
+          || collapsedTitles.some((value) => value !== "Fenceline")
+          || currentPatternTitles().some((value) => value !== "Fenceline pattern"))
+        problems.push("收起 Debug Console 后 checkbox=true 仍泄漏线型诊断信息");
+      toggleConsole();
+      const reopenedRows = (context.document.getElementById("list").children || [])
+        .filter((node) => node.dataset
+          && Number(node.dataset.lt) === target.line_type_number);
+      if (!reopenedRows.length
+          || !String(reopenedRows[0].innerHTML).includes("synthetic_method2"))
+        problems.push("重新展开 Debug Console 后已勾选的诊断信息未恢复");
+      metaInput.checked = false;
+      metaInput.dispatchEvent({type:"change"});
+      toggleConsole();
+      const normalNodeCountAfterMeta = vm.runInContext(
+        "(LT_NODES.get(__patternNumber)||[]).length", context);
+      if (normalNodeCountAfterMeta !== normalNodeCount)
+        problems.push("诊断开关改变了普通 FENCELINE 高亮几何");
 
       const provenanceKinds = JSON.parse(vm.runInContext(
         "JSON.stringify(lineTypeProvenance(__patternNumber))", context));
@@ -1254,6 +1479,7 @@ for (const rel of urls) {
 
       const provenanceInput = context.document.getElementById("tgLtSrc")
         .querySelector("input");
+      toggleConsole();
       provenanceInput.checked = true;
       provenanceInput.dispatchEvent({type:"change"});
       const provenanceOn = JSON.parse(vm.runInContext(
@@ -1274,6 +1500,7 @@ for (const rel of urls) {
         problems.push("provenance 开启后普通列表/选择详情/聚焦标签未同时显示三类来源");
       provenanceInput.checked = false;
       provenanceInput.dispatchEvent({type:"change"});
+      toggleConsole();
 
       const targetRow = normal.rows[0];
       if (targetRow) {
@@ -1304,7 +1531,8 @@ for (const rel of urls) {
       const allM2 = {
         line_type_number:701,signature_family:"synthetic_method2",
         recognition_source:"method2",op_count:4,segment_count:1,
-        member_count:2,runs:[{run_id:"r1"}],bound_by:[],
+        member_count:2,runs:[{run_id:"r1"}],
+        bound_by:[{key:"s1:0",ti:0,distance:0}],
         bbox:[100,120,145,325],polylines:[[[110,120],[110,325]]],
         pattern_instance_count:2,pattern_instances:instances,
       };
@@ -1333,6 +1561,23 @@ for (const rel of urls) {
       if (allState.m1.includes("al-pattern"))
         problems.push("All 层给 Method 1 画了 pattern 框");
 
+      const allInput = context.document.getElementById("tgAll").querySelector("input");
+      // build() replaces the SVG and therefore the actual <g id="gAll">.
+      // Always resolve it again; keeping an old node would make layer checks
+      // pass or fail against detached geometry instead of the live canvas.
+      const allGroupNow = () => context.document.getElementById("gAll");
+      const sel = context.document.getElementById("sel");
+      const listAllItems = () => (context.document.getElementById("list").children || [])
+        .filter((node) => node.classList && node.classList.contains("al-item"));
+      const hasAllSection = () => (context.document.getElementById("list").children || [])
+        .some((node) => String(node.textContent || "") === "ALL LINE TYPES (DEBUG)");
+
+      // tgAll 只控制画布几何和取数。客户默认视图里即使几何已打开，也不能
+      // 把完整聚类清单或点击后的算法卡塞进 Fence scope。
+      if (listAllItems().length || hasAllSection())
+        problems.push("诊断关闭时 tgAll 仍把 ALL LINE TYPES(DEBUG) 渲染进侧栏");
+      sel.classList.add("has"); sel.dataset.detail = "line-type-diagnostic";
+      sel.innerHTML = "stale all-line detail";
       context.focusAllType(701, false);
       const allFocused = JSON.parse(vm.runInContext(
         "JSON.stringify({m2:(ALL_NODES.get(701)||[]).filter(n=>"
@@ -1346,16 +1591,29 @@ for (const rel of urls) {
           || allFocused.m1.some((node) => node.focus || !node.dim))
         problems.push("All pattern 框没有随类型 focus，其余类型没有 dim");
       context.showAllTypeDetail(allM2);
-      const detail = context.document.getElementById("sel").innerHTML;
-      if (!context.document.getElementById("sel").classList.contains("has")
-          || !detail.includes("source Method 2")
-          || !detail.includes("2 confirmed pattern instances boxed"))
-        problems.push("All 详情没有 Method 2 来源/confirmed pattern 数");
-      context.renderList();
-      const allItems = (context.document.getElementById("list").children || [])
-        .filter((node) => node.classList && node.classList.contains("al-item"));
+      if (sel.classList.contains("has") || sel.innerHTML)
+        problems.push("诊断关闭时 show/focus All type 仍显示算法详情");
+
+      let networkCalls = 0;
+      context.fetch = async () => {
+        networkCalls += 1;
+        return {ok:false,status:599,json:async()=>({error:"unexpected request"})};
+      };
+      toggleConsole();
+      metaInput.checked = true;
+      metaInput.dispatchEvent({type:"change"});
+      context.showAllTypeDetail(allM2);
+      const detail = sel.innerHTML;
+      const allItems = listAllItems();
       const m2Item = allItems.find((node) => Number(node.dataset.al) === 701);
       const m1Item = allItems.find((node) => Number(node.dataset.al) === 702);
+      if (!hasAllSection() || allItems.length !== 2)
+        problems.push("诊断开启后没有恢复 ALL LINE TYPES(DEBUG) 清单");
+      if (!sel.classList.contains("has")
+          || !detail.includes("source Method 2")
+          || !detail.includes("2 confirmed pattern instances boxed")
+          || !detail.includes("Bound by: s1:0/0 @0pt"))
+        problems.push("诊断开启后没有恢复算法详情/Bound by");
       if (!m2Item || !String(m2Item.innerHTML).includes("Method 2")
           || !String(m2Item.innerHTML).includes("2 confirmed patterns boxed"))
         problems.push("All 列表没有 Method 2 / pattern 数");
@@ -1382,34 +1640,63 @@ for (const rel of urls) {
       vm.runInContext("drawAllLinetypes();renderList();", context,
         {filename:"linetype-provenance-all-off"});
 
-      let networkCalls = 0;
-      context.fetch = async () => {
-        networkCalls += 1;
-        return {ok:false,status:599,json:async()=>({error:"unexpected request"})};
-      };
-      const allInput = context.document.getElementById("tgAll").querySelector("input");
-      const allGroup = context.document.getElementById("gAll");
+      const allNodeCount = (allGroupNow().children || []).length;
+      toggleConsole();
+      if (listAllItems().length || hasAllSection()
+          || sel.classList.contains("has") || sel.innerHTML)
+        problems.push("收起 Debug Console 后 All 清单/详情仍残留");
+      if (allGroupNow().style.display === "none"
+          || (allGroupNow().children || []).length !== allNodeCount)
+        problems.push("收起 Debug Console 误隐藏或重算 tgAll 画布几何");
+
+      // Console 重新打开会恢复已勾选的诊断清单。关闭 tgAll 则必须立即清除
+      // 这张清单和当前 All detail；之后选普通 FENCELINE 不得偷偷重开 tgAll。
+      toggleConsole();
+      context.showAllTypeDetail(allM2);
       allInput.checked = false; allInput.dispatchEvent({type:"change"});
-      if (allGroup.style.display !== "none")
+      if (allGroupNow().style.display !== "none")
         problems.push("关闭 All 后 pattern 框层仍显示");
-      const offListItems = (context.document.getElementById("list").children || [])
-        .filter((node) => node.classList && node.classList.contains("al-item"));
-      const offListSection = (context.document.getElementById("list").children || [])
-        .some((node) => String(node.textContent || "") === "ALL LINE TYPES (DEBUG)");
-      if (offListItems.length || offListSection)
-        problems.push("关闭 All 后调试侧栏仍残留");
+      if (listAllItems().length || hasAllSection()
+          || sel.classList.contains("has") || sel.innerHTML)
+        problems.push("关闭 All 后调试侧栏/All detail 仍残留");
+      if (targetRow) context.selectScope(targetRow.scopeId, false);
+      if (allInput.checked || allGroupNow().style.display !== "none")
+        problems.push("选择普通 FENCELINE 因 ALL_LT 缓存而强制重开 tgAll");
+      const focusedNormalLines = vm.runInContext(
+        "(LT_NODES.get(__patternNumber)||[]).filter(n=>"
+        + "n.getAttribute('class')==='lt-line'&&n.classList.contains('lt-focus')).length",
+        context);
+      if (!focusedNormalLines)
+        problems.push("关闭 tgAll 后选择普通 FENCELINE 没有正常高亮");
       allInput.checked = true; allInput.dispatchEvent({type:"change"});
       await Promise.resolve();
-      const restoredBoxes = (allGroup.children || []).filter((node) =>
+      const restoredBoxes = (allGroupNow().children || []).filter((node) =>
         node.getAttribute && node.getAttribute("class") === "al-pattern");
-      const restoredListItems = (context.document.getElementById("list").children || [])
-        .filter((node) => node.classList && node.classList.contains("al-item"));
-      if (allGroup.style.display === "none" || restoredBoxes.length !== 2)
+      if (allGroupNow().style.display === "none" || restoredBoxes.length !== 2)
         problems.push("再次打开 All 没从缓存恢复两个 pattern 框");
-      if (restoredListItems.length !== 2)
+      if (listAllItems().length !== 2 || !hasAllSection())
         problems.push("再次打开 All 没从缓存恢复调试侧栏");
+
+      metaInput.checked = false;
+      metaInput.dispatchEvent({type:"change"});
+      if (listAllItems().length || hasAllSection()
+          || sel.classList.contains("has") || sel.innerHTML)
+        problems.push("关闭 line-type diagnostics 后清单/详情仍残留");
+      if (allGroupNow().style.display === "none"
+          || (allGroupNow().children || []).length !== allNodeCount)
+        problems.push("关闭 line-type diagnostics 误影响 tgAll 画布几何");
+      allInput.checked = false; allInput.dispatchEvent({type:"change"});
+      allInput.checked = true; allInput.dispatchEvent({type:"change"});
+      await Promise.resolve();
+      const finalBoxes = (allGroupNow().children || []).filter((node) =>
+        node.getAttribute && node.getAttribute("class") === "al-pattern");
+      if (allGroupNow().style.display === "none" || finalBoxes.length !== 2)
+        problems.push("诊断关闭时 All 开→关→开没有从缓存恢复几何");
+      if (listAllItems().length || hasAllSection())
+        problems.push("诊断关闭时 All 开→关→开重新泄漏调试侧栏");
+      toggleConsole();
       if (networkCalls)
-        problems.push(`All pattern 开→关→开额外请求 ${networkCalls} 次`);
+        problems.push(`诊断/All 开关过程额外请求 ${networkCalls} 次`);
     }
   } catch (error) {
     const first = error && error.stack ? error.stack.split("\n")[0] : String(error);
@@ -1427,6 +1714,8 @@ for (const rel of urls) {
       + "$('tgLt').querySelector('input').checked=__patternSaved.ltChecked;"
       + "$('tgAll').querySelector('input').checked=__patternSaved.allChecked;"
       + "$('tgLtSrc').querySelector('input').checked=__patternSaved.provChecked;"
+      + "$('tgLtMeta').querySelector('input').checked=__patternSaved.metaChecked;"
+      + "$('bar').classList.toggle('tucked',__patternSaved.barTucked);"
       + "if(PAGE){makeScopeModel();build();renderList();syncLayers();}", context,
       {filename:"method2-pattern-restore"});
   }
@@ -1434,7 +1723,7 @@ for (const rel of urls) {
     console.log(`  FAIL Method 2 pattern 框: ${problems.join("; ")}`);
     failures += 1;
   } else if (!skipped) {
-    console.log("  OK   普通框详情已隐藏；Method 2 pattern 与三类 binding provenance 开关通过");
+    console.log("  OK   客户 FENCELINE 纯文字；线型诊断/All 详情/Method 2 pattern/provenance 开关通过");
   }
 }
 
@@ -1530,6 +1819,36 @@ for (const rel of urls) {
         problems.push(`没有使用 GET/POST 专用超时: ${deadlines.join(",")}`);
       if (buildLimit < 3600 * 1000)
         problems.push(`POST 超时 ${buildLimit}ms 短于密页边车上限`);
+
+      // Legend-only 页的 GET 会带一个可验证但不完整的 supervised 子集。
+      // partial 绝不能进入 ok/绘图终态，必须和 missing/stale 一样只触发
+      // 一次完整 POST；最终画布只能来自 POST 返回的 full audit。
+      vm.runInContext(
+        "epoch+=1; ALL_LT=null; ALL_LT_KEY=''; ALL_LT_STATE='idle';"
+        + "ALL_LT_DETAIL=''; ALL_LT_INFLIGHT=null; build();",
+        context, {filename: "all-partial-setup"});
+      const partialCalls = [];
+      context.fetch = async (_url, opt = {}) => {
+        const method = String(opt.method || "GET").toUpperCase();
+        partialCalls.push(method);
+        if (method === "GET") return response({
+          state: "partial", partial: true, cache_state: "not-run",
+          types: [{...full.types[0], line_type_number: 999}], residual: null,
+        });
+        return response(full);
+      };
+      await context.ensureAllLinetypes();
+      const partialBuilt = vm.runInContext(
+        "({state:ALL_LT_STATE,partial:!!(ALL_LT&&ALL_LT.partial),"
+        + "hasFull:ALL_NODES.has(901),hasSubset:ALL_NODES.has(999),"
+        + "inflight:!!ALL_LT_INFLIGHT})", context);
+      if (partialCalls.join(",") !== "GET,POST")
+        problems.push(`partial 请求顺序=${partialCalls.join(",")}`);
+      if (partialBuilt.state !== "ok" || partialBuilt.partial
+          || !partialBuilt.hasFull || partialBuilt.hasSubset)
+        problems.push("partial 子集被误当成完整 ok 或写进最终画布");
+      if (partialBuilt.inflight)
+        problems.push("partial POST 完成后 inflight 未清理");
 
       // 再走 stale 分支，在 POST 飞行期间使页面代次失效。
       vm.runInContext(

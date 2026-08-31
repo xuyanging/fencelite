@@ -19,7 +19,8 @@ from pathlib import Path
 
 from core.config import MODEL_NAME
 from steps.placements import (LINE_NOTE, NO_PLAN_NOTE, has_current_placements,
-                              match_placements)
+                              match_placements,
+                              placement_scope_signature)
 from steps.store import items_of, pdf_revision, sig_of
 from steps.symbols import (_require_group_symbol_lists, can_reuse_raw,
                            compute_page_symbols, filter_owned_group_symbols,
@@ -451,7 +452,10 @@ class TestPlacements(unittest.TestCase):
                                    "dropped_outside_plan": 2,
                                    "dropped_without_outline": 0,
                                    "plan_groups": 1,
-                                   "plc_v": PLACEMENT_VERSION})
+                                   "plc_v": PLACEMENT_VERSION,
+                                   "plc_scope_sig":
+                                       placement_scope_signature(
+                                           symbols, PLAN_GROUPS)})
 
     def test_inherited_row_code_requires_a_real_enclosing_outline(self):
         sample = [700, 700, 710, 709]       # inherited parent frame: 10x9
@@ -548,12 +552,56 @@ class TestPlacements(unittest.TestCase):
         self.assertEqual(snapshot, symbols)
 
     def test_has_current_placements(self):
-        self.assertFalse(has_current_placements(None))
-        self.assertFalse(has_current_placements({}))
-        self.assertFalse(has_current_placements({"plc_v": PLACEMENT_VERSION + 1}))
+        self.assertFalse(has_current_placements(None, PLAN_GROUPS))
+        self.assertFalse(has_current_placements({}, PLAN_GROUPS))
+        self.assertFalse(has_current_placements(
+            {"plc_v": PLACEMENT_VERSION + 1}, PLAN_GROUPS))
         result = {"symbols": []}
         result.update(match_placements("x.pdf", 0, [], PLAN_GROUPS))
-        self.assertTrue(has_current_placements(result))
+        self.assertTrue(has_current_placements(result, PLAN_GROUPS))
+
+    def test_scope_rejects_changed_plan_or_shape_and_is_order_invariant(self):
+        symbols = [self._shape()]
+        result = {
+            "symbols": copy.deepcopy(symbols),
+            "plc_v": PLACEMENT_VERSION,
+            "plc_scope_sig": placement_scope_signature(
+                symbols, PLAN_GROUPS),
+        }
+        self.assertTrue(has_current_placements(result, PLAN_GROUPS))
+        self.assertTrue(has_current_placements(
+            result, list(reversed(PLAN_GROUPS))))
+        elevation = copy.deepcopy(PLAN_GROUPS)
+        elevation[0]["view_type"] = "elevation"
+        self.assertFalse(has_current_placements(result, elevation))
+        moved_plan = copy.deepcopy(PLAN_GROUPS)
+        moved_plan[0]["box_2d"][2] += 0.001
+        self.assertFalse(has_current_placements(result, moved_plan))
+        moved_symbol = copy.deepcopy(result)
+        moved_symbol["symbols"][0]["box_2d"][1] += 0.001
+        self.assertFalse(has_current_placements(moved_symbol, PLAN_GROUPS))
+
+    def test_old_or_pending_shape_scope_fails_closed(self):
+        symbols = [self._shape()]
+        self.assertFalse(has_current_placements(
+            {"symbols": symbols, "plc_v": PLACEMENT_VERSION}, PLAN_GROUPS))
+        self.assertIsNone(placement_scope_signature(symbols, None))
+        self.assertFalse(has_current_placements({
+            "symbols": symbols,
+            "plc_v": PLACEMENT_VERSION,
+            "plc_scope_sig": None,
+        }, None))
+
+    def test_line_only_scope_is_independent_of_view_classification(self):
+        symbols = [{"box_2d": SAMPLE_BOX, "category": "line", "value": "SF",
+                    "text_index": 0, "group_index": 1}]
+        result = {
+            "symbols": symbols,
+            "plc_v": PLACEMENT_VERSION,
+            "plc_scope_sig": placement_scope_signature(symbols, None),
+        }
+        self.assertTrue(has_current_placements(result, None))
+        self.assertTrue(has_current_placements(result, PLAN_GROUPS))
 
     def test_debug_channel_is_always_collected(self):
         from steps.debug import DebugSink
@@ -738,7 +786,7 @@ class TestReferenceRealMatcher(unittest.TestCase):
                 self.assertEqual(summary["placed"], placed)
                 self.assertEqual(summary["dropped_outside_plan"], dropped)
                 result.update(summary)
-                self.assertTrue(has_current_placements(result))
+                self.assertTrue(has_current_placements(result, typed))
                 total_placed += summary["placed"]
                 total_dropped += summary["dropped_outside_plan"]
         self.assertEqual(total_placed, REF_TOTAL_PLACED)

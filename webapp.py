@@ -40,13 +40,11 @@ from steps import arrows, legend_linetypes, linetypes, store
 from steps.legend_linetypes.merge import (
     LegendMergeError, debug_types as legend_debug_types, merge_entries)
 from steps.linetypes import refresh_state as linetype_refresh_state
-from steps.placements import has_current_placements
-from steps.symbols import (has_current_symbols, marker_code_indices,
-                          symbols_dropped_view)
+from steps.placements import current_placement_context
+from steps.symbols import marker_code_indices, symbols_dropped_view
 from steps.text.target import TARGET_DEFAULT, is_default_target
 from steps.versions import FUSED_VERSION
-from steps.views import (groups_need_classification, has_current_view_types,
-                         merge_view_types, plan_boxes)
+from steps.views import merge_view_types, plan_boxes
 
 BASE_LONG = 5000          # base render long side (px) — sharp enough to zoom
 JPEG_Q = 80
@@ -93,29 +91,26 @@ def _fused_pending(reason):
     }), 409
 
 
-def _symbols_publishable(entry, sig):
-    """符号 + 放置是否当期可发布 —— 直接用写缓存那两步自己的判定函数.
-
-    has_current_symbols 锚定 (items, pdf_revision) + 提示词/过滤版本，
-    has_current_placements 锚定本地放置匹配版本。任何一项不当期都视作
-    「这一页还没算」，返回空符号层，绝不把旧几何画到新底图上。
-    """
-    return bool(has_current_symbols(entry, sig)
-                and has_current_placements(entry.get("result")))
-
-
-def _typed_groups(slug, page, groups, revision):
-    """Cache-only read.  Return typed groups, or ``None`` when pending."""
-    if not groups_need_classification(groups):
-        return merge_view_types(groups, None)
-    entry = store.load_json(
-        store.slug_dir(slug) / "view_types.json", {}).get(str(page))
-    if not has_current_view_types(entry, groups, revision):
-        return None
-    return merge_view_types(groups, entry)
+def _placement_context_for(slug, page, items, revision, *,
+                           symbol_cache=None, view_cache=None):
+    """One prerequisite decision shared by every web placement consumer."""
+    symbols = (store.load_json(
+        store.slug_dir(slug) / "symbols.json", {})
+        if symbol_cache is None else symbol_cache)
+    views = (store.load_json(
+        store.slug_dir(slug) / "view_types.json", {})
+        if view_cache is None else view_cache)
+    entry = (symbols or {}).get(str(page))
+    context = current_placement_context(
+        entry, store.sig_of(items, revision),
+        (views or {}).get(str(page)), revision)
+    context["entry"] = entry
+    context["raw_result"] = ((entry or {}).get("result") or {})
+    context["publishable"] = bool(context["placements_current"])
+    return context
 
 
-def _page_symbols(slug, page, items, revision):
+def _page_symbols(slug, page, items, revision, *, context=None):
     """一页的符号层：图例样例 symbol + plan 视图内的放置 + 免费的剥离解释.
 
     纯读盘：symbols.json（付费步的产物）+ view_types.json（分类步的产物）。
@@ -125,9 +120,10 @@ def _page_symbols(slug, page, items, revision):
     empty = {"groups": [], "symbols": []}
     if not items:
         return empty, [], []
-    entry = store.load_json(
-        store.slug_dir(slug) / "symbols.json", {}).get(str(page))
-    if not _symbols_publishable(entry, store.sig_of(items, revision)):
+    context = (context or _placement_context_for(
+        slug, page, items, revision))
+    entry = context["entry"]
+    if not context["symbols_current"]:
         # 盘上明明有符号、只是版本戳对不上当前算法（改了算法/版本号之后就会这样）
         # —— 这种"陈旧"必须显式说出来。静默返回 0 会让人以为"模型没找到"，
         # 那是最误导的失败方式：真实案例里用户按着截图问"这条线怎么没框出来"，
@@ -138,12 +134,20 @@ def _page_symbols(slug, page, items, revision):
             return ({"groups": [], "symbols": [], "stale": True,
                      "stale_symbols": stale_count}, [], [])
         return empty, [], []
-    result = entry["result"]
+    result = context["symbols_result"]
     raw_groups = result.get("groups") or []
-    typed = _typed_groups(slug, page, raw_groups, revision)
+    typed = context["typed_groups"]
     payload = dict(result)
-    payload["symbols"] = [symbol for symbol in (result.get("symbols") or [])
-                          if isinstance(symbol, dict)]
+    payload["symbols"] = []
+    for symbol in result.get("symbols") or []:
+        if not isinstance(symbol, dict):
+            continue
+        published = dict(symbol)
+        if not context["placements_current"]:
+            published.pop("placements", None)
+        payload["symbols"].append(published)
+    if not context["placements_current"]:
+        payload["placements_pending"] = True
     if typed is None:
         # Only classifier-versioned view types may reach an API response.
         groups = merge_view_types(raw_groups, None)
@@ -162,10 +166,16 @@ def _page_symbols(slug, page, items, revision):
     return payload, list(dropped.get("dropped") or []), plans
 
 
-def _placement_anchors_for(slug, page):
-    """与 job._placement_anchors 同源：shape 放置也是箭头步的锚，必须进签名。"""
-    result = ((store.load_json(store.slug_dir(slug) / "symbols.json", {})
-               .get(str(page)) or {}).get("result") or {})
+def _placement_anchors_for(slug, page, items=None, revision=None, *,
+                           context=None):
+    """当期 shape 放置锚；stale symbol/placement 绝不能进入下游签名。"""
+    if items is None or revision is None:
+        return []
+    context = (context or _placement_context_for(
+        slug, page, items, revision))
+    if not context["publishable"]:
+        return []
+    result = context["placement_result"]
     anchors = []
     for si, symbol in enumerate(result.get("symbols") or []):
         for pi, box in enumerate(symbol.get("placements") or []):
@@ -174,7 +184,8 @@ def _placement_anchors_for(slug, page):
     return anchors
 
 
-def _attach_arrows(record, slug, page, items, revision, plan_regions=None):
+def _attach_arrows(record, slug, page, items, revision, plan_regions=None, *,
+                   symbol_context=None):
     """箭头步的结果与**分层状态**.
 
     只挂结果是不够的：一个空结果可能是「这页确实没有引线」，也可能是任何一层
@@ -197,12 +208,21 @@ def _attach_arrows(record, slug, page, items, revision, plan_regions=None):
     if not arrows.ENABLED:
         record["arrows_status"] = {"state": "disabled"}
         return
-    extra = _placement_anchors_for(slug, page)
+    symbol_context = (symbol_context or _placement_context_for(
+        slug, page, items, revision))
+    extra = _placement_anchors_for(
+        slug, page, items, revision, context=symbol_context)
     entry = store.load_json(
         store.slug_dir(slug) / "arrows.json", {}).get(str(page))
-    sig = arrows.arrows_signature(items, revision, extra)
+    sig = arrows.arrows_signature(
+        items, revision, extra,
+        plan_regions=symbol_context["plan_regions"])
 
-    if isinstance(entry, dict) and entry.get("error"):
+    # A failure belongs to this page state only when its captured signature is
+    # still current.  Showing an old timeout after the PDF/anchors changed is
+    # misleading; the old entry remains fail-closed and is simply stale.
+    if (isinstance(entry, dict) and entry.get("sig") == sig
+            and entry.get("error")):
         record["arrows_status"] = {"state": "failed",
                                    "detail": str(entry["error"])[:200]}
         return
@@ -251,7 +271,8 @@ def _attach_arrows(record, slug, page, items, revision, plan_regions=None):
         record["arrows_status"] = {"state": "stale", "anchors": inside}
 
 
-def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
+def _attach_linetypes(record, slug, page, items, revision, plan_regions=None, *,
+                      symbol_context=None):
     """线型层的结果与**分层状态**（只读盘，零模型调用）.
 
     plan 在这里、而且只在这里起作用：它是**显示闸**，不进缓存签名。所以步骤3
@@ -284,15 +305,15 @@ def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
 
     # The two producers are independent: arrow terminals may be absent while
     # a confirmed legend swatch is still a complete supervised query.
-    symbol_entry = store.load_json(
-        store.slug_dir(slug) / "symbols.json", {}).get(str(page))
+    symbol_context = (symbol_context or _placement_context_for(
+        slug, page, items, revision))
+    symbol_entry = symbol_context["entry"]
     # Keep the reader on the exact prerequisite contract used by
     # job._legend_linetype_jobs.  A stale symbol result may still contain old
     # line boxes (and even an old matching legend cache), but neither is
     # publishable against the current symbol detector/version.
-    symbols_result = ((symbol_entry or {}).get("result") or {}
-                      if _symbols_publishable(
-                          symbol_entry, store.sig_of(items, revision)) else {})
+    symbols_result = symbol_context["symbols_result"]
+    placement_result = symbol_context["placement_result"]
     owners = linetypes.symbol_owners_of(symbols_result)
     legend_samples = legend_linetypes.samples_of(symbols_result)
     legend_entry = None
@@ -307,13 +328,21 @@ def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
                 and legend_entry.get("error")):
             legend_error = str(legend_entry["error"])
 
-    extra = _placement_anchors_for(slug, page)
-    arrows_sig = arrows.arrows_signature(items, revision, extra)
+    extra = _placement_anchors_for(
+        slug, page, items, revision, context=symbol_context)
+    arrows_sig = arrows.arrows_signature(
+        items, revision, extra,
+        plan_regions=symbol_context["plan_regions"])
     arrow_entry = store.load_json(
         store.slug_dir(slug) / "arrows.json", {}).get(str(page))
     arrows_current = arrows.has_current_arrows(arrow_entry, arrows_sig)
-    anchors = linetypes.anchors_of(arrow_entry) if arrows_current else []
-    sig = linetypes.linetypes_signature(arrows_sig) if anchors else None
+    anchors = (linetypes.anchors_of(arrow_entry, placement_result, items)
+               if arrows_current else [])
+    arrow_targets = sum(anchor.get("anchor_kind") != "symbol_center"
+                        for anchor in anchors)
+    symbol_center_targets = len(anchors) - arrow_targets
+    sig = (linetypes.linetypes_signature(
+        arrows_sig, placement_result, items) if anchors else None)
     entry = linetypes.load_page(slug, page) if anchors else None
     # Signature mismatch is never publishable, including an error produced by
     # an older engine.  The low-priority refresh worker will replace it
@@ -344,15 +373,28 @@ def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
             ("arrow" if anchors and not legend_samples else None))
         refresh = linetype_refresh_state.page_refresh_status(
             slug, page, channel=refresh_channel)
+        if refresh is None:
+            record["linetypes_status"] = {
+                "state": "stale",
+                "detail": "No current line-type result is available",
+                "targets": expected,
+                "callout_targets": len(anchors),
+                "arrow_targets": arrow_targets,
+                "symbol_center_targets": symbol_center_targets,
+                "legend_samples": len(legend_samples),
+            }
+            return
         detail = {
             "running": "Current line-type engine is refreshing this sheet",
             "waiting": "Queued; a foreground upload/rerun has priority",
             "queued": "Queued for the current line-type engine",
-        }.get(refresh, "Queued for the next automatic line-type refresh scan")
+        }[refresh]
         record["linetypes_status"] = {
-            "state": "updating", "refresh": refresh or "queued",
+            "state": "updating", "refresh": refresh,
             "detail": detail, "targets": expected,
             "callout_targets": len(anchors),
+            "arrow_targets": arrow_targets,
+            "symbol_center_targets": symbol_center_targets,
             "legend_samples": len(legend_samples)}
         return
 
@@ -370,6 +412,8 @@ def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
     page_info = payload.get("page") or {}
     status = {"targets": expected,
               "callout_targets": len(anchors),
+              "arrow_targets": arrow_targets,
+              "symbol_center_targets": symbol_center_targets,
               "bound": len(payload.get("visible") or ()),
               "clusters": (page_info.get("line_types")
                            or page_info.get("base_line_types")),
@@ -509,6 +553,7 @@ def _overview_row(res, slug):
         revision = None
     directory = store.slug_dir(slug)
     symbol_cache = store.load_json(directory / "symbols.json", {})
+    view_cache = store.load_json(directory / "view_types.json", {})
     arrow_cache = store.load_json(directory / "arrows.json", {})
     pages = []
     tot_added = tot_vlm = tot_cov = tot_sym = tot_plc = tot_stale = 0
@@ -526,17 +571,24 @@ def _overview_row(res, slug):
         items = store.items_of(rec)
         entry = symbol_cache.get(str(p)) if revision else None
         symbols = []
-        if items and revision \
-                and _symbols_publishable(entry, store.sig_of(items, revision)):
-            symbols = [s for s in (entry["result"].get("symbols") or [])
+        symbol_context = (_placement_context_for(
+            slug, p, items, revision, symbol_cache=symbol_cache,
+            view_cache=view_cache) if items and revision else None)
+        symbols_result = ((symbol_context or {}).get("symbols_result") or {})
+        current_result = ((symbol_context or {}).get("placement_result") or {})
+        if symbol_context and symbol_context.get("symbols_current"):
+            symbols = [s for s in (symbols_result.get("symbols") or [])
                        if isinstance(s, dict)]
         elif (entry or {}).get("result", {}).get("symbols"):
             # 有结果但版本戳不当期：算进 stale 计数，让画廊显示「符号待重跑」
             # 而不是让这一页看起来"什么都没找到"。
             tot_stale += len([s for s in entry["result"]["symbols"]
                               if isinstance(s, dict)])
-        placements = sum(len(s.get("placements") or []) for s in symbols)
-        raw_result = (entry or {}).get("result") or {}
+        placements = sum(
+            len(s.get("placements") or [])
+            for s in (current_result.get("symbols") or [])
+            if isinstance(s, dict))
+        raw_result = current_result
         arrow_extra = []
         for si, symbol in enumerate(raw_result.get("symbols") or []):
             for pi, box in enumerate(symbol.get("placements") or []):
@@ -545,7 +597,10 @@ def _overview_row(res, slug):
         arrow_entry = arrow_cache.get(str(p)) if revision else None
         arrow_current = bool(
             revision and arrow_entry and arrows.has_current_arrows(
-                arrow_entry, arrows.arrows_signature(items, revision, arrow_extra)))
+                arrow_entry, arrows.arrows_signature(
+                    items, revision, arrow_extra,
+                    plan_regions=(symbol_context or {}).get(
+                        "plan_regions") or [])))
         image_only = bool(arrow_current
                           and arrow_entry.get("page_kind") == "image-only")
         if arrow_current:
@@ -1136,14 +1191,21 @@ def page_data(slug, page):
     revision = res.get("pdf_revision")
     symbols, dropped, plan_boxes = ({"groups": [], "symbols": []}, [], [])
     plan_boxes_now = []
+    symbol_context = None
     if res.get("mode", "fence") == "fence":
         # 图例符号 / plan 放置是 fence 专属的；自定义检测目标只有文字层。
-        symbols, dropped, plan_boxes = _page_symbols(
+        symbol_context = _placement_context_for(
             slug, page, items, revision)
-        plan_boxes_now = plan_boxes
-    _attach_arrows(record, slug, page, items, revision, plan_boxes_now)
+        symbols, dropped, plan_boxes = _page_symbols(
+            slug, page, items, revision, context=symbol_context)
+        plan_boxes_now = symbol_context["plan_regions"]
+    _attach_arrows(
+        record, slug, page, items, revision, plan_boxes_now,
+        symbol_context=symbol_context)
     # 线型层跟在箭头之后：它绑的就是箭头末端。plan 在这里只当显示闸。
-    _attach_linetypes(record, slug, page, items, revision, plan_boxes_now)
+    _attach_linetypes(
+        record, slug, page, items, revision, plan_boxes_now,
+        symbol_context=symbol_context)
     suppressed_items = arrows.suppressed_unverified_duplicates(
         items, record.get("arrow_anchors"))
     placements = sum(len(s.get("placements") or [])
@@ -1208,9 +1270,12 @@ def linetypes_all(slug, page):
       not-run       GET 没有 .all.json；前端随后 POST，在本地按需生成
       stale         .all.json 版本/生产器/逐类型指纹与当期主结果不符；
                     可能是旧结果或损坏文件，所以不发并允许 POST 自愈
+      partial       图例已验证的 supervised 子集可用，但完整 All
+                    几何尚未生成；前端随后 POST，不把子集当作全量
       ok            types / residual 可用
 
-    GET 始终只读缓存。POST 只在 missing/stale 时运行本地边车，不调用模型；
+    GET 始终只读缓存。POST 只在 missing/stale/partial 时运行本地边车，
+    不调用模型；
     结果必须逐类型通过 op-set 指纹校验后才原子发布。
     """
     if request.method == "POST" and _cross_site_write_blocked():
@@ -1227,36 +1292,99 @@ def linetypes_all(slug, page):
     # 锚的就是这个列表，用别的口径算出来的签名一定对不上。
     items = store.items_of(record)
     revision = res.get("pdf_revision")
-    symbol_entry = store.load_json(
-        store.slug_dir(slug) / "symbols.json", {}).get(str(page))
-    symbols_result = ((symbol_entry or {}).get("result") or {}
-                      if _symbols_publishable(
-                          symbol_entry, store.sig_of(items, revision)) else {})
+    symbol_context = _placement_context_for(
+        slug, page, items, revision)
+    symbol_entry = symbol_context["entry"]
+    symbols_result = symbol_context["symbols_result"]
+    placement_result = symbol_context["placement_result"]
     legend_samples = legend_linetypes.samples_of(symbols_result)
     legend_entry = None
     legend_current = False
+    legend_sig = None
     if legend_samples:
         legend_sig = legend_linetypes.signature(revision, legend_samples)
         legend_entry = legend_linetypes.load_page(slug, page)
         legend_current = legend_linetypes.has_current(legend_entry, legend_sig)
-    extra = _placement_anchors_for(slug, page)
-    arrows_sig = arrows.arrows_signature(items, revision, extra)
+    extra = _placement_anchors_for(
+        slug, page, items, revision, context=symbol_context)
+    arrows_sig = arrows.arrows_signature(
+        items, revision, extra,
+        plan_regions=symbol_context["plan_regions"])
     arrow_entry = store.load_json(
         store.slug_dir(slug) / "arrows.json", {}).get(str(page))
     arrows_current = arrows.has_current_arrows(arrow_entry, arrows_sig)
-    sig = linetypes.linetypes_signature(arrows_sig) if arrows_current else None
+    sig = (linetypes.linetypes_signature(
+        arrows_sig, placement_result, items) if arrows_current else None)
     main_entry = linetypes.load_page(slug, page) if sig else None
     main_current = bool(
         sig and linetypes.has_current_linetypes(main_entry, sig))
     if not main_current:
         if legend_current:
+            audit_entry = legend_linetypes.all_audit_entry(
+                legend_entry, legend_sig)
+            if audit_entry is None:
+                return jsonify({"state": "stale",
+                                "detail": "legend engine audit is incomplete"})
+            stored_entry = linetypes.load_all_page(slug, page)
+            all_entry = linetypes.validated_all_page(
+                stored_entry, audit_entry, legend_sig)
+            if request.method == "POST" and all_entry is None:
+                try:
+                    generated = job.materialize_all_linetypes_from_legend(
+                        slug, page, legend_sig)
+                    all_entry = linetypes.validated_all_page(
+                        generated, audit_entry, legend_sig)
+                    if all_entry is None:
+                        raise linetypes.AllGeometryMismatch(
+                            "materialized legend geometry failed publication "
+                            "validation")
+                except Exception as exc:                       # noqa: BLE001
+                    print(f"[linetypes-all] {slug} P{page} legend generation "
+                          f"failed: {type(exc).__name__}: {exc}", flush=True)
+                    return jsonify({
+                        "state": "error",
+                        "error": "full line-type geometry generation failed",
+                    }), 500
+            if all_entry is not None:
+                try:
+                    combined = merge_entries({}, legend_entry)
+                    payload = linetypes.all_payload(all_entry, combined)
+                    supervised = {
+                        row["line_type_number"]: row
+                        for row in legend_debug_types(legend_entry)
+                    }
+                except LegendMergeError:
+                    return jsonify({
+                        "state": "stale",
+                        "detail": "line-type cache identity mismatch",
+                    })
+                ordinary = {
+                    row["line_type_number"]: row
+                    for row in payload.get("types") or ()
+                }
+                for number, row in supervised.items():
+                    if number in ordinary:
+                        row["bound_by"] = list(
+                            ordinary[number].get("bound_by") or ())
+                ordinary.update(supervised)
+                payload["types"] = [ordinary[number]
+                                    for number in sorted(ordinary)]
+                payload["legend_samples"] = (
+                    legend_entry.get("samples") or [])
+                payload["state"] = "ok"
+                return jsonify(payload)
             try:
                 types = legend_debug_types(legend_entry)
             except LegendMergeError:
                 return jsonify({"state": "stale"})
             return jsonify({
-                "state": "ok", "partial": True,
-                "detail": "supervised legend line types",
+                # A supervised subset is useful evidence, but it is not All
+                # Line Types.  ``ok`` is reserved for a complete independently
+                # verified audit; the browser POSTs this state exactly once.
+                "state": "partial", "partial": True,
+                "cache_state": ("not-run" if stored_entry is None
+                                else "stale"),
+                "detail": "complete line-type geometry is not generated yet",
                 "page": legend_entry.get("page") or {},
                 "engine": legend_entry.get("engine") or {},
                 "types": types, "residual": None,

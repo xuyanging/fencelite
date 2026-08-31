@@ -1510,7 +1510,7 @@ def _stage_symbols(slug, on_progress=None, should_cancel=None):
 
 # ------------------------------------------------- stage 3: view projections --
 def _view_jobs(slug):
-    """只给「有 shape 样例符号 且 有合法 kind=view 组」的页排活.
+    """给会消费 plan 显示/取景语义且有合法 view 组的页排活.
 
     这条排活条件比参考实现更严：没有 shape 样例就没有要匹配的放置，那页的
     plan/elevation 分类对最终交付毫无影响 —— 付这笔钱纯属浪费。
@@ -1536,10 +1536,12 @@ def _view_jobs(slug):
             warnings.append(f"P{pstr} skipped view classification: legend symbol detection is stale")
             continue
         result = entry.get("result") or {}
-        if not any(s.get("category") == "shape"
-                   for s in result.get("symbols") or []) and not arrows.ENABLED:
+        if (not any(s.get("category") == "shape"
+                    for s in result.get("symbols") or [])
+                and not arrows.ENABLED and not linetypes.ENABLED):
             # no shape sample → nothing to place → don't pay.  但箭头步同样只在
-            # plan 视图里找引线，开启后这页仍然需要分类，否则整页 fail-closed。
+            # plan 视图里找引线；legend 线型匹配也要用 plan 做显示闸。任一接缝
+            # 开启后这页仍然需要分类，否则整页 fail-closed。
             continue
         groups = result.get("groups") or []
         if not groups_need_classification(groups):
@@ -1691,7 +1693,7 @@ def _stage_placements(slug, on_progress=None, should_cancel=None):
             typed_groups = merge_view_types(groups, ventry)
         else:
             typed_groups = groups
-        if has_current_placements(result):
+        if has_current_placements(result, typed_groups):
             if on_progress:
                 on_progress(number, total)
             continue
@@ -1810,8 +1812,6 @@ def _arrow_jobs(slug):
     steps.views.plan_boxes 的下游约定一致：缺分类时一个结果都不给，
     绝不把整页当 plan。
     """
-    from steps.views import merge_view_types, plan_boxes
-
     res = load_json(results_path(slug), None)
     pdf = pdf_path(slug)
     if not res or not pdf.exists():
@@ -1826,16 +1826,19 @@ def _arrow_jobs(slug):
         items = items_of(rec)
         if not items:
             continue
-        result = (symbols.get(pstr) or {}).get("result") or {}
+        placement_context = _placement_context(
+            symbols.get(pstr), items, revision, views.get(pstr))
+        result = (placement_context["result"]
+                  if placement_context["placements_current"] else {})
         # 第二类锚：shape 样例矢量匹配出来的放置。它们和文字框一样落在 plan 上，
         # 同样要走后续步骤，只是键空间分开（"s<symbol>:<placement>"）以免和
         # 文字锚的 union index 相撞。
         extra = _placement_anchors(result)
-        sig = arrows.arrows_signature(items, revision, extra)
+        regions = placement_context["plan_regions"]
+        sig = arrows.arrows_signature(
+            items, revision, extra, plan_regions=regions)
         if arrows.has_current_arrows(cache.get(pstr), sig):
             continue
-        groups = result.get("groups") or []
-        regions = plan_boxes(merge_view_types(groups, views.get(pstr)))
         # 取景开启时没有 plan 框就 fail-closed；关闭时任何有锚的页都要跑，
         # 这样被取景挡掉的锚也能暴露出问题来。
         if arrows.PLAN_GATE and not regions:
@@ -1855,6 +1858,26 @@ def _placement_anchors(result):
             if isinstance(box, (list, tuple)) and len(box) == 4:
                 anchors.append((f"s{si}:{pi}", list(box)))
     return anchors
+
+
+def _placement_context(entry, items, revision, view_entry=None):
+    """Current symbol/view/placement prerequisite state for one page."""
+    from steps.placements import current_placement_context
+
+    return current_placement_context(
+        entry, sig_of(items, revision), view_entry, revision)
+
+
+def _current_placement_result(entry, items, revision, view_entry=None):
+    """只让当期 symbol + placement 结果进入 arrows/linetypes 的签名与锚点。
+
+    maintenance refresh 可以脱离完整上传流水线单独运行。若这里直接消费盘上的 raw
+    ``result``，一个旧 placement cache 会重新生成带中心绑定的新 linetype cache；
+    web 发布闸虽然能隐藏它，却浪费整页聚类且留下容易误用的成功缓存。
+    """
+    context = _placement_context(entry, items, revision, view_entry)
+    return (context["result"]
+            if context["placements_current"] else {})
 
 
 def _raise_if_cancelled(should_cancel):
@@ -1983,7 +2006,7 @@ def _stage_arrows(slug, on_progress=None, should_cancel=None):
 
 # ------------------------------------------- stage 6: line types (sidecar) --
 def _linetype_jobs(slug):
-    """给「箭头结果当期 且 这页有末端」的页排活.
+    """给「箭头结果当期 且 有箭头末端或 symbol 中心」的页排活.
 
     **不看 plan** —— plan 只是显示闸（见 steps/linetypes 的 docstring）。
     也不看 arrows 的取景开关：末端在哪算在哪，可见性留给 webapp 决定。
@@ -1994,6 +2017,7 @@ def _linetype_jobs(slug):
         return [], []
     revision = pdf_revision(pdf)
     symbols = load_json(slug_dir(slug) / "symbols.json", {})
+    views = load_json(slug_dir(slug) / "view_types.json", {})
     arrow_cache = load_json(slug_dir(slug) / "arrows.json", {})
     jobs, warnings = [], []
     for pstr, rec in sorted(res.get("pages", {}).items(),
@@ -2001,18 +2025,24 @@ def _linetype_jobs(slug):
         items = items_of(rec)
         if not items:
             continue
-        result = (symbols.get(pstr) or {}).get("result") or {}
+        symbol_entry = symbols.get(pstr)
+        placement_context = _placement_context(
+            symbol_entry, items, revision, views.get(pstr))
+        result = (placement_context["result"]
+                  if placement_context["placements_current"] else {})
         extra = _placement_anchors(result)
-        arrows_sig = arrows.arrows_signature(items, revision, extra)
+        arrows_sig = arrows.arrows_signature(
+            items, revision, extra,
+            plan_regions=placement_context["plan_regions"])
         arrow_entry = arrow_cache.get(pstr)
         if not arrows.has_current_arrows(arrow_entry, arrows_sig):
             # 箭头层不当期 —— 这页的末端还没定下来，算线型没有意义。不报错：
             # 上一阶段自己会把失败页记进 warnings。
             continue
-        anchors = linetypes.anchors_of(arrow_entry)
+        anchors = linetypes.anchors_of(arrow_entry, result, items)
         if not anchors:
             continue
-        sig = linetypes.linetypes_signature(arrows_sig)
+        sig = linetypes.linetypes_signature(arrows_sig, result, items)
         if linetypes.has_current_linetypes(
                 linetypes.load_page(slug, int(pstr)), sig):
             continue
@@ -2152,8 +2182,8 @@ def _linetype_job_still_current(slug, page, sig):
 
     Reusing ``_linetype_jobs`` keeps this check on exactly the same prerequisite
     contract as normal scheduling: current results, current arrows (including
-    placement anchors and PDF revision), at least one terminal, and no already
-    current successful line-type cache.  A failed cache remains eligible because
+    placement anchors and PDF revision), at least one arrow terminal or eligible
+    symbol center, and no already current successful line-type cache.  A failed cache remains eligible because
     it intentionally has no ``bindings`` key, so this lookup does not turn a
     retryable failure into a permanent cache hit.
     """
@@ -2187,13 +2217,30 @@ def _linetype_one(slug, page, items, arrow_entry, sig, should_cancel=None):
         timeout = _linetype_timeout_for(slug, page, arrow_entry)
         for attempt in range(RETRIES + 1):
             try:
+                revision_now = pdf_revision(pdf_path(slug))
+                symbol_entry = load_json(
+                    slug_dir(slug) / "symbols.json", {}).get(str(page))
+                view_entry = load_json(
+                    slug_dir(slug) / "view_types.json", {}).get(str(page))
+                placement_context = _placement_context(
+                    symbol_entry, items, revision_now, view_entry)
+                symbol_result = (placement_context["result"]
+                                 if placement_context["placements_current"]
+                                 else {})
+                extra = _placement_anchors(symbol_result)
+                arrows_sig_now = arrows.arrows_signature(
+                    items, revision_now, extra,
+                    plan_regions=placement_context["plan_regions"])
+                if linetypes.linetypes_signature(
+                        arrows_sig_now, symbol_result, items) != sig:
+                    return page, 0, None
                 with _slot_pool(
                         "heavy-sidecar", HEAVY_SIDECAR_SLOTS).slot(
                             cancelled=should_cancel):
                     _raise_if_cancelled(should_cancel)
                     entry = linetypes.compute_page_linetypes(
                         pdf_path(slug), page, items, arrow_entry, sig=sig,
-                        timeout=timeout)
+                        symbol_result=symbol_result, timeout=timeout)
                 break
             except SlotWaitCancelled as exc:
                 raise Cancelled() from exc
@@ -2280,6 +2327,48 @@ def _legend_linetype_one(slug, page, samples, sig, should_cancel=None):
         return page, len(entry.get("line_types") or ()), None
 
 
+def _current_main_all_source(slug, page, sig):
+    """Return the exact current main/arrow entries for an All rerun."""
+    page = int(page)
+    res = load_json(results_path(slug), None)
+    pdf = pdf_path(slug)
+    if (not isinstance(res, dict) or res.get("fused_v") != FUSED_VERSION
+            or not pdf.exists()):
+        return None, None
+    record = (res.get("pages") or {}).get(str(page))
+    if not isinstance(record, dict):
+        return None, None
+    revision = pdf_revision(pdf)
+    if res.get("pdf_revision") not in (None, revision):
+        return None, None
+    items = items_of(record)
+    symbol_entry = load_json(
+        slug_dir(slug) / "symbols.json", {}).get(str(page))
+    view_entry = load_json(
+        slug_dir(slug) / "view_types.json", {}).get(str(page))
+    placement_context = _placement_context(
+        symbol_entry, items, revision, view_entry)
+    placement_result = (placement_context["result"]
+                        if placement_context["placements_current"] else {})
+    extra = _placement_anchors(placement_result)
+    arrows_sig = arrows.arrows_signature(
+        items, revision, extra,
+        plan_regions=placement_context["plan_regions"])
+    arrow_entry = load_json(
+        slug_dir(slug) / "arrows.json", {}).get(str(page))
+    if not arrows.has_current_arrows(arrow_entry, arrows_sig):
+        return None, None
+    anchors = linetypes.anchors_of(arrow_entry, placement_result, items)
+    expected = (linetypes.linetypes_signature(
+        arrows_sig, placement_result, items) if anchors else None)
+    if expected != sig:
+        return None, None
+    entry = linetypes.load_page(slug, page)
+    if not linetypes.has_current_linetypes(entry, sig):
+        return None, None
+    return entry, arrow_entry
+
+
 def materialize_all_linetypes(slug, page, sig):
     """Build the optional all-line-types geometry for one current main result.
 
@@ -2291,16 +2380,15 @@ def materialize_all_linetypes(slug, page, sig):
     """
     page = int(page)
     with _linetype_page_lock(slug, page):
-        main_entry = linetypes.load_page(slug, page)
-        if not linetypes.has_current_linetypes(main_entry, sig):
+        main_entry, arrow_entry = _current_main_all_source(
+            slug, page, sig)
+        if main_entry is None:
             raise RuntimeError("main line-type result changed before generation")
         cached = linetypes.validated_all_page(
             linetypes.load_all_page(slug, page), main_entry, sig)
         if cached is not None:
             return cached
 
-        arrow_entry = load_json(
-            slug_dir(slug) / "arrows.json", {}).get(str(page)) or {}
         timeout = _linetype_timeout_for(slug, page, arrow_entry)
         with _slot_pool("heavy-sidecar", HEAVY_SIDECAR_SLOTS).slot():
             generated = linetypes.compute_all_page_geometry(
@@ -2309,10 +2397,82 @@ def materialize_all_linetypes(slug, page, sig):
         # A rerun or upload can replace prerequisites during the minutes spent
         # in the sidecar.  Verify against the latest cache, not merely the
         # object captured before computation, before the atomic write.
-        latest = linetypes.load_page(slug, page)
-        if not linetypes.has_current_linetypes(latest, sig):
+        latest, _latest_arrow = _current_main_all_source(
+            slug, page, sig)
+        if latest is None:
             raise RuntimeError("main line-type result changed during generation")
         generated = linetypes.verify_all_page_geometry(latest, generated)
+        linetypes.save_all_page(slug, page, generated)
+        return generated
+
+
+def _current_legend_all_source(slug, page, sig):
+    """Return ``(legend_entry, full_audit)`` for exact current prerequisites.
+
+    Merely re-reading a cache with the captured signature is insufficient
+    during a multi-minute All rerun: a PDF/results/symbol replacement must
+    invalidate the pending write even if an old legend file is still present.
+    Recompute the supervised signature from the currently publishable symbol
+    boxes before accepting either the initial or final generation.
+    """
+    from steps.symbols import has_current_symbols
+
+    page = int(page)
+    res = load_json(results_path(slug), None)
+    pdf = pdf_path(slug)
+    if not isinstance(res, dict) or not pdf.exists():
+        return None, None
+    record = (res.get("pages") or {}).get(str(page))
+    if not isinstance(record, dict):
+        return None, None
+    revision = pdf_revision(pdf)
+    items = items_of(record)
+    symbol_entry = load_json(
+        slug_dir(slug) / "symbols.json", {}).get(str(page))
+    if not has_current_symbols(symbol_entry, sig_of(items, revision)):
+        return None, None
+    samples = legend_linetypes.samples_of(
+        (symbol_entry or {}).get("result") or {})
+    if not samples or legend_linetypes.signature(revision, samples) != sig:
+        return None, None
+    entry = legend_linetypes.load_page(slug, page)
+    audit = legend_linetypes.all_audit_entry(entry, sig)
+    return (entry, audit) if audit is not None else (None, None)
+
+
+def materialize_all_linetypes_from_legend(slug, page, sig):
+    """Build complete All geometry for a current legend-only page.
+
+    Legend matching already ran the full engine but publishes only supervised
+    semantic matches.  Its cache now retains the complete metadata audit;
+    ``run_all.py`` independently regenerates geometry with the same pinned
+    single-worker algorithm, and every page/type fingerprint must agree before
+    the shared optional ``.all.json`` cache is atomically replaced.
+    """
+    page = int(page)
+    with _linetype_page_lock(slug, page):
+        _entry, audit = _current_legend_all_source(slug, page, sig)
+        if audit is None:
+            raise RuntimeError(
+                "legend line-type result changed before generation")
+        cached = linetypes.validated_all_page(
+            linetypes.load_all_page(slug, page), audit, sig)
+        if cached is not None:
+            return cached
+
+        timeout = _legend_linetype_timeout_for(slug, page)
+        with _slot_pool("heavy-sidecar", HEAVY_SIDECAR_SLOTS).slot():
+            generated = linetypes.compute_all_page_geometry(
+                pdf_path(slug), page, audit, timeout=timeout,
+                cpu_budget=legend_linetypes.sidecar.CPU_BUDGET)
+
+        _latest_entry, latest_audit = _current_legend_all_source(
+            slug, page, sig)
+        if latest_audit is None:
+            raise RuntimeError(
+                "legend line-type result changed during generation")
+        generated = linetypes.verify_all_page_geometry(
+            latest_audit, generated)
         linetypes.save_all_page(slug, page, generated)
         return generated
 

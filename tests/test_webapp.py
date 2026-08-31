@@ -30,9 +30,10 @@ import fitz
 from core.config import MODEL_NAME
 from core.pdfio import FITZ_LOCK
 from steps import store
+from steps.placements import placement_scope_signature
 from steps.versions import (FUSED_VERSION, PLACEMENT_VERSION, SYMBOL_PROMPT_V,
                             SYMBOL_VERSION, VIEW_VERSION)
-from steps.views import view_signature
+from steps.views import merge_view_types, view_signature
 
 STUBBED = []
 
@@ -187,8 +188,11 @@ class WebappCase(unittest.TestCase):
                        "plc_v": PLACEMENT_VERSION,
                        "placement_note": "2 placements inside plan"},
         }
+        view_entry = self.write_view_types(groups, revision, slug=slug)
+        entry["result"]["plc_scope_sig"] = placement_scope_signature(
+            entry["result"]["symbols"],
+            merge_view_types(groups, view_entry))
         store.save_json(store.slug_dir(slug) / "symbols.json", {"1": entry})
-        self.write_view_types(groups, revision, slug=slug)
         return entry
 
     def write_view_types(self, groups, revision, slug=SLUG, **over):
@@ -586,7 +590,11 @@ class PageTests(WebappCase):
         cache["1"]["result"]["plc_v"] = PLACEMENT_VERSION + 1
         store.save_json(path, cache)
         body = self.client.get(f"/api/page/{SLUG}/1").get_json()
-        self.assertEqual(body["symbols"]["symbols"], [])
+        self.assertEqual(len(body["symbols"]["symbols"]), 2)
+        self.assertTrue(body["symbols"]["placements_pending"])
+        self.assertTrue(all("placements" not in symbol
+                            for symbol in body["symbols"]["symbols"]))
+        self.assertEqual(body["counts"]["placements"], 0)
 
     def test_custom_target_skips_symbol_layer(self):
         self.make_pdf()
@@ -641,6 +649,48 @@ class PageTests(WebappCase):
         self.assertTrue(body["processing"])
         self.assertEqual(body["items"], [])
         self.assertEqual(body["record"]["vlm_items"], [])
+
+
+class ArrowStatusTests(WebappCase):
+    def _status(self, entry):
+        record = {}
+        items = [{"text": "FENCE", "box_2d": [10, 20, 30, 80]}]
+        context = {
+            "entry": None,
+            "symbols_current": False,
+            "placements_current": False,
+            "symbols_result": {},
+            "placement_result": {},
+            "plan_regions": [],
+            "publishable": False,
+        }
+
+        def load_json(path, default=None):
+            return {"1": entry} if Path(path).name == "arrows.json" else {}
+
+        with mock.patch.object(webapp.arrows, "ENABLED", True), \
+                mock.patch.object(webapp.arrows, "PLAN_GATE", False), \
+                mock.patch.object(webapp, "_placement_context_for",
+                                  return_value=context), \
+                mock.patch.object(webapp, "_placement_anchors_for",
+                                  return_value=[]), \
+                mock.patch.object(webapp.arrows, "arrows_signature",
+                                  return_value="arrow-current"), \
+                mock.patch.object(webapp.store, "load_json",
+                                  side_effect=load_json):
+            webapp._attach_arrows(
+                record, SLUG, 1, items, "pdf-current", plan_regions=[])
+        return record["arrows_status"]
+
+    def test_current_arrow_failure_is_reported(self):
+        status = self._status({"sig": "arrow-current", "error": "timeout"})
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["detail"], "timeout")
+
+    def test_old_arrow_failure_is_stale_not_current_failed(self):
+        status = self._status({"sig": "arrow-old", "error": "timeout"})
+        self.assertEqual(status["state"], "stale")
+        self.assertNotIn("detail", status)
 
 
 class AllLineTypesRouteTests(WebappCase):
@@ -780,6 +830,211 @@ class AllLineTypesRouteTests(WebappCase):
         materialize.assert_called_once()
 
 
+class LegendOnlyAllLineTypesRouteTests(WebappCase):
+    """A supervised subset must materialize a complete independently audited All."""
+
+    @staticmethod
+    def _entries():
+        page = {
+            "sheet": 1,
+            "base_line_types": 2,
+            "line_types": 2,
+            "page_fingerprint": "legend-page",
+            "owned_ops_sha1": "legend-owned",
+            "fused_ops_sha1": "legend-fused",
+            "path_ops": 2,
+            "owned_path_ops": 2,
+            "tip_precision_pt": 0.0,
+        }
+        engine_rows = [
+            {
+                "line_type_number": 1,
+                "line_type_id": "engine-one",
+                "type_uid": "engine:one",
+                "signature_family": "motif_periodic",
+                "recognition_source": "method2",
+                "op_count": 1, "ops_sha1": "one",
+                "segment_count": 1,
+                "pattern_instance_count": 0,
+                "pattern_instances": [],
+            },
+            {
+                "line_type_number": 2,
+                "line_type_id": "engine-two",
+                "type_uid": "engine:two",
+                "signature_family": "pdf_text_dash_line",
+                "recognition_source": "method1",
+                "op_count": 1, "ops_sha1": "two",
+                "segment_count": 1,
+                "pattern_instance_count": 0,
+                "pattern_instances": [],
+            },
+        ]
+        supervised = {
+            **engine_rows[0],
+            "line_type_id": "legend:engine-one",
+            "type_uid": "legend:engine:one",
+            "recognition_source": "legend_template",
+            "base_recognition_source": "method2",
+            "matched_cluster_sources": {"1": "method2"},
+            "base_line_type_number": 1,
+            "matched_line_type_numbers": [1],
+            "by_run": {"lt1:r1": {
+                "run_id": "lt1:r1", "source_line_type_number": 1,
+                "source_run_id": "1", "op_count": 1,
+                "segment_count": 1, "bbox": [1, 1, 2, 2],
+                "polylines": [[[1, 1], [2, 2]]],
+            }},
+        }
+        legend = {
+            "sig": "legend-current", "v": webapp.legend_linetypes.VERSION,
+            "ok": True, "engine": {"engine": "unit"},
+            "page": dict(page),
+            "line_types": [supervised],
+            "all_line_types": [
+                {key: value for key, value in supervised.items()
+                 if key != "by_run"}],
+            "engine_all_line_types": engine_rows,
+            "bindings": [],
+            "samples": [{"sample_index": 0}],
+        }
+
+        def full_row(row, start):
+            return {**row, "bbox": [start, start, start + 1, start + 1],
+                    "by_run": [{
+                        "run_id": "1", "op_count": 1,
+                        "segment_count": 1,
+                        "bbox": [start, start, start + 1, start + 1],
+                        "polylines": [[[start, start],
+                                       [start + 1, start + 1]]],
+                    }]}
+
+        full = {
+            "sig": "legend-current", "v": webapp.legend_linetypes.VERSION,
+            "all_v": webapp.linetypes.ALL_GEOMETRY_VERSION,
+            "producer_sha256": webapp.linetypes.sidecar.all_geometry_digest(),
+            "page": dict(page), "engine": {"engine": "unit"},
+            "types": [full_row(engine_rows[0], 1),
+                      full_row(engine_rows[1], 3)],
+            "residual": {"op_count": 0, "segment_count": 0,
+                         "polylines": []},
+        }
+        return legend, full
+
+    @contextmanager
+    def route_context(self, *, all_entry=None, generation_error=None,
+                      incomplete_audit=False):
+        legend, generated = self._entries()
+        if incomplete_audit:
+            legend.pop("engine_all_line_types", None)
+        results = {"pages": {"1": {}}, "pdf_revision": "pdf-current"}
+        symbols = {"1": {"result": {"symbols": [{
+            "category": "line", "text_index": 0,
+            "box_2d": [10, 20, 12, 45], "value": "8'",
+            "source": "page",
+        }]}}}
+        symbols_result = symbols["1"]["result"]
+        symbol_context = {
+            "entry": symbols["1"],
+            "symbols_current": True,
+            "placements_current": True,
+            "symbols_result": symbols_result,
+            "placement_result": symbols_result,
+            "plan_regions": [],
+            "publishable": True,
+        }
+
+        def load_json(path, default=None):
+            return symbols if Path(path).name == "symbols.json" else {"1": {}}
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(webapp.linetypes, "ENABLED", True))
+            stack.enter_context(mock.patch.object(
+                webapp, "_results_state", return_value=(results, None)))
+            stack.enter_context(mock.patch.object(
+                webapp, "_placement_context_for",
+                return_value=symbol_context))
+            stack.enter_context(mock.patch.object(
+                webapp, "_placement_anchors_for", return_value=[]))
+            stack.enter_context(mock.patch.object(
+                webapp.store, "load_json", side_effect=load_json))
+            stack.enter_context(mock.patch.object(
+                webapp.arrows, "arrows_signature",
+                return_value="arrow-without-terminals"))
+            stack.enter_context(mock.patch.object(
+                webapp.arrows, "has_current_arrows", return_value=False))
+            stack.enter_context(mock.patch.object(
+                webapp.legend_linetypes, "signature",
+                return_value="legend-current"))
+            stack.enter_context(mock.patch.object(
+                webapp.legend_linetypes, "load_page", return_value=legend))
+            stack.enter_context(mock.patch.object(
+                webapp.linetypes, "load_all_page", return_value=all_entry))
+            materialize = stack.enter_context(mock.patch.object(
+                job_module, "materialize_all_linetypes_from_legend",
+                return_value=generated, side_effect=generation_error))
+            yield materialize, legend, generated
+
+    def test_get_subset_is_partial_and_cache_only(self):
+        with self.route_context() as (materialize, _legend, _generated):
+            response = self.client.get(
+                f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["state"], "partial")
+        self.assertTrue(body["partial"])
+        self.assertEqual(body["cache_state"], "not-run")
+        self.assertEqual(len(body["types"]), 1)
+        self.assertIsNone(body["residual"])
+        materialize.assert_not_called()
+
+    def test_post_subset_materializes_complete_types_and_residual(self):
+        with self.route_context() as (materialize, _legend, generated):
+            response = self.client.post(
+                f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["state"], "ok")
+        self.assertFalse(body.get("partial", False))
+        self.assertEqual(len(body["types"]), 2)
+        self.assertEqual(body["types"][0]["recognition_source"],
+                         "legend_template")
+        self.assertEqual(body["types"][1]["recognition_source"], "method1")
+        self.assertIsNotNone(body["residual"])
+        materialize.assert_called_once_with(SLUG, 1, generated["sig"])
+
+    def test_get_valid_full_cache_is_ok_without_generation(self):
+        _legend, full = self._entries()
+        with self.route_context(all_entry=full) as (
+                materialize, _legend, _generated):
+            response = self.client.get(
+                f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.get_json()["state"], "ok")
+        self.assertEqual(len(response.get_json()["types"]), 2)
+        materialize.assert_not_called()
+
+    def test_incomplete_legend_engine_audit_fails_closed(self):
+        with self.route_context(incomplete_audit=True) as (
+                materialize, _legend, _generated):
+            response = self.client.get(
+                f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.get_json()["state"], "stale")
+        materialize.assert_not_called()
+
+    def test_post_generation_error_does_not_publish_subset_as_ok(self):
+        with self.route_context(
+                generation_error=RuntimeError("private path")) as (
+                    materialize, _legend, _generated), \
+                mock.patch("builtins.print"):
+            response = self.client.post(
+                f"/api/linetypes_all/{SLUG}/1")
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()["state"], "error")
+        self.assertNotIn("private path", response.get_data(as_text=True))
+        materialize.assert_called_once()
+
+
 class LineTypeRefreshStatusTests(WebappCase):
     def _attach(self, entry, refresh="running", text="PROPOSED FENCE"):
         record = {}
@@ -816,22 +1071,80 @@ class LineTypeRefreshStatusTests(WebappCase):
         self.assertEqual(status["state"], "failed")
         self.assertIn("timeout", status["detail"])
 
-    def test_timeout_from_smaller_budget_keeps_polling_for_retry(self):
+    def test_timeout_without_a_live_refresh_worker_is_reported_stale(self):
         entry = {"sig": "lt-current", "error": (
             "RuntimeError: linetype sidecar timeout after 600s (sheet 24)")}
         with mock.patch.object(
                 job_module, "_linetype_failure_budget_increased",
                 return_value=True):
             status = self._attach(entry, refresh=None)
-        self.assertEqual(status["state"], "updating")
-        self.assertEqual(status["refresh"], "queued")
-        self.assertIn("automatic", status["detail"].lower())
+        self.assertEqual(status["state"], "stale")
+        self.assertNotIn("refresh", status)
+        self.assertIn("no current", status["detail"].lower())
 
     def test_current_incomplete_cache_is_reported_as_automatic_update(self):
         status = self._attach({"sig": "lt-current", "page": {}})
         self.assertEqual(status["state"], "updating")
         self.assertEqual(status["refresh"], "running")
         self.assertEqual(status["targets"], 1)
+
+    def test_attach_uses_symbol_centers_and_reports_anchor_kinds(self):
+        record = {}
+        items = [{"text": "6' CHAIN LINK FENCE",
+                  "box_2d": [100, 100, 120, 180]}]
+        symbol_result = {"symbols": [{
+            "category": "shape", "text_index": 0,
+            "placements": [[200, 300, 220, 340]],
+        }]}
+        symbol_context = {
+            "entry": {"result": symbol_result},
+            "symbols_current": True,
+            "placements_current": True,
+            "symbols_result": symbol_result,
+            "placement_result": symbol_result,
+            "plan_regions": [[0, 0, 1000, 1000]],
+            "publishable": True,
+        }
+        store.save_json(store.slug_dir(SLUG) / "symbols.json",
+                        {"1": {"result": symbol_result}})
+        anchors = [
+            {"key": "0", "ti": 0, "tip": [210, 280],
+             "anchor_kind": "arrow_tip"},
+            {"key": "s0:0", "ti": -1, "tip": [210, 320],
+             "anchor_kind": "symbol_center",
+             "exclude_box": [200, 300, 220, 340]},
+        ]
+        with mock.patch.object(webapp.linetypes, "ENABLED", True), \
+                mock.patch.object(webapp, "_placement_context_for",
+                                  return_value=symbol_context), \
+                mock.patch.object(webapp.arrows, "arrows_signature",
+                                  return_value="arrow-current"), \
+                mock.patch.object(webapp.arrows, "has_current_arrows",
+                                  return_value=True), \
+                mock.patch.object(webapp.linetypes, "anchors_of",
+                                  return_value=anchors) as anchors_of, \
+                mock.patch.object(webapp.linetypes, "linetypes_signature",
+                                  return_value="lt-current"), \
+                mock.patch.object(webapp.linetypes, "load_page",
+                                  return_value={"sig": "lt-old",
+                                                "bindings": []}), \
+                mock.patch.object(
+                    webapp.linetype_refresh_state, "page_refresh_status",
+                    return_value="running"):
+            webapp._attach_linetypes(
+                record, SLUG, 1, items, "pdf-current",
+                plan_regions=[[0, 0, 1000, 1000]])
+
+        args = anchors_of.call_args.args
+        self.assertIsNone(args[0])
+        self.assertEqual(args[1], symbol_result)
+        self.assertIs(args[2], items)
+        status = record["linetypes_status"]
+        self.assertEqual(status["state"], "updating")
+        self.assertEqual(status["targets"], 2)
+        self.assertEqual(status["callout_targets"], 2)
+        self.assertEqual(status["arrow_targets"], 1)
+        self.assertEqual(status["symbol_center_targets"], 1)
 
     @staticmethod
     def _owned_entry():
@@ -913,6 +1226,16 @@ class LegendLineTypePublicationTests(WebappCase):
         items = [{"text": "8' HIGH FENCE",
                   "box_2d": [20, 600, 30, 680]}]
         symbols = {"1": self._symbol_entry()}
+        symbols_result = (symbols["1"]["result"] if publishable else {})
+        symbol_context = {
+            "entry": symbols["1"],
+            "symbols_current": publishable,
+            "placements_current": publishable,
+            "symbols_result": symbols_result,
+            "placement_result": symbols_result,
+            "plan_regions": [],
+            "publishable": publishable,
+        }
 
         def load_json(path, default=None):
             return symbols if Path(path).name == "symbols.json" else {}
@@ -920,8 +1243,6 @@ class LegendLineTypePublicationTests(WebappCase):
         with mock.patch.object(webapp.linetypes, "ENABLED", True), \
                 mock.patch.object(webapp.store, "load_json",
                                   side_effect=load_json), \
-                mock.patch.object(webapp, "_symbols_publishable",
-                                  return_value=publishable), \
                 mock.patch.object(webapp, "_placement_anchors_for",
                                   return_value=[]), \
                 mock.patch.object(webapp.arrows, "arrows_signature",
@@ -936,7 +1257,8 @@ class LegendLineTypePublicationTests(WebappCase):
                                   return_value=True):
             webapp._attach_linetypes(
                 record, SLUG, 1, items, "pdf-current",
-                plan_regions=[[0, 0, 500, 500]])
+                plan_regions=[[0, 0, 500, 500]],
+                symbol_context=symbol_context)
         return record
 
     def test_current_legend_sample_publishes_full_type_without_arrows(self):

@@ -17,6 +17,7 @@ callout 检测（content stream 解析 → 顺序分段 → 引线拓扑恢复 �
 """
 import hashlib
 import json
+import math
 import os
 import shutil
 import re
@@ -104,7 +105,29 @@ _BUDGET_LADDER = [
 ]
 
 
-def arrows_signature(items, revision, extra_anchors=None):
+_PLAN_REGIONS_UNSET = object()
+
+
+def _signature_plan_regions(regions):
+    canonical = set()
+    for box in regions or ():
+        if not (isinstance(box, (list, tuple)) and len(box) == 4):
+            continue
+        values = []
+        for value in box:
+            if (isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))):
+                values = []
+                break
+            values.append(float(value))
+        if values:
+            canonical.add(tuple(values))
+    return [list(box) for box in sorted(canonical)]
+
+
+def arrows_signature(items, revision, extra_anchors=None,
+                     plan_regions=_PLAN_REGIONS_UNSET):
     """arrows.json 的缓存签名：两类锚 + PDF 身份 + 算法版本。
 
     extra_anchors 是 [(key, box_2d), ...]，即 shape 样例矢量匹配出来的放置。
@@ -127,6 +150,17 @@ def arrows_signature(items, revision, extra_anchors=None):
             [[str(k), list(b)] for k, b in extra_anchors],
             sort_keys=True).encode()).hexdigest()[:12]
         base = f"{base}+{digest}"
+    if PLAN_GATE:
+        if plan_regions is _PLAN_REGIONS_UNSET:
+            raise TypeError(
+                "plan_regions is required when ARROWS_PLAN_GATE is enabled")
+        # Gate-off keeps the established cache identity because regions do not
+        # affect execution in that mode.  Gate-on has an explicit namespace
+        # and signs the exact effective view geometry used by the sidecar.
+        region_digest = hashlib.sha1(json.dumps(
+            _signature_plan_regions(plan_regions),
+            separators=(",", ":")).encode()).hexdigest()[:12]
+        base = f"{base}+g1p{region_digest}"
     return f"{base}|v{ARROWS_VERSION}"
 
 

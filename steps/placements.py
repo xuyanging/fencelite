@@ -10,17 +10,23 @@ plan 内，被滤掉的正是图例原件与图签噪声。所以：
   * 中心落在任一 plan 组框 ±2 内 → 保留（±2 与全栈其它包含判定一致）；
   * 本页没有 plan 框 → fail-closed，一个都不留（未分类不猜 plan）。
 
-``line`` 样例暂不匹配：整线追踪已下线，只标出图例样例本身。
+``line`` 样例不走 shape 放置传播；它由步骤6的 supervised legend line-type
+通道直接提取样例线型并匹配全图。这里仅记录「不属于 placement 阶段」，不能再
+写成只标框、不做全图匹配。
 
 这一步免费且可重复，所以 dbg 记录永远收集，PLACEMENT_VERSION bump 就是免费重算。
 """
+import hashlib
+import json
+import math
+
 from steps.versions import PLACEMENT_VERSION
 
 # ±2 tolerance on plan containment — the same slack the symbol group gate and
 # the rest of the stack use for "center inside this box".
 PLAN_PAD = 2
 
-LINE_NOTE = "line samples are not matched (only the legend sample is marked)"
+LINE_NOTE = "handled by supervised legend line-type matching (not shape placement)"
 NO_PLAN_NOTE = "no_plan_view"
 
 # Written afresh on every run so a reused cache entry never keeps a stale
@@ -33,6 +39,68 @@ _STALE_KEYS = ("placements", "placement_error", "placement_note",
 # roughly that inherited frame; a naked decimal elsewhere on the plan is not
 # a symbol even though its exact text class matches.
 INHERITED_OUTLINE_MIN_RATIO = 0.75
+
+
+def _scope_box(box):
+    """Stable numeric geometry for placement cache identity."""
+    if not (isinstance(box, (list, tuple)) and len(box) == 4):
+        return None
+    out = []
+    for value in box:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))):
+            return None
+        out.append(float(value))
+    return out
+
+
+def placement_scope_signature(symbols, typed_groups):
+    """Identity of every input that can change local placement output.
+
+    The symbol cache signature alone is insufficient: a forced classifier
+    rerun can change a view from plan to elevation while retaining the same
+    classifier input signature.  Placements must then be filtered again.
+    Sign the effective plan boxes and the shape-template geometry actually
+    consumed by :func:`match_placements`.
+
+    Pages without shape samples use a fixed scope.  Line samples never create
+    placements, so changing view classification must not make those pages
+    perpetually stale.
+    """
+    shapes = []
+    for index, symbol in enumerate(symbols or ()):
+        if not isinstance(symbol, dict) or symbol.get("category") != "shape":
+            continue
+        source = str(symbol.get("source") or "")
+        shapes.append({
+            "index": index,
+            "box": _scope_box(symbol.get("box_2d")),
+            "source": source,
+            "content_box": (_scope_box(symbol.get("glyph_box_2d"))
+                            if source == "row_code" else None),
+        })
+    if shapes and typed_groups is None:
+        # ``None`` means classification is pending, not "classified and found
+        # no plan".  Those two states must never share a placement cache key.
+        return None
+    plans = []
+    if shapes:
+        from steps.views import plan_boxes
+
+        plans = sorted({
+            tuple(normalized)
+            for box in plan_boxes(typed_groups)
+            if (normalized := _scope_box(box)) is not None
+        })
+    payload = {
+        "v": PLACEMENT_VERSION,
+        "plan_pad": PLAN_PAD,
+        "shapes": shapes,
+        "plans": [list(box) for box in plans],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _has_inherited_outline(box, sample):
@@ -70,8 +138,8 @@ def match_placements(pdf_path, page_index, symbols, typed_groups, *, dbg=None):
 
     返回
       {"shape", "line", "placed", "dropped_outside_plan", "plan_groups",
-       "plc_v"} —— 调用方把它整份 merge 进 result（``result.update(summary)``），
-      has_current_placements 就靠里面的 plc_v 判当期。
+       "plc_v", "plc_scope_sig"} —— 调用方把它整份 merge 进 result
+      （``result.update(summary)``）；版本和输入 scope 必须同时当期。
     """
     from core.symbolmatch import find_symbol_placements
     from steps.views import plan_boxes
@@ -148,10 +216,88 @@ def match_placements(pdf_path, page_index, symbols, typed_groups, *, dbg=None):
     return {"shape": shape_count, "line": line_count, "placed": placed,
             "dropped_outside_plan": dropped_total, "plan_groups": len(plans),
             "dropped_without_outline": outline_dropped_total,
-            "plc_v": PLACEMENT_VERSION}
+            "plc_v": PLACEMENT_VERSION,
+            "plc_scope_sig": placement_scope_signature(
+                symbols, typed_groups)}
 
 
-def has_current_placements(result):
-    """Whether this page's local shape matching is current (free to redo)."""
-    return bool(isinstance(result, dict)
-                and result.get("plc_v") == PLACEMENT_VERSION)
+def has_current_placements(result, typed_groups):
+    """Whether local shape matching matches the current templates and plans."""
+    if not (isinstance(result, dict)
+            and result.get("plc_v") == PLACEMENT_VERSION):
+        return False
+    expected = placement_scope_signature(
+        result.get("symbols") or (), typed_groups)
+    return bool(isinstance(expected, str)
+                and result.get("plc_scope_sig") == expected)
+
+
+def current_placement_context(symbol_entry, expected_symbol_sig,
+                              view_entry, pdf_revision):
+    """Validate symbol, view and placement caches as one prerequisite chain.
+
+    Consumers previously validated only ``plc_v`` and could therefore publish
+    placements filtered with an old plan/elevation decision.  This helper is
+    intentionally shared by the job scheduler and web readers so they cannot
+    disagree about which placement boxes enter arrow/line-type signatures.
+
+    ``typed_groups`` is ``None`` while a page with view boxes awaits a current
+    classifier result.  Shape placements then fail closed.  A line-only page
+    remains current because it never creates placements; its independent view
+    status is still reported through ``views_current`` and ``plan_regions``.
+    """
+    from steps.symbols import has_current_symbols
+    from steps.views import (groups_need_classification,
+                             has_current_view_types, merge_view_types,
+                             plan_boxes)
+
+    context = {
+        "state": "symbols-stale",
+        "result": {},
+        "symbols_result": {},
+        "placement_result": {},
+        "typed_groups": None,
+        "plan_regions": [],
+        "scope_sig": None,
+        "symbols_current": False,
+        "views_current": False,
+        "placements_current": False,
+    }
+    if not has_current_symbols(symbol_entry, expected_symbol_sig):
+        return context
+
+    result = (symbol_entry or {}).get("result") or {}
+    groups = result.get("groups") or []
+    context["result"] = result
+    context["symbols_result"] = result
+    context["symbols_current"] = True
+
+    needs_views = groups_need_classification(groups)
+    views_current = (not needs_views or has_current_view_types(
+        view_entry, groups, pdf_revision))
+    typed_groups = (merge_view_types(groups, view_entry)
+                    if views_current else None)
+    context["views_current"] = views_current
+    context["typed_groups"] = typed_groups
+    context["plan_regions"] = (plan_boxes(typed_groups)
+                               if typed_groups is not None else [])
+
+    has_shape = any(
+        isinstance(symbol, dict) and symbol.get("category") == "shape"
+        for symbol in (result.get("symbols") or ()))
+    if has_shape and typed_groups is None:
+        context["state"] = "views-pending"
+        return context
+
+    # The no-shape signature deliberately ignores plans, so raw groups are a
+    # safe stand-in while an unrelated view classification is pending.
+    scope_groups = typed_groups if typed_groups is not None else groups
+    context["scope_sig"] = placement_scope_signature(
+        result.get("symbols") or (), scope_groups)
+    context["placements_current"] = has_current_placements(
+        result, scope_groups)
+    if context["placements_current"]:
+        context["placement_result"] = result
+    context["state"] = ("ok" if context["placements_current"]
+                        else "placements-stale")
+    return context

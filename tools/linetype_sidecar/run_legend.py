@@ -247,6 +247,38 @@ def main():
     except Exception as error:                                  # noqa: BLE001
         _fail("PATTERN_INSTANCE_ERROR", f"{type(error).__name__}: {error}")
 
+    # Keep the complete engine audit, not merely the clusters selected by a
+    # legend swatch.  ``run_all.py`` is an independent producer; publication
+    # can therefore compare every type's exact op-set fingerprint against this
+    # cache before an All Line Types response is allowed.  This matters on
+    # sheets with legend samples but no arrow terminals: the supervised rows
+    # below are intentionally only a semantic subset (P4: 1 of 33 clusters),
+    # while the debug layer promises the complete page audit.
+    range_counts = {
+        int(cluster["line_type_number"]):
+            len(cluster["commands"].get("ranges") or ())
+        for cluster in payload["global_line_types"]
+    }
+    for number, indices in cluster_ops.items():
+        page_lines = [
+            [to_page_frame(x, y) for x, y in line]
+            for op_index in indices
+            for line in ir_geometry.get(op_index, ())
+        ]
+        instances = pattern_instances.get(number) or []
+        row = meta[number]
+        row.update({
+            "op_count": len(indices),
+            "range_count": range_counts.get(number, len(indices)),
+            "segment_count": sum(max(0, len(line) - 1)
+                                 for line in page_lines),
+            "ops_sha1": _sha1(indices),
+            "bbox": _bbox(page_lines),
+            "pattern_instance_count": len(instances),
+            "pattern_instances": instances,
+        })
+    engine_all_line_types = [dict(meta[number]) for number in sorted(meta)]
+
     try:
         templates = [extract_template(
             page, sample, sample_index, to_page_frame)
@@ -418,13 +450,22 @@ def main():
             "sheet": sheet,
             "ops": payload["operation_count"],
             "path_ops": len(ir_geometry),
+            "owned_path_ops": sum(1 for index in ir_geometry
+                                  if index in owner),
             "rotation": page.rotation_degrees,
             "groups": payload["group_count"],
             "base_line_types": len(payload["global_line_types"]) + len(recovered),
+            "line_types": len(payload["global_line_types"]) + len(recovered),
+            "fused_line_types": len(payload["global_line_types"]),
+            "recovered_line_types": len(recovered),
             "legend_samples": len(templates),
             "legend_matches": len(matches),
             "legend_semantic_types": len(line_types),
             "page_fingerprint": payload["page_fingerprint"],
+            "owned_ops_sha1": _sha1(owner),
+            "fused_ops_sha1": _sha1(
+                index for index, number in owner.items()
+                if number <= len(payload["global_line_types"])),
             "tip_precision_pt": 0.0,
             "seconds_ir": round(seconds_ir, 2),
             "seconds_cluster": round(seconds_cluster, 2),
@@ -432,6 +473,7 @@ def main():
         },
         "line_types": line_types,
         "all_line_types": all_line_types,
+        "engine_all_line_types": engine_all_line_types,
         "bindings": bindings,
         "samples": audits,
     }, sys.stdout, ensure_ascii=False, separators=(",", ":"))

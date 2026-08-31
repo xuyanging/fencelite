@@ -56,7 +56,9 @@ job = {
   "pages": [                     # **一次一批**，见下面「为什么是多页」
     {"sheet": int,               #   **1-based** 页号
      "targets":[{"key": str, "ti": int, "tip": [y, x],
-                 "own": [[[y,x], ...], ...]}]},   # own = 该 callout 自己的引线+箭头
+                 "own": [[[y,x], ...], ...],      # own = 该 callout 自己的引线+箭头
+                 "anchor_kind": "symbol_center", # 可选：无引线 symbol 中心
+                 "exclude_box": [y0,x0,y1,x1]}]}, # center 必需：symbol 紧框
     ...
   ],
   "top_k":  int,                 # 每个末端回传几个候选簇（审计用）
@@ -96,6 +98,17 @@ TOP_K_DEFAULT = 3
 # 同一份 PDF，坐标只差舍入（arrows.json 里的点是页帧整数），所以 1 pt 足够。
 OWN_TOLERANCE_PT = 1.0
 OWN_POINT_RATIO = 0.75       # op 的点有这么多落在自己笔画上就算自己的几何
+
+# 无引线 symbol 的 placement 框往往只包住文字或图形中心，自身边框会比
+# placement 多伸出。drawings_volume_4_binder P4 的 6DFG 实测最远伸出约
+# 28 PDF pt，因此以 36 pt 留出 8 pt 的量化/线宽余量。必须在 IR 里等向
+# 外扩，不能在 0-1000 页面帧里扩：后者的 x/y 比例随纸张长宽变化。
+SYMBOL_EXCLUDE_PAD_PT = 36.0
+
+# 中心锚点的 tip 本身只精确到约 1 pt，候选距离的 0.001 pt 差异没有物理
+# 意义。只在这个极小的同距桶内，优先 op 更少的簇（更具体）。
+# 普通引线锚点仍严格按真实距离排序，不受这条规则影响。
+SYMBOL_CENTER_TIE_PT = 0.001
 
 # **所有距离都在 IR 帧（PDF 点）里算，不在 0-1000 页帧里算。**
 # 0-1000 是逐轴归一的：gladstone P2 上 x 是 1000/2448 = 0.4085 单位/pt、
@@ -314,6 +327,98 @@ def _is_own_geometry(lines, own_lines):
                                OWN_TOLERANCE_PT * 2) <= OWN_TOLERANCE_PT:
             hits += 1
     return hits >= max(2, int(len(points) * OWN_POINT_RATIO))
+
+
+def _symbol_exclude_ir_box(frame_box, to_ir_frame):
+    """symbol 页面帧框外扩后转为 IR 轴对齐框 ``[xmin,ymin,xmax,ymax]``.
+
+    只有 ``anchor_kind=symbol_center`` 的调用方会用这个框。这里对协议输入
+    fail closed：缺失、非有限数或退化框都返回 None，上层将不会以一个无法
+    排除 marker 自身的中心锚点做绑定。
+    """
+    if not isinstance(frame_box, (list, tuple)) or len(frame_box) != 4:
+        return None
+    try:
+        y0, x0, y1, x1 = (float(value) for value in frame_box)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(value) for value in (y0, x0, y1, x1)):
+        return None
+    if y1 <= y0 or x1 <= x0:
+        return None
+    # 先投影紧框，再在 PDF/IR 点中等向外扩；页面帧是各轴独立归一，
+    # 在那里外扩会让同一常量在横竖轴上对应不同的物理距离。
+    corners = [to_ir_frame(y, x) for y in (y0, y1) for x in (x0, x1)]
+    if any(
+        not isinstance(point, (list, tuple))
+        or len(point) != 2
+        or not all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            for value in point
+        )
+        for point in corners
+    ):
+        return None
+    xs = [float(point[0]) for point in corners]
+    ys = [float(point[1]) for point in corners]
+    pad = SYMBOL_EXCLUDE_PAD_PT
+    return (min(xs) - pad, min(ys) - pad,
+            max(xs) + pad, max(ys) + pad)
+
+
+def _geometry_inside_ir_box(lines, box):
+    """一条 path op 的**所有**折线点是否都在框内。
+
+    判定粒度故意是整个 op，不是把框内的线段裁掉。因此只要长线的任一
+    点伸出框外，整个 op 都保留，不会把穿过 symbol 的真围栏线误排除。
+    """
+    if box is None:
+        return False
+    x0, y0, x1, y1 = box
+    seen = False
+    for line in lines:
+        for point in line:
+            seen = True
+            if not (x0 <= point[0] <= x1 and y0 <= point[1] <= y1):
+                return False
+    return seen
+
+
+def _symbol_excluded_ops(ir_geometry, frame_box, to_ir_frame):
+    """Return complete path ops belonging to the center marker neighbourhood."""
+    box = _symbol_exclude_ir_box(frame_box, to_ir_frame)
+    if box is None:
+        return None
+    return {
+        op_index
+        for op_index, lines in ir_geometry.items()
+        if _geometry_inside_ir_box(lines, box)
+    }
+
+
+def _candidate_rank_key(distance, number, op_count, symbol_center):
+    """Distance order; center-only ties prefer the smaller/more specific cluster."""
+    if not symbol_center:
+        return (distance, number)
+    distance_bucket = round(float(distance) / SYMBOL_CENTER_TIE_PT)
+    return (distance_bucket, int(op_count), float(distance), int(number))
+
+
+def _op_rank_key(distance, op_index, number, op_count, symbol_center):
+    """Nearest-op order, retaining legacy behavior outside symbol centers."""
+    if not symbol_center:
+        return (float(distance), int(op_index))
+    distance_bucket = round(float(distance) / SYMBOL_CENTER_TIE_PT)
+    # At the same physical distance, a recognized type is more useful than
+    # residual ink for this explicit "nearest known line type" anchor.  Among
+    # recognized types the smaller cluster is the more specific one.
+    known_rank = 0 if number is not None else 1
+    cluster_size = int(op_count) if number is not None else sys.maxsize
+    cluster_number = int(number) if number is not None else sys.maxsize
+    return (distance_bucket, known_rank, cluster_size, float(distance),
+            cluster_number, int(op_index))
 
 
 # 判定「同一条走线」的接触容差，单位 PDF 点（IR 帧，等向）。
@@ -755,11 +860,23 @@ def main():
         tip = target.get("tip")
         if not (isinstance(tip, (list, tuple)) and len(tip) >= 2):
             continue
+        anchor_kind = target.get("anchor_kind")
+        symbol_center = anchor_kind == "symbol_center"
         frame_tip = [float(tip[0]), float(tip[1])]
         ir_tip = to_ir_frame(frame_tip[0], frame_tip[1])
         own_lines = [[to_ir_frame(p[0], p[1]) for p in line]
                      for line in (target.get("own") or ())
                      if isinstance(line, (list, tuple)) and len(line) >= 2]
+
+        # 中心锚点必须有可验证的 symbol 框。没有框时继续找最近几何会
+        # 稳定地选中 marker 自身，比不返回这个锚点更危险，因此 fail closed。
+        excluded_ops = set()
+        if symbol_center:
+            excluded = _symbol_excluded_ops(
+                ir_geometry, target.get("exclude_box"), to_ir_frame)
+            if excluded is None:
+                continue
+            excluded_ops = excluded
 
         # 先剔掉这个 callout 自己的引线 / 箭头笔画，再找离 tip 最近的 op。
         # 同时单独记下最近的**有主** op：tip 自身的量化精度就有 1 pt 量级
@@ -773,22 +890,63 @@ def main():
             if _is_own_geometry(lines, own_lines):
                 own_ops += 1
                 continue
+            if op_index in excluded_ops:
+                continue
+            # 中心策略只消费“最近的已识别线型”，residual 与结论无关。P4 有
+            # 154k path op、其中仅约13k有主；提前跳过无主 op，避免几十个
+            # placement 各自重复扫描整页背景线。普通箭头仍保留完整 residual
+            # 审计，不受影响。
+            if symbol_center and op_index not in owner:
+                continue
             distance = _polylines_distance(ir_tip, lines)
-            if nearest is None or distance < nearest[0]:
-                nearest = (distance, op_index)
-            if op_index in owner and (nearest_owned is None
-                                      or distance < nearest_owned[0]):
-                nearest_owned = (distance, op_index)
+            number = owner.get(op_index)
+            op_rank_key = _op_rank_key(
+                distance, op_index, number,
+                len(ops_by_cluster.get(number) or ()) if number is not None else 0,
+                symbol_center)
+            if nearest is None or op_rank_key < nearest[2]:
+                nearest = (distance, op_index, op_rank_key)
+            if op_index in owner:
+                number = owner[op_index]
+                rank_key = _candidate_rank_key(
+                    distance, number, len(ops_by_cluster.get(number) or ()),
+                    symbol_center)
+                if (nearest_owned is None
+                        or (symbol_center and rank_key < nearest_owned[2])
+                        or (not symbol_center
+                            and distance < nearest_owned[0])):
+                    nearest_owned = (distance, op_index, rank_key)
+
+        if symbol_center:
+            # 让 nearest_op 与中心专用的具体度平手裁决一致；否则 operation
+            # 输入顺序可能让它指向较大的父簇，而 nearest_owned_op 指向子簇。
+            nearest = ((nearest_owned[0], nearest_owned[1], nearest_owned[2])
+                       if nearest_owned is not None else None)
 
         # 候选簇的距离（同样排除自己的几何），作审计与投票改判用。
         ranked = []
         for number, lines in ir_by_cluster.items():
-            usable = [line for line in lines
-                      if not _is_own_geometry([line], own_lines)]
+            if symbol_center:
+                # 中心锚点按 op 排除：一条 op 只要伸出框外就整条保留。
+                # 不能对已摊平的 cluster polylines 逐段删，那会把穿框长线的
+                # 框内部分错当 marker 裁掉。
+                usable = [
+                    line
+                    for op_index in (ops_by_cluster.get(number) or ())
+                    if op_index not in excluded_ops
+                    for line in (ir_geometry.get(op_index) or ())
+                    if not _is_own_geometry([line], own_lines)
+                ]
+            else:
+                usable = [line for line in lines
+                          if not _is_own_geometry([line], own_lines)]
             if not usable:
                 continue
-            ranked.append((_polylines_distance(ir_tip, usable), number))
-        ranked.sort()
+            distance = _polylines_distance(ir_tip, usable)
+            ranked.append((distance, number))
+        ranked.sort(key=lambda item: _candidate_rank_key(
+            item[0], item[1], len(ops_by_cluster.get(item[1]) or ()),
+            symbol_center))
         head = ranked[:max(1, top_k)]
         candidates.update(number for _distance, number in head)
 
@@ -802,10 +960,14 @@ def main():
                         "distance": round(distance, 3)}
                        for distance, number in head],
         }
+        if anchor_kind is not None:
+            row["anchor_kind"] = anchor_kind
+        if symbol_center:
+            row["excluded_ops"] = len(excluded_ops)
         if nearest is None:
             row["nearest_op"] = None
         else:
-            distance, op_index = nearest
+            distance, op_index, _rank_key = nearest
             row["nearest_op"] = {
                 "op_index": op_index,
                 "distance": round(distance, 3),
@@ -825,7 +987,7 @@ def main():
         if nearest_owned is None:
             row["nearest_owned_op"] = None
         else:
-            distance, op_index = nearest_owned
+            distance, op_index, _rank_key = nearest_owned
             row["nearest_owned_op"] = {
                 "op_index": op_index,
                 "distance": round(distance, 3),

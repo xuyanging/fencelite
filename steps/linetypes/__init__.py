@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 
 from steps import store
@@ -74,7 +75,7 @@ __all__ = ["ALL_GEOMETRY_VERSION", "ALL_PAGE_SUFFIX", "ENABLED", "LINETYPE_VERSI
            "verify_all_page_geometry",
            "linetypes_signature", "page_payload", "regroup",
            "resolve_visible", "sidecar", "sidecar_available",
-           "symbol_owners_of"]
+           "symbol_center_anchors", "symbol_owners_of"]
 
 
 # ---------------------------------------------------------------- 磁盘布局 --
@@ -420,7 +421,7 @@ def sidecar_available():
     return sidecar.sidecar_available()
 
 
-def linetypes_signature(arrows_sig):
+def linetypes_signature(arrows_sig, symbol_result=None, items=None):
     """linetypes.json 的缓存签名 = 箭头结果 + 引擎源码 + 本层版本.
 
     * ``arrows_sig``：直接串上 arrows.arrows_signature(...) 的结果。它自己已经
@@ -436,7 +437,22 @@ def linetypes_signature(arrows_sig):
       一页 100 秒的聚类。
     """
     digest = hashlib.sha1(str(sidecar.engine_digest()).encode()).hexdigest()[:12]
-    return f"{arrows_sig}+e{digest}|lt{LINETYPE_VERSION}"
+    centers = symbol_center_anchors(symbol_result, items)
+    center_suffix = ""
+    if centers:
+        # arrows_sig 只签 placement 的 key+box，不知道主人文字是 gate 还是 fence。
+        # 同一批框若 owner 从纯 gate 变为 fence，中心输入会从 0 变为 N；不把这份
+        # eligibility/几何摘要签进去就会静默复用“没有中心”的旧缓存。
+        canonical = [{
+            "key": row["key"], "tip": row["tip"],
+            "exclude_box": row["exclude_box"],
+        } for row in centers]
+        center_digest = hashlib.sha1(json.dumps(
+            canonical, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode()).hexdigest()[:12]
+        center_suffix = f"+c{center_digest}"
+    return (f"{arrows_sig}{center_suffix}+e{digest}"
+            f"|lt{LINETYPE_VERSION}")
 
 
 def has_current_linetypes(entry, sig):
@@ -445,7 +461,56 @@ def has_current_linetypes(entry, sig):
                 and isinstance(entry.get("bindings"), list))
 
 
-def anchors_of(arrow_entry):
+def symbol_center_anchors(symbol_result, items):
+    """为没有可靠引线的 symbol placement 生成框中心锚点。
+
+    placement 本身就是全图矢量匹配确认过的 callout。这里不再要求箭头模块先从
+    它周围猜出一条引线；每个框中心直接寻找最近的**已识别线型**，而相同 symbol
+    的多个 placement 在读盘期共同投票。纯 gate 仍不找线；一句话同时包含 fence
+    与 gate 时遵守 fence 优先的既有产品口径。
+
+    ``exclude_box`` 交给边车排除 symbol 自己及紧邻的标记笔画。只在这里传原始
+    紧框，具体按 PDF 点扩多大属于几何生产者的判据，应随 ``run.py`` 进入引擎
+    digest，而不能在两个进程里各写一份。
+    """
+    out = []
+    rows = list(items or ())
+    for si, symbol in enumerate((symbol_result or {}).get("symbols") or ()):
+        if not isinstance(symbol, dict):
+            continue
+        owner = symbol.get("text_index")
+        if (isinstance(owner, bool) or not isinstance(owner, int)
+                or not 0 <= owner < len(rows)):
+            continue
+        if bind.is_gate_text((rows[owner] or {}).get("text")):
+            continue
+        for pi, raw_box in enumerate(symbol.get("placements") or ()):
+            if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
+                continue
+            try:
+                y0, x0, y1, x1 = (float(value) for value in raw_box)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not all(math.isfinite(value) for value in (y0, x0, y1, x1)):
+                continue
+            y0, y1 = sorted((y0, y1))
+            x0, x1 = sorted((x0, x1))
+            if y1 <= y0 or x1 <= x0:
+                continue
+            out.append({
+                "key": f"s{si}:{pi}",
+                # 箭头 target 的 ti 从 0 开始；-1 明确表示同一 placement 的
+                # 无引线中心证据，二者不会在审计时撞成同一个末端。
+                "ti": -1,
+                "tip": [(y0 + y1) / 2.0, (x0 + x1) / 2.0],
+                "own": [],
+                "anchor_kind": "symbol_center",
+                "exclude_box": [y0, x0, y1, x1],
+            })
+    return out
+
+
+def anchors_of(arrow_entry, symbol_result=None, items=None):
     """arrows.json 的一页 entry → 线型层要处理的末端列表.
 
     一个 callout 可以有多个末端，身份是 (key, ti) —— 只用 key 会把同一句话的
@@ -467,18 +532,19 @@ def anchors_of(arrow_entry):
             if isinstance(tip, (list, tuple)) and len(tip) >= 2:
                 out.append({"key": key, "ti": index,
                             "tip": [float(tip[0]), float(tip[1])],
-                            "own": own})
+                            "own": own, "anchor_kind": "arrow_tip"})
+    out.extend(symbol_center_anchors(symbol_result, items))
     return out
 
 
 def compute_page_linetypes(pdf_path, sheet, items, arrow_entry, *, sig,
-                           dbg=None, **kwargs):
+                           symbol_result=None, dbg=None, **kwargs):
     """算一页，返回**待落盘的 entry**（不含 plan 任何信息）。
 
     sheet 是 **1-based**（results.json 的页键、引擎 API 都是 1-based）。
     没有末端时返回一个显式的空 entry —— 那是"确实没有可绑的对象"，不是失败。
     """
-    anchors = anchors_of(arrow_entry)
+    anchors = anchors_of(arrow_entry, symbol_result, items)
     if not anchors:
         return {"sig": sig, "v": LINETYPE_VERSION, "bindings": [],
                 "groups": [], "line_types": [], "used_all": [],

@@ -44,6 +44,13 @@ import unicodedata
 # 已经很宽松；final_plans P3 两个正确 Method 2 目标分别仅 3.437 / 6.838 pt。
 MAX_BIND_DISTANCE = 36.0
 
+# symbol 中心先要排除向外伸出的 marker 笔画；真实围栏的下一段因此可能略超过
+# 普通箭头的 36 pt。drawings_volume_4_binder P4 在完整排除 6DFG marker 后，
+# 正确共同候选 #45 是 37.593 pt。48 pt 给 marker 排除带留出 10 pt 余量，同时
+# 仍是一个明确的局部邻域护栏；只供 ``anchor_kind=symbol_center`` 使用，绝不
+# 放宽普通箭头。
+MAX_SYMBOL_CENTER_DISTANCE = 48.0
+
 # residual → 最近已识别线型是较弱证据，不能沿用 direct owner 的 36 pt。现有 plan
 # 页旧规则已确认绑定的 fallback 距离 p95=2.537 pt、最大 2.970 pt；final_plans P3
 # 两个确定正确的 Method 2 目标是 3.437 / 6.838 pt。12 pt 给已知正确最大值留约
@@ -60,7 +67,7 @@ MAX_FALLBACK_BIND_DISTANCE = 12.0
 # 这条判定放在**读盘期**（resolve_visible），不进缓存：gate 与否是对文字的
 # 判断，将来可能换更好的判据，而重算一页聚类要 100 s 以上。和 plan 显示闸
 # 同一个道理。
-FENCE_PATTERN = re.compile(r"\bFENC(?:E[DS]?|ING)\b", re.I)
+FENCE_PATTERN = re.compile(r"\b(?:FENC(?:E[DS]?|ING)|FENCELINES?)\b", re.I)
 GATE_PATTERN = re.compile(r"\bGATES?\b", re.I)
 
 
@@ -108,6 +115,24 @@ def verdict_of(row, tip_precision_pt=0.0):
     ``MAX_BIND_DISTANCE``（36 pt）控制；residual fallback 使用更严格的
     ``MAX_FALLBACK_BIND_DISTANCE``（12 pt）。
     """
+    # 无引线 symbol 的框中心落在 marker 自己身上是正常现象。边车会排除 marker
+    # 邻域的小图元，但附近仍可能先遇到一条无主背景线；这一路的产品定义本来就是
+    # “最近的**已知线型**”，所以直接消费 nearest_owned_op，并继续受中心专用
+    # 48 pt
+    # 绝对距离护栏约束。普通箭头仍走下面更严格的 residual→12 pt fallback，互不
+    # 放宽。
+    if row.get("anchor_kind") == "symbol_center":
+        owned = row.get("nearest_owned_op")
+        if isinstance(owned, dict) and owned.get("owner") is not None:
+            try:
+                owned_distance = float(owned["distance"])
+            except (KeyError, TypeError, ValueError):
+                owned_distance = None
+            if owned_distance is not None:
+                if owned_distance <= MAX_SYMBOL_CENTER_DISTANCE:
+                    return "bound", int(owned["owner"]), owned_distance
+                return "too-far", None, owned_distance
+
     nearest = row.get("nearest_op")
     if not isinstance(nearest, dict):
         return "no-geometry", None, None

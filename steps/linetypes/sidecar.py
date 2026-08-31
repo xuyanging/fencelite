@@ -19,10 +19,16 @@ import threading
 from pathlib import Path
 
 _BASE_DIR = Path(__file__).resolve().parent.parent.parent
+_CLIENT = Path(__file__).resolve()
 _SIDECAR_DIR = _BASE_DIR / "tools" / "linetype_sidecar"
 _RUNNER = _SIDECAR_DIR / "run.py"
 _ALL_RUNNER = _SIDECAR_DIR / "run_all.py"
-_ENGINE_DIR = _SIDECAR_DIR / "engine" / "line_type_engine"
+_VENDORED_ENGINE_DIR = _SIDECAR_DIR / "engine" / "line_type_engine"
+# run.py supports an explicit engine checkout for controlled verification.  The
+# cache digest and availability check must follow the same directory; hashing
+# the vendored tree while executing an override would publish an untraceable mix.
+_ENGINE_DIR = Path(os.environ.get(
+    "LINETYPE_ENGINE_PATH", str(_VENDORED_ENGINE_DIR))).resolve()
 
 
 def _venv_python(venv_dir):
@@ -70,6 +76,7 @@ CPU_BUDGET = int(os.environ.get("LINETYPE_CPU_BUDGET", "")
 # 每个末端回传几个候选线型。投票只可能从各末端的候选里选，所以这个数决定了
 # 上层判据的闭合性：调小到 1 就等于禁掉"被多数票改判"。
 TOP_K = int(os.environ.get("LINETYPE_TOP_K", "3"))
+RUN_TOUCH_PT = os.environ.get("LINETYPE_RUN_TOUCH_PT", "0.5")
 
 _DIGEST_LOCK = threading.Lock()
 _DIGEST = {"value": None, "stamp": None}
@@ -103,9 +110,8 @@ def engine_digest():
     包含三部分，缺一不可：
 
       * vendored 引擎源码树。动了算法（哪怕一个阈值）就换摘要。
-      * ``run.py`` 本身。它决定用哪个提取器（plain vs source-aligned）、
-        cpu_budget、以及绑定前怎么剔除自己的几何 —— 换了这些结果就变，
-        但它不在 engine/ 里，不单独算进来就是一个静默的缺口。
+      * ``run.py`` 与本客户端协议。前者决定提取/绑定几何，后者决定哪些 target
+        字段真的越过进程边界；任一不进摘要都会让旧缓存静默复用错误协议。
       * 边车 venv 里 PyMuPDF / pypdf / scipy 的版本。scipy 尤其重要：
         unknown_pattern_split 里 5 处 ``try: import scipy`` 的纯 Python 回退
         **不是逐位等价** —— _delaunay_edges 的等价代价平票能让一整个线型
@@ -127,6 +133,17 @@ def engine_digest():
             hasher.update(hashlib.sha256(_RUNNER.read_bytes()).hexdigest().encode())
         except OSError:
             hasher.update(b"no-runner")
+        hasher.update(b"\0client\0")
+        try:
+            hasher.update(hashlib.sha256(_CLIENT.read_bytes()).hexdigest().encode())
+        except OSError:
+            hasher.update(b"no-client")
+        # Environment-driven values are executable algorithm inputs, not mere
+        # performance tuning.  P4 center consensus needs the second ranked
+        # candidate, so TOP_K=1 and TOP_K=3 must never share a cache key.
+        hasher.update(b"\0runtime-config\0")
+        hasher.update(f"top_k={TOP_K}\0".encode())
+        hasher.update(f"run_touch_pt={RUN_TOUCH_PT}\0".encode())
         hasher.update(b"\0deps\0")
         for name, version in sorted(dep_versions().items()):
             hasher.update(f"{name}={version}\0".encode())
@@ -146,8 +163,13 @@ def engine_digest():
 
 
 def _stat_stamp():
-    """引擎树 + run.py 的 (路径, mtime_ns, size) 摘要 —— 纯 stat，不读内容。"""
+    """引擎树 + runner/client 的 (路径, mtime_ns, size) 摘要 —— 纯 stat。"""
     parts = []
+    try:
+        stat = _CLIENT.stat()
+        parts.append(f"client:{stat.st_mtime_ns}:{stat.st_size}")
+    except OSError:
+        parts.append("client:missing")
     try:
         stat = _RUNNER.stat()
         parts.append(f"run:{stat.st_mtime_ns}:{stat.st_size}")
@@ -332,7 +354,14 @@ def run_page(pdf_path, sheet, targets, *, top_k=None, cpu_budget=None,
                      "tip": [float(row["tip"][0]), float(row["tip"][1])],
                      # 这个 callout 自己的引线 + 箭头笔画。边车要先把它们对应的
                      # op 剔掉再比距离，否则会把重复的箭头本身认成"线型"。
-                     "own": [list(line) for line in (row.get("own") or ())]}
+                     "own": [list(line) for line in (row.get("own") or ())],
+                     # 无引线 symbol 的协议字段必须原样越过进程边界。旧白名单
+                     # 丢掉这两项后，run.py 会把中心当普通箭头，稳定吸回 marker。
+                     "anchor_kind": row.get("anchor_kind"),
+                     "exclude_box": (list(row["exclude_box"])
+                                     if isinstance(row.get("exclude_box"),
+                                                   (list, tuple))
+                                     else row.get("exclude_box"))}
                     for row in targets or ()],
         "top_k": int(top_k if top_k is not None else TOP_K),
         "cpu_budget": int(cpu_budget if cpu_budget is not None else CPU_BUDGET),

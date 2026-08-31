@@ -856,10 +856,13 @@ class TestPlacementsStage(JobTestBase):
                 s["placements"] = [[500, 500, 520, 520]]
             if dbg is not None:
                 dbg.add("placements", {"symbol_index": 0})
+            from steps.placements import placement_scope_signature
             from steps.versions import PLACEMENT_VERSION
             return {"shape": 1, "line": 0, "placed": 1,
                     "dropped_outside_plan": 3, "plan_groups": 1,
-                    "plc_v": PLACEMENT_VERSION}
+                    "plc_v": PLACEMENT_VERSION,
+                    "plc_scope_sig": placement_scope_signature(
+                        symbols, typed_groups)}
 
         p = mock.patch("steps.placements.match_placements", fake_match)
         p.start()
@@ -879,6 +882,22 @@ class TestPlacementsStage(JobTestBase):
         # 第二次是当期，零工作
         self.assertEqual(job._stage_placements(self.slug), [])
         self.assertEqual(len(self.seen), 1)
+
+    def test_changed_view_output_recomputes_same_version_placements(self):
+        views_path = store.slug_dir(self.slug) / "view_types.json"
+        store.save_json(views_path,
+                        {"1": _view_entry(self.groups, self.revision)})
+        self.assertEqual(job._stage_placements(self.slug), [])
+        self.assertEqual(self.seen, [(0, [None, "plan"])])
+
+        # view_signature signs classifier inputs; a forced rerun may change
+        # its output under the same signature.  Placement scope must still
+        # notice that the effective plan set changed.
+        store.save_json(views_path, {"1": _view_entry(
+            self.groups, self.revision, view_type="elevation")})
+        self.assertEqual(job._stage_placements(self.slug), [])
+        self.assertEqual(self.seen[-1], (0, [None, "elevation"]))
+        self.assertEqual(len(self.seen), 2)
 
     def test_verified_row_code_is_added_before_the_production_matcher(self):
         rec = _page_rec()
@@ -1025,6 +1044,74 @@ class TestLinetypeCompletionBounds(JobTestBase):
                         "v": job.linetypes.LINETYPE_VERSION,
                         "used_all": [3],
                         "bindings": [], "line_types": []}
+
+    def test_current_fence_placement_schedules_without_an_arrow_target(self):
+        symbols = [{
+            "category": "shape", "text_index": 0,
+            "placements": [[100, 200, 120, 240]],
+        }]
+        revision = store.pdf_revision(store.pdf_path(self.slug))
+        symbol_entry = _symbol_entry(
+            store.sig_of(self.items, revision), symbols, [])
+        from steps.versions import PLACEMENT_VERSION
+        symbol_entry["result"]["plc_v"] = PLACEMENT_VERSION
+        from steps.placements import placement_scope_signature
+        symbol_entry["result"]["plc_scope_sig"] = \
+            placement_scope_signature(symbols, [])
+        symbol_result = symbol_entry["result"]
+        store.save_json(store.slug_dir(self.slug) / "symbols.json",
+                        {"1": symbol_entry})
+        extra = job._placement_anchors(symbol_result)
+        arrows_sig = job.arrows.arrows_signature(
+            self.items, revision, extra)
+        arrow_entry = {
+            "sig": arrows_sig, "v": job.arrows.ARROWS_VERSION,
+            "geometry": {"state": "vector", "vector_paths": 10},
+            # The symbol center is deliberately the only usable anchor.
+            "items": {},
+        }
+        store.save_json(store.slug_dir(self.slug) / "arrows.json",
+                        {"1": arrow_entry})
+
+        jobs, warnings = job._linetype_jobs(self.slug)
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(jobs), 1)
+        page, items, captured_arrows, sig = jobs[0]
+        self.assertEqual(page, 1)
+        self.assertEqual(items, self.items)
+        self.assertEqual(captured_arrows, arrow_entry)
+        self.assertEqual(
+            sig,
+            job.linetypes.linetypes_signature(
+                arrows_sig, symbol_result, self.items))
+        anchors = job.linetypes.anchors_of(
+            captured_arrows, symbol_result, items)
+        self.assertEqual([anchor["anchor_kind"] for anchor in anchors],
+                         ["symbol_center"])
+
+    def test_linetype_worker_passes_current_symbol_result_to_compute(self):
+        symbols = [{
+            "category": "shape", "text_index": 0,
+            "placements": [], "unit_marker": "current-symbol-result",
+        }]
+        revision = store.pdf_revision(store.pdf_path(self.slug))
+        symbol_entry = _symbol_entry(
+            store.sig_of(self.items, revision), symbols, [])
+        from steps.versions import PLACEMENT_VERSION
+        symbol_entry["result"]["plc_v"] = PLACEMENT_VERSION
+        from steps.placements import placement_scope_signature
+        symbol_entry["result"]["plc_scope_sig"] = \
+            placement_scope_signature(symbols, [])
+        symbol_result = symbol_entry["result"]
+        store.save_json(store.slug_dir(self.slug) / "symbols.json",
+                        {"1": symbol_entry})
+        with mock.patch.object(job.linetypes, "compute_page_linetypes",
+                               return_value=self.success) as compute:
+            page, count, error = job._linetype_one(
+                self.slug, 1, self.items, self.arrow_entry, self.sig)
+        self.assertEqual((page, count, error), (1, 1, None))
+        self.assertEqual(compute.call_args.kwargs["symbol_result"],
+                         symbol_result)
 
     def test_timeout_is_adaptive_at_dense_path_boundary(self):
         self.assertEqual(job._linetype_timeout_for(
@@ -1216,8 +1303,8 @@ class TestLinetypeCompletionBounds(JobTestBase):
         cached = {"cache": "raw"}
         canonical = {"cache": "validated"}
 
-        with mock.patch.object(job.linetypes, "load_page",
-                               return_value=main) as load_main, \
+        with mock.patch.object(job, "_current_main_all_source",
+                               return_value=(main, self.arrow_entry)) as current, \
                 mock.patch.object(job.linetypes, "load_all_page",
                                   return_value=cached) as load_all, \
                 mock.patch.object(job.linetypes, "validated_all_page",
@@ -1231,12 +1318,26 @@ class TestLinetypeCompletionBounds(JobTestBase):
                 self.slug, 1, self.sig)
 
         self.assertIs(result, canonical)
-        load_main.assert_called_once_with(self.slug, 1)
+        current.assert_called_once_with(self.slug, 1, self.sig)
         load_all.assert_called_once_with(self.slug, 1)
         validate.assert_called_once_with(cached, main, self.sig)
         slot_pool.assert_not_called()
         compute.assert_not_called()
         save.assert_not_called()
+
+    def test_current_main_all_source_rechecks_live_prerequisites(self):
+        job.linetypes.save_page(self.slug, 1, dict(self.success))
+        main, arrow = job._current_main_all_source(
+            self.slug, 1, self.sig)
+        self.assertEqual(main, self.success)
+        self.assertEqual(arrow, self.arrow_entry)
+
+        results = store.load_json(store.results_path(self.slug), {})
+        results["pages"]["1"]["vlm_items"][0]["text"] = "CHANGED FENCE"
+        store.save_json(store.results_path(self.slug), results)
+        self.assertEqual(
+            job._current_main_all_source(self.slug, 1, self.sig),
+            (None, None))
 
     def test_materialize_all_missing_cache_computes_verifies_and_saves(self):
         main = dict(self.success)
@@ -1245,8 +1346,10 @@ class TestLinetypeCompletionBounds(JobTestBase):
         heavy_pool = mock.Mock()
         heavy_pool.slot.return_value = mock.MagicMock()
 
-        with mock.patch.object(job.linetypes, "load_page",
-                               side_effect=[main, main]) as load_main, \
+        with mock.patch.object(
+                job, "_current_main_all_source",
+                side_effect=[(main, self.arrow_entry),
+                             (main, self.arrow_entry)]) as current, \
                 mock.patch.object(job.linetypes, "load_all_page",
                                   return_value=None), \
                 mock.patch.object(job.linetypes, "validated_all_page",
@@ -1265,7 +1368,7 @@ class TestLinetypeCompletionBounds(JobTestBase):
                 self.slug, 1, self.sig)
 
         self.assertIs(result, canonical)
-        self.assertEqual(load_main.call_count, 2)
+        self.assertEqual(current.call_count, 2)
         slot_pool.assert_called_once_with(
             "heavy-sidecar", job.HEAVY_SIDECAR_SLOTS)
         heavy_pool.slot.assert_called_once_with()
@@ -1282,8 +1385,9 @@ class TestLinetypeCompletionBounds(JobTestBase):
         heavy_pool = mock.Mock()
         heavy_pool.slot.return_value = mock.MagicMock()
 
-        with mock.patch.object(job.linetypes, "load_page",
-                               side_effect=[main, replacement]), \
+        with mock.patch.object(
+                job, "_current_main_all_source",
+                side_effect=[(main, self.arrow_entry), (None, None)]), \
                 mock.patch.object(job.linetypes, "load_all_page",
                                   return_value=None), \
                 mock.patch.object(job.linetypes, "validated_all_page",
@@ -1337,8 +1441,8 @@ class TestLinetypeCompletionBounds(JobTestBase):
             return job.materialize_all_linetypes(
                 self.slug, 1, self.sig)
 
-        with mock.patch.object(job.linetypes, "load_page",
-                               return_value=main), \
+        with mock.patch.object(job, "_current_main_all_source",
+                               return_value=(main, self.arrow_entry)), \
                 mock.patch.object(job.linetypes, "load_all_page",
                                   side_effect=load_all), \
                 mock.patch.object(job.linetypes, "validated_all_page",
@@ -1393,6 +1497,29 @@ class TestLegendLinetypeOrchestration(JobTestBase):
         self.sig = job.legend_linetypes.signature(
             self.revision, self.samples)
 
+    def _complete_legend_cache(self):
+        return {
+            "sig": self.sig, "v": job.legend_linetypes.VERSION,
+            "ok": True, "line_types": [], "bindings": [],
+            "page": {
+                "base_line_types": 1,
+                "page_fingerprint": "page",
+                "owned_ops_sha1": "owned",
+                "fused_ops_sha1": "fused",
+                "path_ops": 1,
+                "owned_path_ops": 1,
+            },
+            "engine_all_line_types": [{
+                "line_type_number": 1,
+                "signature_family": "motif_periodic",
+                "recognition_source": "method1",
+                "op_count": 1, "ops_sha1": "one",
+                "segment_count": 1,
+                "pattern_instance_count": 0,
+                "pattern_instances": [],
+            }],
+        }
+
     def test_jobs_need_current_line_symbols_but_no_arrows_or_placements(self):
         self.assertFalse((store.slug_dir(self.slug) / "arrows.json").exists())
         self.assertNotIn("placements", self.samples[0])
@@ -1408,6 +1535,169 @@ class TestLegendLinetypeOrchestration(JobTestBase):
             "ok": True, "line_types": [], "bindings": [],
         })
         self.assertEqual(job._legend_linetype_jobs(self.slug), ([], []))
+
+    def test_current_legend_all_source_rechecks_symbols_and_projects_audit(self):
+        cache = self._complete_legend_cache()
+        job.legend_linetypes.save_page(self.slug, 1, cache)
+
+        entry, audit = job._current_legend_all_source(
+            self.slug, 1, self.sig)
+
+        self.assertEqual(entry, cache)
+        self.assertEqual(audit["sig"], self.sig)
+        self.assertEqual(len(audit["all_line_types"]), 1)
+
+        symbols_path = store.slug_dir(self.slug) / "symbols.json"
+        symbols = store.load_json(symbols_path, {})
+        symbols["1"]["result"]["symbols"][0]["value"] = "changed"
+        store.save_json(symbols_path, symbols)
+        self.assertEqual(
+            job._current_legend_all_source(self.slug, 1, self.sig),
+            (None, None))
+
+    def test_materialize_all_from_legend_computes_pinned_and_revalidates(self):
+        entry = self._complete_legend_cache()
+        audit = job.legend_linetypes.all_audit_entry(entry, self.sig)
+        latest = {**audit, "latest": True}
+        generated = {"geometry": "fresh"}
+        canonical = {"geometry": "verified"}
+        heavy_pool = mock.Mock()
+        heavy_pool.slot.return_value = mock.MagicMock()
+        with mock.patch.object(
+                job, "_current_legend_all_source",
+                side_effect=[(entry, audit), (entry, latest)]) as current, \
+                mock.patch.object(job.linetypes, "load_all_page",
+                                  return_value=None), \
+                mock.patch.object(job.linetypes, "validated_all_page",
+                                  return_value=None), \
+                mock.patch.object(job, "_legend_linetype_timeout_for",
+                                  return_value=123) as timeout, \
+                mock.patch.object(job, "_slot_pool",
+                                  return_value=heavy_pool) as slot_pool, \
+                mock.patch.object(
+                    job.linetypes, "compute_all_page_geometry",
+                    return_value=generated) as compute, \
+                mock.patch.object(
+                    job.linetypes, "verify_all_page_geometry",
+                    return_value=canonical) as verify, \
+                mock.patch.object(job.linetypes, "save_all_page") as save:
+            result = job.materialize_all_linetypes_from_legend(
+                self.slug, 1, self.sig)
+
+        self.assertIs(result, canonical)
+        self.assertEqual(current.call_count, 2)
+        timeout.assert_called_once_with(self.slug, 1)
+        slot_pool.assert_called_once_with(
+            "heavy-sidecar", job.HEAVY_SIDECAR_SLOTS)
+        compute.assert_called_once_with(
+            store.pdf_path(self.slug), 1, audit, timeout=123,
+            cpu_budget=job.legend_linetypes.sidecar.CPU_BUDGET)
+        verify.assert_called_once_with(latest, generated)
+        save.assert_called_once_with(self.slug, 1, canonical)
+
+    def test_materialize_all_from_legend_discards_changed_prerequisite(self):
+        entry = self._complete_legend_cache()
+        audit = job.legend_linetypes.all_audit_entry(entry, self.sig)
+        heavy_pool = mock.Mock()
+        heavy_pool.slot.return_value = mock.MagicMock()
+        with mock.patch.object(
+                job, "_current_legend_all_source",
+                side_effect=[(entry, audit), (None, None)]), \
+                mock.patch.object(job.linetypes, "load_all_page",
+                                  return_value=None), \
+                mock.patch.object(job.linetypes, "validated_all_page",
+                                  return_value=None), \
+                mock.patch.object(job, "_legend_linetype_timeout_for",
+                                  return_value=123), \
+                mock.patch.object(job, "_slot_pool",
+                                  return_value=heavy_pool), \
+                mock.patch.object(
+                    job.linetypes, "compute_all_page_geometry",
+                    return_value={"geometry": "fresh"}), \
+                mock.patch.object(
+                    job.linetypes, "verify_all_page_geometry") as verify, \
+                mock.patch.object(job.linetypes, "save_all_page") as save:
+            with self.assertRaisesRegex(RuntimeError, "during generation"):
+                job.materialize_all_linetypes_from_legend(
+                    self.slug, 1, self.sig)
+        verify.assert_not_called()
+        save.assert_not_called()
+
+    def test_materialize_all_from_legend_valid_cache_skips_sidecar(self):
+        entry = self._complete_legend_cache()
+        audit = job.legend_linetypes.all_audit_entry(entry, self.sig)
+        cached = {"geometry": "verified"}
+        with mock.patch.object(
+                job, "_current_legend_all_source",
+                return_value=(entry, audit)), \
+                mock.patch.object(job.linetypes, "load_all_page",
+                                  return_value={"raw": "cache"}), \
+                mock.patch.object(job.linetypes, "validated_all_page",
+                                  return_value=cached) as validate, \
+                mock.patch.object(job, "_slot_pool") as slot_pool, \
+                mock.patch.object(
+                    job.linetypes, "compute_all_page_geometry") as compute:
+            result = job.materialize_all_linetypes_from_legend(
+                self.slug, 1, self.sig)
+        self.assertIs(result, cached)
+        validate.assert_called_once()
+        slot_pool.assert_not_called()
+        compute.assert_not_called()
+
+    def test_materialize_all_from_legend_same_page_callers_compute_once(self):
+        entry = self._complete_legend_cache()
+        audit = job.legend_linetypes.all_audit_entry(entry, self.sig)
+        generated = {"geometry": "fresh"}
+        canonical = {"geometry": "verified"}
+        cache = {"entry": None}
+        entered = threading.Event()
+        release = threading.Event()
+        heavy_pool = mock.Mock()
+        heavy_pool.slot.return_value = mock.MagicMock()
+
+        def validate(value, _audit, _sig):
+            return canonical if value is canonical else None
+
+        def compute(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("test did not release legend All compute")
+            return generated
+
+        def save(_slug, _page, value):
+            cache["entry"] = value
+
+        with mock.patch.object(
+                job, "_current_legend_all_source",
+                return_value=(entry, audit)), \
+                mock.patch.object(job.linetypes, "load_all_page",
+                                  side_effect=lambda *_: cache["entry"]), \
+                mock.patch.object(job.linetypes, "validated_all_page",
+                                  side_effect=validate), \
+                mock.patch.object(job, "_legend_linetype_timeout_for",
+                                  return_value=123), \
+                mock.patch.object(job, "_slot_pool",
+                                  return_value=heavy_pool), \
+                mock.patch.object(
+                    job.linetypes, "compute_all_page_geometry",
+                    side_effect=compute) as run_compute, \
+                mock.patch.object(
+                    job.linetypes, "verify_all_page_geometry",
+                    return_value=canonical), \
+                mock.patch.object(job.linetypes, "save_all_page",
+                                  side_effect=save), \
+                ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                job.materialize_all_linetypes_from_legend,
+                self.slug, 1, self.sig)
+            self.assertTrue(entered.wait(2))
+            second = pool.submit(
+                job.materialize_all_linetypes_from_legend,
+                self.slug, 1, self.sig)
+            release.set()
+            self.assertIs(first.result(timeout=2), canonical)
+            self.assertIs(second.result(timeout=2), canonical)
+        run_compute.assert_called_once()
 
     def test_one_success_uses_pdf_geometry_timeout_and_saves(self):
         success = {

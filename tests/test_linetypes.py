@@ -331,6 +331,23 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual((state, number), ("bound", 7))
         self.assertEqual(distance, bind.MAX_BIND_DISTANCE)
 
+    def test_symbol_center_uses_its_dedicated_48pt_guard(self):
+        """P4 的正确共同 #45 在 37.593pt，不能受箭头 36pt 护栏误杀。"""
+        self.assertEqual(bind.MAX_SYMBOL_CENTER_DISTANCE, 48.0)
+        for owned_distance, expected in (
+                (bind.MAX_SYMBOL_CENTER_DISTANCE, "bound"),
+                (bind.MAX_SYMBOL_CENTER_DISTANCE + 0.001, "too-far")):
+            with self.subTest(owned_distance=owned_distance):
+                target = row("s0:0", -1, (110, 220), near=None, dist=0.1)
+                target["anchor_kind"] = "symbol_center"
+                target["nearest_owned_op"] = {
+                    "op_index": 9, "distance": owned_distance, "owner": 45,
+                }
+                state, number, distance = bind.verdict_of(target)
+                self.assertEqual(state, expected)
+                self.assertEqual(number, 45 if expected == "bound" else None)
+                self.assertEqual(distance, owned_distance)
+
     def test_too_far_when_the_tip_touches_nothing(self):
         state, number, distance = bind.verdict_of(
             row("0", 0, (11, 11), near=3,
@@ -459,7 +476,8 @@ class GateTextClassificationTests(unittest.TestCase):
     def test_explicit_fence_wins_over_gate_in_the_same_text(self):
         for text in ("5' ORNAMENTAL STEEL FENCE & GATE",
                      "FENCING / GATES", "FENCED ACCESS GATE",
-                     "FENCES AND GATES"):
+                     "FENCES AND GATES", "FENCELINE GATE",
+                     "FENCE LINE / GATE"):
             with self.subTest(text=text):
                 self.assertFalse(bind.is_gate_text(text))
 
@@ -472,6 +490,92 @@ class GateTextClassificationTests(unittest.TestCase):
         self.assertEqual(out["groups"][0]["visible_line_type_number"], 7)
         self.assertEqual(out["bindings"][0]["state"], "bound")
         self.assertEqual(out["visible"], [7])
+
+
+class SymbolCenterAnchorTests(unittest.TestCase):
+    ITEMS = [
+        {"text": "6' CHAIN LINK FENCE", "box_2d": [10, 10, 20, 90]},
+        {"text": "DOUBLE SWING GATE", "box_2d": [30, 10, 40, 90]},
+        {"text": "5' ORNAMENTAL STEEL FENCE & GATE",
+         "box_2d": [50, 10, 60, 90]},
+    ]
+
+    @staticmethod
+    def symbols(owner, placements):
+        return {"symbols": [{"text_index": owner,
+                              "placements": placements}]}
+
+    def test_anchors_of_combines_arrow_tip_and_symbol_center(self):
+        leader = [[100, 100], [105, 110]]
+        arrow = [[105, 110], [108, 112]]
+        arrow_entry = {"items": {"0": {
+            "leader_strokes": [leader], "arrow_strokes": [arrow],
+            "targets": [{"tip": [108, 112]}],
+        }}}
+        anchors = linetypes.anchors_of(
+            arrow_entry,
+            self.symbols(0, [[100, 200, 120, 240]]),
+            self.ITEMS)
+        self.assertEqual(len(anchors), 2)
+        self.assertEqual(anchors[0], {
+            "key": "0", "ti": 0, "tip": [108.0, 112.0],
+            "own": [leader, arrow], "anchor_kind": "arrow_tip",
+        })
+        self.assertEqual(anchors[1], {
+            "key": "s0:0", "ti": -1, "tip": [110.0, 220.0],
+            "own": [], "anchor_kind": "symbol_center",
+            "exclude_box": [100.0, 200.0, 120.0, 240.0],
+        })
+
+    def test_pure_gate_symbol_does_not_emit_a_center(self):
+        anchors = linetypes.symbol_center_anchors(
+            self.symbols(1, [[100, 200, 120, 240]]), self.ITEMS)
+        self.assertEqual(anchors, [])
+
+    def test_fence_and_gate_symbol_keeps_fence_priority(self):
+        anchors = linetypes.symbol_center_anchors(
+            self.symbols(2, [[100, 200, 120, 240]]), self.ITEMS)
+        self.assertEqual(len(anchors), 1)
+        self.assertEqual(anchors[0]["anchor_kind"], "symbol_center")
+        self.assertEqual(anchors[0]["key"], "s0:0")
+
+    def test_invalid_owner_and_bad_placement_boxes_fail_closed(self):
+        bad_boxes = [
+            None,
+            [1, 2, 3],
+            ["bad", 10, 20, 30],
+            [float("nan"), 10, 20, 30],
+            [10, 10, 10, 20],
+            [10, 10, 20, 10],
+        ]
+        result = {"symbols": [
+            {"text_index": 0, "placements": bad_boxes},
+            {"text_index": True, "placements": [[1, 2, 3, 4]]},
+            {"text_index": -1, "placements": [[1, 2, 3, 4]]},
+            {"text_index": len(self.ITEMS),
+             "placements": [[1, 2, 3, 4]]},
+        ]}
+        self.assertEqual(
+            linetypes.symbol_center_anchors(result, self.ITEMS), [])
+
+    def test_sidecar_wire_payload_preserves_center_protocol_fields(self):
+        target = {
+            "key": "s2:4", "ti": -1, "tip": [110, 220], "own": [],
+            "anchor_kind": "symbol_center",
+            "exclude_box": [100, 200, 120, 240],
+        }
+        with mock.patch.object(linetypes.sidecar, "sidecar_available",
+                               return_value=True), \
+                mock.patch.object(linetypes.sidecar, "_run_job",
+                                  return_value={"ok": True}) as invoke:
+            out = linetypes.sidecar.run_page("unit.pdf", 1, [target])
+        self.assertEqual(out, {"ok": True})
+        payload = invoke.call_args.args[1]
+        self.assertEqual(payload["targets"], [{
+            "key": "s2:4", "ti": -1, "tip": [110.0, 220.0], "own": [],
+            "anchor_kind": "symbol_center",
+            "exclude_box": [100, 200, 120, 240],
+        }])
 
 
 class PlanDisplayGateTests(unittest.TestCase):
@@ -611,6 +715,188 @@ class SymbolAnchorGroupingTests(unittest.TestCase):
         keys = sorted(g["group"] for g in out["groups"])
         self.assertEqual(keys, ["s:3", "s:4"])
         self.assertEqual(out["visible"], [5, 6])
+
+
+class SymbolCenterConsensusTests(unittest.TestCase):
+    """无引线中心只有跨 placement 形成共同可达共识后才能改判。"""
+
+    ITEMS = [{"text": "6' DECORATIVE FENCE",
+              "box_2d": [10, 10, 20, 90]}]
+    OWNERS = {1: 0}
+
+    @staticmethod
+    def center(key, tip, *, near, dist, ranked):
+        target = row(key, 0, tip, near=near, dist=dist, ranked=ranked)
+        target["anchor_kind"] = "symbol_center"
+        return target
+
+    def resolve(self, rows):
+        return regroup.resolve(entry_of(rows), [[0, 0, 1000, 1000]],
+                               self.ITEMS, self.OWNERS)
+
+    def test_common_reachable_candidate_overrides_one_false_arrow(self):
+        """P4 形态：两中心个人最近不同，但 #45 是二者共同可达且更具体。"""
+        out = self.resolve([
+            self.center("s1:0", (100, 100), near=45, dist=1.0,
+                        ranked=((45, 1.0), (19, 1.0))),
+            self.center("s1:1", (200, 200), near=9, dist=2.0,
+                        ranked=((9, 2.0), (45, 4.0), (19, 4.0))),
+            row("s1:0", 0, (101, 101), near=30, dist=0.05,
+                ranked=((30, 0.05), (45, 3.0))),
+        ])
+        group = out["groups"][0]
+        self.assertEqual(group["votes_in_plan"], {"30": 1})
+        self.assertEqual(group["symbol_center_coverage_in_plan"],
+                         {"9": 1, "19": 2, "45": 2})
+        self.assertEqual(group["symbol_center_first_votes_in_plan"],
+                         {"9": 1, "45": 1})
+        self.assertEqual(group["symbol_center_line_type_number"], 45)
+        self.assertTrue(group["symbol_center_consensus_applied"])
+        self.assertEqual(group["symbol_center_contribution"],
+                         "consensus_override")
+        self.assertEqual(group["visible_line_type_number"], 45)
+        self.assertEqual(out["visible"], [45])
+
+    def test_strict_majority_tolerates_one_center_outlier(self):
+        out = self.resolve([
+            self.center("s1:0", (100, 100), near=8, dist=1.0,
+                        ranked=((8, 1.0),)),
+            self.center("s1:1", (200, 200), near=8, dist=2.0,
+                        ranked=((8, 2.0),)),
+            self.center("s1:2", (300, 300), near=7, dist=1.0,
+                        ranked=((7, 1.0),)),
+            row("s1:0", 0, (101, 101), near=4, dist=0.1,
+                ranked=((4, 0.1), (8, 2.0))),
+        ])
+        group = out["groups"][0]
+        self.assertEqual(group["symbol_center_coverage_in_plan"],
+                         {"7": 1, "8": 2})
+        self.assertEqual(group["symbol_center_line_type_number"], 8)
+        self.assertEqual(group["visible_line_type_number"], 8)
+
+    def test_matching_arrow_is_reported_as_corroboration_not_override(self):
+        out = self.resolve([
+            self.center("s1:0", (100, 100), near=3, dist=1.0,
+                        ranked=((3, 1.0),)),
+            self.center("s1:1", (200, 200), near=3, dist=2.0,
+                        ranked=((3, 2.0),)),
+            row("s1:0", 0, (101, 101), near=3, dist=0.05,
+                ranked=((3, 0.05),)),
+        ])
+        group = out["groups"][0]
+        self.assertEqual(group["symbol_center_contribution"], "corroborated")
+        self.assertFalse(group["symbol_center_consensus_applied"])
+        self.assertEqual(group["visible_line_type_number"], 3)
+
+    def test_equal_center_evidence_fails_closed_and_keeps_arrow(self):
+        out = self.resolve([
+            self.center("s1:0", (100, 100), near=3, dist=1.0,
+                        ranked=((3, 1.0), (7, 2.0))),
+            self.center("s1:1", (200, 200), near=7, dist=1.0,
+                        ranked=((7, 1.0), (3, 2.0))),
+            row("s1:0", 0, (101, 101), near=9, dist=0.1,
+                ranked=((9, 0.1),)),
+        ])
+        group = out["groups"][0]
+        self.assertEqual(group["symbol_center_finalists_in_plan"], [3, 7])
+        self.assertIsNone(group["symbol_center_line_type_number"])
+        self.assertFalse(group["symbol_center_consensus_applied"])
+        self.assertEqual(group["visible_line_type_number"], 9)
+
+    def test_single_center_does_not_change_existing_arrow_result(self):
+        out = self.resolve([
+            self.center("s1:0", (100, 100), near=3, dist=1.0,
+                        ranked=((3, 1.0),)),
+            row("s1:0", 0, (101, 101), near=9, dist=0.1,
+                ranked=((9, 0.1),)),
+        ])
+        group = out["groups"][0]
+        self.assertEqual(group["symbol_center_placement_count_in_plan"], 1)
+        self.assertEqual(group["symbol_center_line_type_number"], 3)
+        self.assertFalse(group["symbol_center_consensus_confirmed"])
+        self.assertFalse(group["symbol_center_consensus_applied"])
+        self.assertEqual(group["visible_line_type_number"], 9)
+
+    def test_single_center_without_an_arrow_uses_nearest_type_as_fallback(self):
+        out = self.resolve([
+            self.center("s1:0", (100, 100), near=3, dist=1.0,
+                        ranked=((3, 1.0), (7, 4.0))),
+        ])
+        group = out["groups"][0]
+        self.assertEqual(group["symbol_center_line_type_number"], 3)
+        self.assertFalse(group["symbol_center_consensus_confirmed"])
+        self.assertFalse(group["symbol_center_consensus_applied"])
+        self.assertEqual(group["visible_line_type_number"], 3)
+        self.assertEqual(out["bindings"][0]["state"], "bound")
+        self.assertEqual(out["visible"], [3])
+
+    def test_center_can_use_a_ranked_type_beyond_arrow_residual_guard(self):
+        target = self.center("s1:0", (100, 100), near=None, dist=0.2,
+                             ranked=((3, 25.0),))
+        target["nearest_owned_op"] = {
+            "op_index": 9, "owner": 3, "distance": 25.0,
+            "run_id": "center-run",
+        }
+        out = self.resolve([target])
+        self.assertEqual(out["visible"], [3])
+        self.assertEqual(out["bindings"][0]["state"], "bound")
+        self.assertEqual(out["bindings"][0]["line_type_number"], 3)
+        self.assertEqual(out["groups"][0]["engine_runs"], ["center-run"])
+
+    def test_different_symbol_indexes_cannot_manufacture_consensus(self):
+        entry = entry_of([
+            self.center("s1:0", (100, 100), near=3, dist=1.0,
+                        ranked=((3, 1.0),)),
+            self.center("s2:0", (200, 200), near=3, dist=1.0,
+                        ranked=((3, 1.0),)),
+            row("s1:0", 0, (101, 101), near=9, dist=0.1,
+                ranked=((9, 0.1),)),
+        ])
+        out = regroup.resolve(entry, [[0, 0, 1000, 1000]], self.ITEMS,
+                              {1: 0, 2: 0})
+        group = out["groups"][0]
+        self.assertEqual(group["symbol_center_symbol_indexes"], [1, 2])
+        self.assertIsNone(group["symbol_center_line_type_number"])
+        self.assertEqual(group["visible_line_type_number"], 9)
+
+    def test_center_without_a_current_symbol_owner_fails_closed(self):
+        entry = entry_of([
+            self.center("s1:0", (100, 100), near=3, dist=1.0,
+                        ranked=((3, 1.0),)),
+        ])
+        out = regroup.resolve(entry, [[0, 0, 1000, 1000]], self.ITEMS, {})
+        self.assertEqual(out["visible"], [])
+        self.assertEqual(out["groups"], [])
+        self.assertEqual(out["bindings"], [])
+
+    def test_two_agreeing_real_arrows_are_not_overridden(self):
+        """中心只修正一个孤立误箭头，不能普遍压过多条一致的真实引线。"""
+        out = self.resolve([
+            self.center("s1:0", (100, 100), near=3, dist=1.0,
+                        ranked=((3, 1.0), (9, 2.0))),
+            self.center("s1:1", (200, 200), near=3, dist=1.0,
+                        ranked=((3, 1.0), (9, 2.0))),
+            row("s1:0", 0, (101, 101), near=9, dist=0.1,
+                ranked=((9, 0.1), (3, 2.0))),
+            row("s1:1", 0, (201, 201), near=9, dist=0.2,
+                ranked=((9, 0.2), (3, 2.0))),
+        ])
+        group = out["groups"][0]
+        self.assertEqual(group["symbol_center_line_type_number"], 3)
+        self.assertFalse(group["symbol_center_consensus_applied"])
+        self.assertEqual(group["symbol_center_contribution"],
+                         "blocked_by_arrows")
+        self.assertEqual(group["visible_line_type_number"], 9)
+
+    def test_legacy_arrow_rows_without_anchor_kind_are_unchanged(self):
+        out = self.resolve([
+            row("s1:0", 0, (100, 100), near=5, dist=3.0),
+            row("s1:1", 0, (200, 200), near=7, dist=1.0),
+        ])
+        group = out["groups"][0]
+        self.assertNotIn("symbol_center_line_type_number", group)
+        self.assertEqual(group["votes_in_plan"], {"5": 1, "7": 1})
+        self.assertEqual(group["visible_line_type_number"], 7)
 
 
 class LegendTemplateBindingTests(unittest.TestCase):

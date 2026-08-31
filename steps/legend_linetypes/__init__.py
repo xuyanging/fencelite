@@ -26,6 +26,15 @@ from steps.legend_linetypes import sidecar
 
 VERSION = 1
 CACHE_KIND = "legend_linetypes"
+_AUDIT_PAGE_KEYS = (
+    "page_fingerprint", "owned_ops_sha1", "fused_ops_sha1",
+    "path_ops", "owned_path_ops",
+)
+_AUDIT_TYPE_KEYS = (
+    "line_type_number", "signature_family", "recognition_source",
+    "op_count", "ops_sha1", "segment_count",
+    "pattern_instance_count", "pattern_instances",
+)
 
 
 def _symbol_result(value):
@@ -125,10 +134,72 @@ def signature(pdf_revision, samples):
 legend_linetypes_signature = signature
 
 
+def _has_complete_engine_audit(entry):
+    """Whether a supervised result retained the full engine identity.
+
+    A legend match is deliberately a subset of the page's recognized types.
+    Treating that subset as the All Line Types audit caused P4/P9 to publish
+    ``state=ok`` with only 1 of 33/67 types.  Current caches must retain every
+    engine row so the independent full-geometry producer can be verified.
+    """
+    if not isinstance(entry, dict):
+        return False
+    page = entry.get("page")
+    rows = entry.get("engine_all_line_types")
+    if not isinstance(page, dict) or not isinstance(rows, list) \
+            or any(page.get(key) is None for key in _AUDIT_PAGE_KEYS):
+        return False
+    expected = page.get("base_line_types")
+    if isinstance(expected, bool) or not isinstance(expected, int) \
+            or expected < 0 or expected != len(rows):
+        return False
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) \
+                or any(key not in row for key in _AUDIT_TYPE_KEYS):
+            return False
+        number = row.get("line_type_number")
+        if isinstance(number, bool) or not isinstance(number, int) \
+                or number <= 0 or number in seen:
+            return False
+        seen.add(number)
+        if not isinstance(row.get("pattern_instances"), list):
+            return False
+    return True
+
+
 def has_current(entry, sig):
-    """Whether ``entry`` is an explicit successful result for ``sig``."""
+    """Whether ``entry`` is an explicit supervised success for ``sig``.
+
+    The full engine audit is a stricter optional publication contract checked
+    by :func:`all_audit_entry`.  Keeping the predicates separate means damage
+    to debug-only audit metadata cannot hide otherwise valid customer-facing
+    supervised geometry.
+    """
     return bool(isinstance(entry, dict) and entry.get("sig") == sig
                 and entry.get("v") == VERSION and entry.get("ok") is True)
+
+
+def all_audit_entry(entry, sig):
+    """Project one current legend cache into the full-geometry verifier API.
+
+    The supervised geometry/bindings remain available for semantic merge, but
+    ``all_line_types`` here is the complete independent engine audit.  The
+    caller can therefore reuse :mod:`steps.linetypes`' strict per-type and page
+    fingerprint validator without weakening either cache namespace.
+    """
+    if not has_current(entry, sig) or not _has_complete_engine_audit(entry):
+        return None
+    return {
+        "sig": str(sig),
+        "v": entry.get("v"),
+        "engine": dict(entry.get("engine") or {}),
+        "page": dict(entry.get("page") or {}),
+        "all_line_types": [dict(row)
+                           for row in entry["engine_all_line_types"]],
+        "line_types": [dict(row) for row in entry.get("line_types") or ()],
+        "bindings": [dict(row) for row in entry.get("bindings") or ()],
+    }
 
 
 def page_path(slug, page):
@@ -187,6 +258,9 @@ def compute_page(pdf_path, sheet, samples_or_symbol_result, *, sig=None,
         # _run_job enforces this in production; retain the check at this API
         # boundary so a replaced/test runner cannot create a false cache.
         raise RuntimeError("legend line-type sidecar returned no successful payload")
+    if not _has_complete_engine_audit(payload):
+        raise RuntimeError(
+            "legend line-type sidecar returned no complete engine audit")
     entry = dict(payload)
     # Sidecar-owned metadata may never spoof the caller's cache identity.
     entry["sig"] = str(sig)
@@ -195,7 +269,7 @@ def compute_page(pdf_path, sheet, samples_or_symbol_result, *, sig=None,
 
 
 __all__ = [
-    "CACHE_KIND", "VERSION", "computed_pages", "compute_page",
+    "CACHE_KIND", "VERSION", "all_audit_entry", "computed_pages", "compute_page",
     "has_current", "legend_linetypes_signature", "load", "load_page",
     "page_path", "samples_of", "save", "save_page", "sidecar",
     "sidecar_available", "signature",

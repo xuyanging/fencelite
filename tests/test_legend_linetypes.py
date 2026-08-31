@@ -13,6 +13,29 @@ from steps import legend_linetypes, store                       # noqa: E402
 from steps.legend_linetypes import sidecar                       # noqa: E402
 
 
+def complete_audit_payload():
+    return {
+        "page": {
+            "base_line_types": 1,
+            "page_fingerprint": "page",
+            "owned_ops_sha1": "owned",
+            "fused_ops_sha1": "fused",
+            "path_ops": 2,
+            "owned_path_ops": 1,
+        },
+        "engine_all_line_types": [{
+            "line_type_number": 1,
+            "signature_family": "motif_periodic",
+            "recognition_source": "method1",
+            "op_count": 1,
+            "ops_sha1": "one",
+            "segment_count": 1,
+            "pattern_instance_count": 0,
+            "pattern_instances": [],
+        }],
+    }
+
+
 class SampleTests(unittest.TestCase):
     def test_only_valid_line_symbols_are_normalised_with_original_index(self):
         result = {"symbols": [
@@ -106,7 +129,7 @@ class SignatureTests(unittest.TestCase):
 class CacheTests(unittest.TestCase):
     def test_only_explicit_success_with_current_version_is_current(self):
         good = {"sig": "wanted", "v": legend_linetypes.VERSION,
-                "ok": True, "matches": []}
+                "ok": True, "matches": [], **complete_audit_payload()}
         self.assertTrue(legend_linetypes.has_current(good, "wanted"))
         for entry in (
                 dict(good, sig="old"),
@@ -116,6 +139,37 @@ class CacheTests(unittest.TestCase):
                  "error": "timeout"},
                 None):
             self.assertFalse(legend_linetypes.has_current(entry, "wanted"))
+
+    def test_subset_or_incomplete_engine_audit_cannot_publish_all(self):
+        good = {"sig": "wanted", "v": legend_linetypes.VERSION,
+                "ok": True, **complete_audit_payload()}
+        incomplete = {key: value for key, value in good.items()
+                      if key != "engine_all_line_types"}
+        self.assertTrue(legend_linetypes.has_current(incomplete, "wanted"))
+        self.assertIsNone(
+            legend_linetypes.all_audit_entry(incomplete, "wanted"))
+        subset = dict(good)
+        subset["page"] = dict(good["page"], base_line_types=2)
+        self.assertIsNone(
+            legend_linetypes.all_audit_entry(subset, "wanted"))
+        malformed = dict(good)
+        malformed["engine_all_line_types"] = [
+            {**good["engine_all_line_types"][0],
+             "pattern_instances": None}]
+        self.assertIsNone(
+            legend_linetypes.all_audit_entry(malformed, "wanted"))
+
+    def test_all_audit_projection_uses_complete_engine_rows(self):
+        entry = {"sig": "wanted", "v": legend_linetypes.VERSION,
+                 "ok": True, "line_types": [{"line_type_number": 1}],
+                 "bindings": [{"key": "s0:0"}],
+                 **complete_audit_payload()}
+        audit = legend_linetypes.all_audit_entry(entry, "wanted")
+        self.assertEqual(audit["sig"], "wanted")
+        self.assertEqual(len(audit["all_line_types"]), 1)
+        self.assertIsNot(audit["all_line_types"],
+                         entry["engine_all_line_types"])
+        self.assertIsNone(legend_linetypes.all_audit_entry(entry, "old"))
 
     def test_page_cache_uses_independent_atomic_pagestore_layout(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -140,7 +194,9 @@ class ComputeTests(unittest.TestCase):
 
     def test_success_payload_is_wrapped_without_allowing_identity_spoofing(self):
         payload = {"ok": True, "sig": "sidecar-spoof", "v": 999,
-                   "page": {"sheet": 3}, "matches": [{"symbol_index": 1}]}
+                   "matches": [{"symbol_index": 1}],
+                   **complete_audit_payload()}
+        payload["page"] = dict(payload["page"], sheet=3)
         with mock.patch.object(sidecar, "run_page", return_value=payload) as run:
             entry = legend_linetypes.compute_page(
                 "/tmp/input.pdf", 3, self.RESULT, sig="expected",
@@ -161,11 +217,19 @@ class ComputeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "engine crash"):
                 legend_linetypes.compute_page(
                     "/tmp/input.pdf", 3, self.RESULT, sig="s")
+        with mock.patch.object(
+                sidecar, "run_page", return_value={"ok": True,
+                                                    "line_types": []}):
+            with self.assertRaisesRegex(RuntimeError,
+                                        "no complete engine audit"):
+                legend_linetypes.compute_page(
+                    "/tmp/input.pdf", 3, self.RESULT, sig="s")
 
     def test_compute_accepts_the_same_canonical_sample_list_that_was_signed(self):
         samples = legend_linetypes.samples_of(self.RESULT)
         with mock.patch.object(sidecar, "run_page",
-                              return_value={"ok": True, "matches": []}) as run:
+                              return_value={"ok": True, "matches": [],
+                                            **complete_audit_payload()}) as run:
             entry = legend_linetypes.compute_page(
                 "/tmp/input.pdf", 3, samples, sig="sample-sig")
         self.assertTrue(legend_linetypes.has_current(entry, "sample-sig"))

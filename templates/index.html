@@ -469,6 +469,7 @@ svg polyline.scope-focus{stroke-width:3.2;opacity:1;filter:drop-shadow(0 0 2px r
   <label class="lay dash" id="tgPlan"><input type="checkbox" checked><i style="border-top-color:var(--c-plan)"></i>plan view boxes</label>
   <label class="lay dash off" id="tgGrp"><input type="checkbox"><i style="border-top-color:var(--c-grp)"></i>Sheet regions</label>
   <span class="sp"></span>
+  <label class="lay off" id="tgLtMeta" title="Show internal all-line lists and line-type details in Fence scope"><input type="checkbox">Debug: line-type diagnostics</label>
   <label class="lay off" id="tgLtSrc" title="Show whether a line type was linked by a text callout, symbol callout, or legend line sample"><input type="checkbox">Debug: line-type provenance</label>
   <label class="lay off" id="tgDbg"><input type="checkbox">Debug (split source + stripped symbols)</label>
 </div>
@@ -514,7 +515,10 @@ svg polyline.scope-focus{stroke-width:3.2;opacity:1;filter:drop-shadow(0 0 2px r
     <h3>Upload PDFs</h3>
     <div class="frow">
       <input id="upFile" type="file" accept=".pdf,application/pdf" multiple hidden>
+      <input id="upFolder" type="file" accept=".pdf,application/pdf"
+             webkitdirectory directory multiple hidden>
       <button type="button" id="upPick">Choose PDFs…</button>
+      <button type="button" id="upPickFolder">Choose Folder…</button>
       <span id="upName" class="fname">No files selected</span>
     </div>
     <div>Detection target for every selected PDF — change it to doors / trees / hydrants, etc.</div>
@@ -550,6 +554,8 @@ let POLL_INFLIGHT=false;       // 全局 tick 不重入，避免旧响应覆盖�
 let POLL_SEQ=0;                // 删除后同 slug 重跑时隔离旧 tick
 let UPLOAD_BUSY=false;         // 批量上传/收口中锁定文件选择与 target
 let UPLOAD_RESULT_PENDING=null;// 隐藏弹窗后仍可找回的失败摘要
+let UPLOAD_FILE_SELECTION=[];  // Choose PDFs 当前选择
+let UPLOAD_FOLDER_SELECTION=[];// Choose Folder 当前递归 PDF 选择
 let CUR=null;                  // {slug,page}
 let PAGE=null;                 // /api/page payload
 let LOOK={};                   // key -> {kind,label,text,box,idx,rect,note}
@@ -579,7 +585,7 @@ const scopeKey=s=>String(s==null?'':s).normalize('NFKC')
 // fence 语义优先：``FENCE & GATE`` 描述的是带门的围栏系统，不是纯 gate。
 // 必须与 steps/linetypes/bind.py:is_gate_text 完全一致；否则前端会画成 gate，
 // 后端却可能按 fence 绑定线型（或反过来）。
-const isFenceText=s=>/\bFENC(?:E[DS]?|ING)\b/i.test(String(s||''));
+const isFenceText=s=>/\b(?:FENC(?:E[DS]?|ING)|FENCELINES?)\b/i.test(String(s||''));
 const isGateText=s=>/\bGATES?\b/i.test(String(s||''))&&!isFenceText(s);
 const scopeClass=g=>g&&g.gate?'gate':'fence';
 const scopeColor=g=>g&&g.gate?'#e53935':'#1976d2';
@@ -587,7 +593,10 @@ const scopeColor=g=>g&&g.gate?'#e53935':'#1976d2';
 function makeScopeModel(){
   SCOPE_GROUPS=[]; SCOPE_BY_INDEX=new Map(); SCOPE_BY_SYMBOL=new Map();
   selectedScope=null; selectedRow=null;
-  if($('sel')){$('sel').classList.remove('has');$('sel').innerHTML=''}
+  if($('sel')){
+    $('sel').classList.remove('has');$('sel').innerHTML='';
+    $('sel').removeAttribute('data-detail');
+  }
   if(!PAGE)return;
   const byKey=new Map(), markers=new Set(PAGE.marker_codes||[]),
         suppressed=new Set(PAGE.suppressed_items||[]);
@@ -664,7 +673,12 @@ function lineTypeSourceLabel(type){
 /* “Method 1 / Method 2”描述的是算法；这里描述的是最终结果由哪一种页面锚
    绑定出来。必须读 PAGE 里已经过 regroup 重判的 bindings，而不是 All 缓存里
    可能过期的 bound_by。legend 的 key 也长得像 s0:0，所以 source 必须先判。 */
-const LT_PROV=()=>$('tgLtSrc').querySelector('input').checked;
+/* Line-type diagnostics are fail-closed.  A checked box is not enough: once
+   the developer console is tucked away, internal lists, detail cards and
+   source annotations must return to the customer-safe presentation.  The
+   explicitly selected All geometry layer remains controlled by tgAll. */
+const LT_META=()=>DEV()&&$('tgLtMeta').querySelector('input').checked;
+const LT_PROV=()=>DEV()&&$('tgLtSrc').querySelector('input').checked;
 const LT_PROVENANCE_ORDER=[
   ['text_callout','Text callout'],
   ['symbol_callout','Symbol callout'],
@@ -754,7 +768,8 @@ function appendPatternInstanceBox(parent,instance,cls,color,number,W,H,dataKey){
   if(instance.pattern_source)bits.push(String(instance.pattern_source));
   if(instance.group_id!=null)bits.push('Group '+instance.group_id);
   const ti=document.createElementNS(NS,'title');
-  ti.textContent=bits.join(' · '); rc.appendChild(ti);
+  ti.textContent=LT_META()?bits.join(' · '):'Fenceline pattern';
+  rc.appendChild(ti);
   parent.appendChild(rc);
   return rc;
 }
@@ -860,6 +875,14 @@ $('bLayers').onclick=()=>{
   /* 模型相关的东西是按 DEV() 渲染的，开关一变必须重渲染，否则要等下一次
      轮询才跟着出现/消失。 */
   renderModelSwitch(); renderJobs();
+  // Closing the developer console is a hard privacy boundary: a developer may
+  // have left a diagnostic checkbox selected, but its internal list and detail
+  // card must disappear immediately from the customer view.
+  if(!on)clearLineTypeDiagnosticDetail();
+  if(PAGE){build();renderList()}
+  syncLayers();
+  if(on&&$('tgAll').querySelector('input').checked)
+    ensureAllLinetypes();
   if(typeof OV!=='undefined'&&OV.length)loadOverview();
 };
 
@@ -1107,7 +1130,7 @@ $('bUp').onclick=async()=>{
     PRESET=(r.body&&r.body.target)||'';
   }
   $('upTarget').value=PRESET;
-  $('upFile').value=''; uploadMessage('');
+  resetUploadSelections(); uploadMessage('');
   $('upCancel').textContent='Cancel';
   renderUploadSelection();
   $('modal').style.display='flex';
@@ -1115,19 +1138,41 @@ $('bUp').onclick=async()=>{
 /* 自己的按钮代替原生 file input：点它转发给隐藏的 input，选完把文件名写出来。
    原生控件的 "选择文件 / 未选择文件" 由浏览器界面语言渲染，页面改不到。 */
 $('upPick').onclick=()=>$('upFile').click();
-function selectedPdfFiles(){return Array.from($('upFile').files||[])}
+$('upPickFolder').onclick=()=>$('upFolder').click();
+
+/* webkitdirectory 返回目录下任意深度的所有文件，并在 webkitRelativePath
+   保留相对路径。accept 在目录模式下并非所有浏览器都严格执行，所以这里必须
+   再做一次 PDF 过滤；两个 input 分开保存，取消目录选择不会碰 Choose PDFs。 */
+const isPdfUpload=file=>{
+  const name=String(file&&file.name||'');
+  const type=String(file&&file.type||'').toLowerCase();
+  return /\.pdf$/i.test(name)||type==='application/pdf'||type==='application/x-pdf';
+};
+const pdfUploads=files=>Array.from(files||[]).filter(isPdfUpload);
+function uploadRelativePath(file){
+  const path=String(file&&(file.webkitRelativePath||file.relativePath)||file&&file.name||'')
+    .replace(/\\/g,'/').replace(/^\/+/, '');
+  return path||String(file&&file.name||'PDF');
+}
+function resetUploadSelections(){
+  UPLOAD_FILE_SELECTION=[]; UPLOAD_FOLDER_SELECTION=[];
+  $('upFile').value=''; $('upFolder').value='';
+}
+function selectedPdfFiles(){
+  return [...UPLOAD_FILE_SELECTION,...UPLOAD_FOLDER_SELECTION];
+}
 function uploadSelectionText(files){
   files=files||[];
   if(!files.length)return 'No files selected';
-  if(files.length===1)return files[0].name;
-  const shown=files.slice(0,3).map(f=>f.name).join(', ');
+  if(files.length===1)return uploadRelativePath(files[0]);
+  const shown=files.slice(0,3).map(uploadRelativePath).join(', ');
   return files.length+' PDFs selected · '+shown
     +(files.length>3?' · +'+(files.length-3)+' more':'');
 }
 function renderUploadSelection(){
   const files=selectedPdfFiles(), name=$('upName'), run=$('upRun');
   name.textContent=uploadSelectionText(files);
-  name.title=files.map(f=>f.name).join('\n');
+  name.title=files.map(uploadRelativePath).join('\n');
   name.classList.toggle('has',files.length>0);
   run.textContent=files.length>1?'Start '+files.length+' PDFs':'Start processing';
   run.disabled=UPLOAD_BUSY||!files.length;
@@ -1154,6 +1199,7 @@ function clearUploadResultPending(){
 function setUploadBusy(busy){
   UPLOAD_BUSY=!!busy;
   $('upPick').disabled=UPLOAD_BUSY;
+  $('upPickFolder').disabled=UPLOAD_BUSY;
   $('upTarget').disabled=UPLOAD_BUSY;
   $('upCancel').disabled=false;
   $('upCancel').textContent=UPLOAD_BUSY?'Hide':'Cancel';
@@ -1161,7 +1207,20 @@ function setUploadBusy(busy){
   $('upRun').disabled=UPLOAD_BUSY||!selectedPdfFiles().length;
 }
 $('upFile').onchange=()=>{
+  UPLOAD_FILE_SELECTION=pdfUploads($('upFile').files);
   clearUploadResultPending();uploadMessage('');renderUploadSelection();
+};
+$('upFolder').onchange=()=>{
+  const all=Array.from($('upFolder').files||[]);
+  // Some browsers dispatch change with an empty FileList when the directory
+  // picker is cancelled. Treat that as a no-op so neither selection is lost.
+  if(!all.length)return;
+  UPLOAD_FOLDER_SELECTION=pdfUploads(all);
+  const ignored=all.length-UPLOAD_FOLDER_SELECTION.length;
+  clearUploadResultPending();
+  uploadMessage(ignored
+    ?ignored+' non-PDF file'+(ignored===1?' was':'s were')+' ignored.':'');
+  renderUploadSelection();
 };
 $('upCancel').onclick=()=>{
   if(!UPLOAD_BUSY)clearUploadResultPending();
@@ -1176,7 +1235,8 @@ $('modal').onclick=e=>{
 
 const UPLOAD_TOKEN_PREFIX='fence_lite.upload.';
 const uploadFileFingerprint=(file,target)=>JSON.stringify([
-  file.name,file.size||0,file.lastModified||0,String(target||'').trim()
+  uploadRelativePath(file),file.name,file.size||0,file.lastModified||0,
+  String(target||'').trim()
 ]);
 function newUploadToken(){
   if(globalThis.crypto&&typeof globalThis.crypto.randomUUID==='function')
@@ -1265,7 +1325,8 @@ $('upRun').onclick=async()=>{
   try{
     batch=await enqueuePdfUploads(files,target,p=>{
       if(p.phase==='uploading'){
-        uploadMessage('Uploading '+p.index+'/'+p.total+' · '+p.file.name);
+        uploadMessage('Uploading '+p.index+'/'+p.total+' · '
+          +uploadRelativePath(p.file));
       }else{
         uploadMessage('Submitted '+p.completed+'/'+p.total+' · '
           +p.queued+' queued'+(p.failed?' · '+p.failed+' failed':''),
@@ -1278,7 +1339,7 @@ $('upRun').onclick=async()=>{
   /* Clear immediately, but keep UPLOAD_BUSY true through overview + final UI
      settlement.  A new batch cannot start and then be overwritten by this
      handler when the older overview request finally returns. */
-  $('upFile').value='';
+  resetUploadSelections();
   if(!batch){
     renderUploadSelection();
     uploadMessage(fatalError||'Batch upload stopped','bad');
@@ -1307,11 +1368,11 @@ $('upRun').onclick=async()=>{
   renderUploadSelection();
   $('upName').textContent=batch.successes.length+'/'+batch.total+' queued · '
     +batch.failures.length+' failed';
-  $('upName').title=batch.failures.map(x=>x.file.name).join('\n');
+  $('upName').title=batch.failures.map(x=>uploadRelativePath(x.file)).join('\n');
   $('upCancel').textContent='Close';
   uploadMessage(batch.successes.length+'/'+batch.total+' PDFs queued. '
     +batch.failures.length+' failed; select those files again to retry:\n'
-    +batch.failures.map(x=>'• '+x.file.name+': '+x.error).join('\n')
+    +batch.failures.map(x=>'• '+uploadRelativePath(x.file)+': '+x.error).join('\n')
     +(overviewError?'\nProject list refresh failed: '+overviewError:''),'bad');
   if(batch.successes.length)toggleProjectDrawer(true);
   setUploadBusy(false);
@@ -1732,6 +1793,7 @@ function clearViewer(msg){
   $('scopeCount').textContent='0';
   $('sel').innerHTML='<div class="empty">Click any box on the sheet for details</div>';
   $('sel').classList.remove('has');
+  $('sel').removeAttribute('data-detail');
   $('list').innerHTML='';
   $('stepStrip').innerHTML='';
 
@@ -1992,11 +2054,13 @@ function build(){
       gLt,t,'lt-prov-label',W,H,'lt',nodes);
     const provenance=LT_PROV()?lineTypeProvenanceLabel(t.line_type_number):'';
     const ti=document.createElementNS(NS,'title');
-    ti.textContent='Line types #'+t.line_type_number+' · '+(t.signature_family||'')
-      +' · '+(t.segment_count||0)+'  segments'
-      +' · '+lineTypeSourceLabel(t)
-      +(provenance?(' · '+provenance):'')
-      +(patternInstances.length?(' · '+patternInstances.length+' confirmed patterns'):'');
+    ti.textContent=LT_META()
+      ?('Line types #'+t.line_type_number+' · '+(t.signature_family||'')
+        +' · '+(t.segment_count||0)+'  segments'
+        +' · '+lineTypeSourceLabel(t)
+        +(provenance?(' · '+provenance):'')
+        +(patternInstances.length?(' · '+patternInstances.length+' confirmed patterns'):''))
+      :'Fenceline';
     gLt.appendChild(ti);
     LT_NODES.set(t.line_type_number,nodes);
   }
@@ -2141,6 +2205,7 @@ function build(){
 const LAYERS=[['tgTxt',['gUni','gVlm','gAdd','gCov']],['tgSym',['gSym']],
               ['tgPlc',['gPlc']],['tgPlan',['gPlan']],['tgGrp',['gGrp']],
               ['tgDbg',['gDrop','gMark','gProbe']],['tgArw',['gArw']],
+              ['tgLtMeta',[]],
               ['tgLtSrc',[]],
               ['tgLt',['gLt']],
               ['tgAll',['gAll']],['tgResid',['gResid']]];
@@ -2158,8 +2223,12 @@ function syncLayers(){
 }
 for(const [tg] of LAYERS){
   $(tg).querySelector('input').addEventListener('change',()=>{
-    if(tg==='tgDbg'||tg==='tgLtSrc'){
-      // 这两个调试开关都只重画现有 payload，不触发识别或 All API 请求。
+    if(tg==='tgDbg'||tg==='tgLtSrc'||tg==='tgLtMeta'){
+      // 诊断开关关闭时定向清掉已打开的 All 详情，避免 DOM 中残留；
+      // All 图层仍由它自己的开关独立控制。
+      if(tg==='tgLtMeta'&&!LT_META()){
+        clearLineTypeDiagnosticDetail();
+      }
       if(PAGE){build();renderList()}
       syncLayers();
       return;
@@ -2169,7 +2238,9 @@ for(const [tg] of LAYERS){
     if(tg==='tgAll'&&$('tgAll').querySelector('input').checked){
       ensureAllLinetypes(); return;
     }
-    if(tg==='tgAll')renderList();
+    if(tg==='tgAll'){
+      clearAllFocus(); clearLineTypeDiagnosticDetail(); renderList();
+    }
     syncLayers();
   });
 }
@@ -2179,6 +2250,7 @@ function showLineTypeProvenanceDetail(number){
   const provenance=lineTypeProvenanceLabel(number);
   if(!LT_PROV()||!provenance)return;
   $('sel').classList.add('has');
+  $('sel').dataset.detail='line-type-provenance';
   $('sel').innerHTML='<div class="scope-detail fence">'
     +'<div><i class="scope-dot" style="background:'
     +(LT_COLOR_BY_NUMBER[number]||'var(--c-fence)')
@@ -2233,19 +2305,20 @@ function selectScope(id,fly,rowKey){
   }
   // 调试层跟着一起走：选中的 callout 有线型就聚焦它，没有（gate / residual）
   // 就把调试层的聚焦**清掉** —— 否则上一个 callout 的聚焦会留在那儿。
-  if(ALL_LT){
+  if($('tgAll').querySelector('input').checked&&ALL_LT){
     if(withLines&&ltNumber!=null&&ALL_NODES.has(ltNumber)){
       ALL_FOCUS=null; focusAllType(ltNumber,false);   // focusAllType 是 toggle 语义，先清再设
     }else{
       clearAllFocus();
     }
-  }
+  }else clearAllFocus();
   /* 点 callout 后最下方那条状态栏（"8' CHAINLINK · 12 identical text boxes ·
      10 leader groups · Line types #26 / compound_path_periodic"）按产品口径去掉。
      #sel 这个容器保留 —— 调试层「全部线型」的类型详情还在用它，那是另一件事；
      所以这里改成**清空并隐藏**，而不是留着上一次的内容。 */
   $('sel').classList.remove('has');
   $('sel').innerHTML='';
+  $('sel').removeAttribute('data-detail');
   if(withLines)showLineTypeProvenanceDetail(ltNumber);
   for(const n of focused){
     if(n.tagName.toLowerCase()!=='rect')continue;
@@ -2274,6 +2347,7 @@ function clearScopeSelection(){
     n.classList.remove('on'); n.setAttribute('aria-pressed','false');
   });
   $('sel').classList.remove('has'); $('sel').innerHTML='';
+  $('sel').removeAttribute('data-detail');
 }
 function pick(key,fly){
   const e=LOOK[key]; if(!e)return;
@@ -2360,14 +2434,18 @@ async function ensureAllLinetypes(){
     let r=await api(url,null,ALL_LT_FETCH_TIMEOUT_MS);
     if(allKey()!==key)return;             // 请求飞行期间翻页/重载了，丢弃
 
-    if(r.ok&&r.body&&(r.body.state==='not-run'||r.body.state==='stale')){
+    if(r.ok&&r.body&&(r.body.state==='not-run'||r.body.state==='stale'
+                      ||r.body.state==='partial')){
       const why=r.body.state;
       ALL_LT_STATE='building';
-      ALL_LT_DETAIL=why==='stale'
+      ALL_LT_DETAIL=(why==='stale'
         ?'The cached geometry is stale; rebuilding it against the current line-type result.'
-        :'Generating and verifying geometry for every recognized line type on this sheet.';
+        :why==='partial'
+          ?'A verified legend subset is available; generating the complete line-type geometry.'
+          :'Generating and verifying geometry for every recognized line type on this sheet.');
       renderList(); syncLayers();
-      // POST 只在 GET 明确说 missing/stale 时发；同一 key 的重复点击会复用
+      // POST 只在 GET 明确说 missing/stale/partial 时发；partial 是已有 legend
+      // 子集但还没有完整 All audit，绝不能把它当成 state=ok 直接画。同一 key 复用
       // ALL_LT_INFLIGHT.promise，不会再开第二个边车。
       r=await api(url,{method:'POST'},ALL_LT_BUILD_TIMEOUT_MS);
       if(allKey()!==key)return;           // 慢 POST 结束时可能已切到另一页
@@ -2462,6 +2540,13 @@ function clearAllFocus(){
   });
 }
 
+function clearLineTypeDiagnosticDetail(){
+  const sel=$('sel');
+  if(!sel||sel.dataset.detail!=='line-type-diagnostic')return;
+  sel.classList.remove('has'); sel.innerHTML='';
+  sel.removeAttribute('data-detail');
+}
+
 function allTypeOf(number){
   return ((ALL_LT&&ALL_LT.types)||[]).find(
     t=>t.line_type_number===number)||null;
@@ -2472,7 +2557,7 @@ function allTypeOf(number){
 function focusAllType(number,fly){
   if(!ALL_LT)return;
   const input=$('tgAll').querySelector('input');
-  if(!input.checked){input.checked=true;$('tgAll').classList.remove('off')}
+  if(!input.checked)return;
   ALL_FOCUS=(ALL_FOCUS===number)?null:number;
   syncLayers(); applyAllFocus();
   document.querySelectorAll('#list .al-item').forEach(n=>{
@@ -2481,10 +2566,14 @@ function focusAllType(number,fly){
   });
   const t=ALL_FOCUS==null?null:allTypeOf(ALL_FOCUS);
   if(t)showAllTypeDetail(t);
+  else clearLineTypeDiagnosticDetail();
   if(fly&&t&&Array.isArray(t.bbox)&&t.bbox.length===4)flyToBox(t.bbox);
 }
 
 function showAllTypeDetail(t){
+  if(!LT_META()||!$('tgAll').querySelector('input').checked){
+    clearLineTypeDiagnosticDetail();return
+  }
   const bound=(t.bound_by||[]);
   const patternCount=method2PatternInstances(t).length;
   const provenance=LT_PROV()?lineTypeProvenanceLabel(t.line_type_number):'';
@@ -2505,6 +2594,7 @@ function showAllTypeDetail(t){
                 +(b.distance==null?'':(' @'+b.distance+'pt'))).join(', ')
     : 'no terminal is bound to it';
   $('sel').classList.add('has');
+  $('sel').dataset.detail='line-type-diagnostic';
   $('sel').innerHTML='<div class="scope-detail fence">'
     +'<div><i class="scope-dot" style="background:'+alColor(t.line_type_number)
     +'"></i><b>Line type  #'+t.line_type_number+'</b></div>'
@@ -2525,7 +2615,7 @@ const AL_STATE_TEXT={
 
 function renderAllSection(box){
   const on=$('tgAll').querySelector('input').checked;
-  if(!on||ALL_LT_STATE==='idle')return;
+  if(!LT_META()||!on||ALL_LT_STATE==='idle')return;
   const empty=box.querySelector('.empty');
   const h=document.createElement('div');
   h.className='scope-section';
@@ -2616,6 +2706,7 @@ function _firstRowKeyFor(id){
 
 function renderList(){
   const box=$('list'); box.innerHTML='';
+  const lineTypeDiagnostics=LT_META();
   $('scopeCount').textContent=SCOPE_GROUPS.length;
   const addSection=(title,groups)=>{
     const section=title;
@@ -2652,24 +2743,30 @@ function renderList(){
       b.dataset.scope=row.scopeId; b.dataset.lt=row.number;
       b.dataset.row=rowKey('FENCELINE',row.scopeId);
       b.setAttribute('aria-pressed',String(selectedRow===b.dataset.row));
-      const meta=['Line types #'+row.number];
-      if(row.family)meta.push(row.family);
-      meta.push(row.segments+'  segments');
-      meta.push(row.source);
-      if(LT_PROV()&&row.provenance)meta.push(row.provenance);
-      if(row.patternCount)meta.push(row.patternCount+' confirmed patterns boxed');
-      if(row.terminals)meta.push(row.terminals+'  terminals');
+      const meta=[];
+      const provenanceVisible=LT_PROV()&&!!row.provenance;
+      if(lineTypeDiagnostics){
+        meta.push('Line types #'+row.number);
+        if(row.family)meta.push(row.family);
+        meta.push(row.segments+'  segments');
+        meta.push(row.source);
+        if(provenanceVisible)meta.push(row.provenance);
+        if(row.patternCount)meta.push(row.patternCount+' confirmed patterns boxed');
+        if(row.terminals)meta.push(row.terminals+'  terminals');
+      }else if(provenanceVisible)meta.push(row.provenance);
       // 这个线型是 fusion 连带丢弃后补回来的（method1 认领、
       // method2 从未认领、fused 却无主）。标出来，免得当成 fused 同源。
-      if(row.recovered)meta.push('restored after fusion dropped it');
+      if(lineTypeDiagnostics&&row.recovered)
+        meta.push('restored after fusion dropped it');
       // 跨组合并出来的同型区域，没被指到的不画 —— 但要让人看得见有多少。
-      if(row.droppedRuns)
+      if(lineTypeDiagnostics&&row.droppedRuns)
         meta.push('plus  '+row.droppedRuns+'  more runs of the same type are not pointed at ('
                   +row.droppedSegments+'  segments, not highlighted)');
       b.innerHTML='<i class="scope-dot fence"></i><span class="scope-copy">'
-        +'<span class="scope-text">'+esc(row.text)+'</span><span class="scope-meta">'
-        +esc(meta.join(' · '))+'</span></span><span class="scope-n">#'
-        +row.number+'</span>';
+        +'<span class="scope-text">'+esc(row.text)+'</span>'
+        +((lineTypeDiagnostics||provenanceVisible)?('<span class="scope-meta">'
+          +esc(meta.join(' · '))+'</span>'):'')+'</span>'
+        +(lineTypeDiagnostics?('<span class="scope-n">#'+row.number+'</span>'):'');
       b.classList.toggle('on',selectedRow===b.dataset.row);
       b.onclick=()=>selectScope(row.scopeId,true,b.dataset.row);
       box.appendChild(b);
@@ -2677,13 +2774,19 @@ function renderList(){
     for(const row of LT_INDEX.orphans){
       const d=document.createElement('div');
       d.className='scope-item fence lt-row lt-orphan';
+      const provenanceVisible=LT_PROV()&&!!row.provenance;
+      const orphanMeta=lineTypeDiagnostics
+        ?['Line types #'+row.number,row.family,row.segments+'  segments',row.source,
+          provenanceVisible?row.provenance:'',
+          row.patternCount?(row.patternCount+' confirmed patterns boxed'):'',
+          'text not in the scope list'].filter(Boolean)
+        :(provenanceVisible?[row.provenance]:[]);
       d.innerHTML='<i class="scope-dot fence"></i><span class="scope-copy">'
-        +'<span class="scope-text">'+esc(row.text)+'</span><span class="scope-meta">'
-        +esc(['Line types #'+row.number,row.family,row.segments+'  segments',row.source,
-              LT_PROV()?row.provenance:'',
-              row.patternCount?(row.patternCount+' confirmed patterns boxed'):'',
-              'text not in the scope list'].filter(Boolean).join(' · '))
-        +'</span></span><span class="scope-n">#'+row.number+'</span>';
+        +'<span class="scope-text">'+esc(row.text)+'</span>'
+        +(orphanMeta.length?('<span class="scope-meta">'
+          +esc(orphanMeta.join(' · '))
+          +'</span>'):'')+'</span>'
+        +(lineTypeDiagnostics?('<span class="scope-n">#'+row.number+'</span>'):'');
       box.appendChild(d);
     }
   }

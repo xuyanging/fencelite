@@ -15,8 +15,9 @@
 4. `shape` 样例 → 在**俯视图（plan）视图**里把全页同款符号都匹配出来（本地矢量几何，
    零模型成本）；
 5. callout / 放置锚 → 本地箭头边车恢复引线与末端；
-6. `line` 样例 → 独立 Python 边车聚类整页矢量线，再按 callout 末端绑定并高亮它实际
-   指到的线型（零模型成本）；同时保留时间 / 费用统计。
+6. 独立 Python 边车识别整页矢量线型：callout 末端绑定它实际指到的线型；无可靠
+   引线的同款 symbol 用框中心的局部候选形成共识；legend 的 `line` 样例则作为
+   supervised template 直接提取并匹配全图（零模型成本）。
 
 最终用户看到的：**所有 fence 文字位置 + fence 相关 symbol 位置（样例框 + plan 视图内的
 全部放置）+ callout 引线 / 箭头 + 末端实际指到的线型高亮**。
@@ -86,6 +87,7 @@
    │        找同款，再用 plan 组框过滤（**fail-closed**：这一页没有  │
    │        plan 组就一个放置都不留）。line 类留给步骤6处理          │
    │  输出：symbols.json 的 result 上加 placements + plc_v          │
+   │        + plc_scope_sig（模板与 plan 框共同决定缓存身份）       │
    └──────────────────────────────┬──────────────────────────────┘
                                   │
    ┌──────────────────────────────┴──────────────────────────────┐
@@ -100,10 +102,12 @@
    ┌──────────────────────────────┴──────────────────────────────┐
    │ 步骤6  线型聚类、末端绑定与高亮                              │  🆓 免费
    │                                                              │
-   │  输入：PDF 矢量几何 + 步骤5 的 callout 末端和自身笔画          │
-   │  算法：独立 Python venv 的 source-aligned 引擎聚类整页线型；   │
-   │        剔除 callout 自身几何后，以末端最近 path op 归属绑定     │
-   │  输出：data/<slug>/linetypes/<page>.json（一页一个原子缓存）   │
+   │  输入：PDF 矢量几何 + callout 末端 / symbol 中心 / legend 样例 │
+   │  算法：source-aligned 引擎的 Method 1 + Method 2 聚类；剔除    │
+   │        marker 自身几何，末端按最近 path op 绑定；同款无引线    │
+   │        symbol 以共同候选投票；legend 水平样例走监督模板匹配     │
+   │  输出：data/<slug>/linetypes/<page>.json                        │
+   │        data/<slug>/legend_linetypes/<page>.json                │
    └──────────────────────────────┬──────────────────────────────┘
                                   │
                         webapp 只读这些 JSON 画层
@@ -241,9 +245,10 @@ pdf_revision = f"{size:x}-{mtime_ns:x}"      # steps.store.pdf_revision
 | `SYMBOL_PROMPT_V = 17` | 步骤2 的提示词 / response schema。**改 `steps/prompts.py` 必须同步 bump** | 💰 每页重新推理 |
 | `SYMBOL_VERSION = 19` | 步骤2 的发布过滤 schema（owner 硬闸 + 组内硬闸） | 🆓 只要 `SYMBOL_PROMPT_V` 不变，就是拿已存 raw 免费重过滤 |
 | `VIEW_VERSION = 1` | 步骤3 分类器（taxonomy / 提示词 / 判读策略） | 💰 只重付分类，不动 symbol raw |
-| `PLACEMENT_VERSION = 3` | 步骤4 本地 shape 匹配 + plan 过滤 | 🆓 纯几何，零模型调用 |
+| `PLACEMENT_VERSION = 4` | 步骤4 本地 shape 匹配 + plan 过滤；包含分节行号继承与输入 scope 签名 | 🆓 纯几何，零模型调用 |
 | `steps/arrows.py: ARROWS_VERSION = 17` | 步骤5箭头语义（边车 + `steps/leaders.py` 的几何兜底） | 🆓 本地边车 + 纯几何，零模型调用 |
-| `steps/linetypes/version.py: LINETYPE_VERSION = 5` | 步骤6绑定 / 发布语义；签名另含箭头签名、边车源码与依赖摘要 | 🆓 本地边车 + 纯几何；所有项目逐页重算 |
+| `steps/linetypes/version.py: LINETYPE_VERSION = 6` | 步骤6绑定 / 发布语义；支持无引线 symbol 中心共识，签名另含锚点、边车源码与依赖摘要 | 🆓 本地边车 + 纯几何；所有项目逐页重算 |
+| `steps/legend_linetypes: VERSION = 1` | legend 线样例监督匹配通道 | 🆓 本地边车 + 纯几何；只重算含 line 样例的页 |
 
 不在这张表里但同样会作废缓存的东西：
 
