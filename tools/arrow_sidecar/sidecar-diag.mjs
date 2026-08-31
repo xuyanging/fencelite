@@ -4801,6 +4801,10 @@ var DEFAULT_PDF_PAGE_EXTRACTION_BUDGET = Object.freeze({
   maxDecodedBytes: 32 * 1024 * 1024,
   maxDecodedStreamBytes: 16 * 1024 * 1024
 });
+var pdfPageExtractionResourceLimitError = (message) => Object.assign(
+  new Error(message),
+  { code: "CALLOUT_PAGE_RESOURCE_LIMIT" }
+);
 var byteString = (bytes) => {
   let output = "";
   const chunkSize = 32768;
@@ -5602,11 +5606,11 @@ async function extractPdfPage(loaded, pageNumber, options = {}) {
     const bytes = await decodeStream(streams[index], pdfLib);
     throwIfPdfPageAborted(options.signal);
     if (bytes.byteLength > budget.maxDecodedStreamBytes) {
-      throw new Error(`\u7B2C ${pageNumber} \u9875\u7684\u7B2C ${index + 1} \u4E2A\u5185\u5BB9\u6D41\u89E3\u538B\u540E\u4E3A ${(bytes.byteLength / 1024 / 1024).toFixed(2)} MiB\uFF0C\u8D85\u8FC7\u5355\u6D41 ${(budget.maxDecodedStreamBytes / 1024 / 1024).toFixed(0)} MiB \u5185\u5B58\u9884\u7B97\u3002`);
+      throw pdfPageExtractionResourceLimitError(`\u7B2C ${pageNumber} \u9875\u7684\u7B2C ${index + 1} \u4E2A\u5185\u5BB9\u6D41\u89E3\u538B\u540E\u4E3A ${(bytes.byteLength / 1024 / 1024).toFixed(2)} MiB\uFF0C\u8D85\u8FC7\u5355\u6D41 ${(budget.maxDecodedStreamBytes / 1024 / 1024).toFixed(0)} MiB \u5185\u5B58\u9884\u7B97\u3002`);
     }
     contentDecodedBytes += bytes.byteLength;
     if (contentDecodedBytes > budget.maxDecodedBytes) {
-      throw new Error(`\u7B2C ${pageNumber} \u9875\u5185\u5BB9\u6D41\u89E3\u538B\u540E\u7D2F\u8BA1\u4E3A ${(contentDecodedBytes / 1024 / 1024).toFixed(2)} MiB\uFF0C\u8D85\u8FC7\u5355\u9875 ${(budget.maxDecodedBytes / 1024 / 1024).toFixed(0)} MiB \u5185\u5B58\u9884\u7B97\u3002`);
+      throw pdfPageExtractionResourceLimitError(`\u7B2C ${pageNumber} \u9875\u5185\u5BB9\u6D41\u89E3\u538B\u540E\u7D2F\u8BA1\u4E3A ${(contentDecodedBytes / 1024 / 1024).toFixed(2)} MiB\uFF0C\u8D85\u8FC7\u5355\u9875 ${(budget.maxDecodedBytes / 1024 / 1024).toFixed(0)} MiB \u5185\u5B58\u9884\u7B97\u3002`);
     }
     decoded.push(bytes);
   }
@@ -5757,7 +5761,9 @@ try {
 try {
   const bytes = new Uint8Array(await readFile(job.pdf));
   let loaded = await loadPdfBytes(bytes, { fileName: "input.pdf", fileSize: bytes.byteLength });
-  const page = await extractPdfPage(loaded, Number(job.page));
+  const page = await extractPdfPage(
+    loaded, Number(job.page), job.budget ?? void 0
+  );
   loaded = null;
   const prepared = prepareCalloutPage(page, job.budget ?? void 0);
   const analysis = analyzePreparedCalloutPage({ prepared });

@@ -2223,6 +2223,25 @@ def _linetype_failed_timeout_budget(error):
         return None
 
 
+def _linetype_attempt_timeout(slug, page, arrow_entry, sig):
+    """Use the bounded dense deadline after a same-signature timeout marker.
+
+    The first explicit run keeps the ordinary geometry-selected deadline.
+    Only a later explicit rerun of the exact same inputs inherits evidence
+    that the ordinary deadline was insufficient.  Deterministic failures and
+    stale markers never receive a larger budget.
+    """
+    selected = _linetype_timeout_for(slug, page, arrow_entry)
+    previous_entry = linetypes.load_page(slug, page)
+    if not (isinstance(previous_entry, dict)
+            and previous_entry.get("sig") == sig):
+        return selected
+    previous = _linetype_failed_timeout_budget(previous_entry.get("error"))
+    if previous is None:
+        return selected
+    return max(selected, LINETYPE_DENSE_TIMEOUT)
+
+
 def _linetype_failure_budget_increased(slug, page, arrow_entry, error):
     """Whether a timeout failure is eligible under a larger current budget."""
     previous = _linetype_failed_timeout_budget(error)
@@ -2292,7 +2311,7 @@ def _linetype_one(slug, page, items, arrow_entry, sig, should_cancel=None):
 
         entry = None
         error = None
-        timeout = _linetype_timeout_for(slug, page, arrow_entry)
+        timeout = _linetype_attempt_timeout(slug, page, arrow_entry, sig)
         for attempt in range(RETRIES + 1):
             try:
                 revision_now = pdf_revision(pdf_path(slug))

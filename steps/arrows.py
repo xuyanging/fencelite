@@ -92,14 +92,17 @@ _BUDGET_LADDER = [
     None,                                  # 先用边车自己的默认预算
     {"maxSceneOps": 1_000_000, "maxPathSegments": 8_000_000,
      "maxDecodedBytes": 128 * 1024 * 1024,
+     "maxDecodedStreamBytes": 64 * 1024 * 1024,
      "maxSourceLength": 128 * 1024 * 1024,
      "maxSegmentsPerPath": 400_000},
     {"maxSceneOps": 8_000_000, "maxPathSegments": 64_000_000,
      "maxDecodedBytes": 512 * 1024 * 1024,
+     "maxDecodedStreamBytes": 256 * 1024 * 1024,
      "maxSourceLength": 512 * 1024 * 1024,
      "maxSegmentsPerPath": 2_000_000},
     {"maxSceneOps": 32_000_000, "maxPathSegments": 256_000_000,
      "maxDecodedBytes": 2048 * 1024 * 1024,
+     "maxDecodedStreamBytes": 1024 * 1024 * 1024,
      "maxSourceLength": 2048 * 1024 * 1024,
      "maxSegmentsPerPath": 8_000_000},
 ]
