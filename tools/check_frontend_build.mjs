@@ -1148,6 +1148,9 @@ for (const rel of urls) {
       console.log("  SKIP Method 2 pattern 框: 没有可用页面外壳");
     } else {
       fixture.record = fixture.record || {};
+      // 固定放一个 plan 框：普通几何仍应可选中，但不再弹 Type / box_2d
+      // 之类的通用调试状态卡。
+      fixture.plan_boxes = [[22,20,580,450]];
       fixture.items = Array.isArray(fixture.items) ? fixture.items : [];
       let scopeItem = fixture.items.find((item) => item && String(item.text || "").trim());
       if (!scopeItem) {
@@ -1191,6 +1194,16 @@ for (const rel of urls) {
         + "makeScopeModel();build();renderList();syncLayers();", context,
         {filename:"method2-pattern-normal"});
       context.__patternNumber = target.line_type_number;
+      const planPick = JSON.parse(vm.runInContext(
+        "$('sel').classList.add('has');$('sel').innerHTML='stale inspector';"
+        + "pick('pl0',false);JSON.stringify({exists:!!LOOK.pl0,picked,"
+        + "selected:!!(LOOK.pl0&&LOOK.pl0.rect.classList.contains('pick')),"
+        + "has:$('sel').classList.contains('has'),html:$('sel').innerHTML})", context,
+        {filename:"hidden-generic-box-status"}));
+      if (!planPick.exists || planPick.picked !== "pl0" || !planPick.selected)
+        problems.push("plan 框不再能保持选中态");
+      if (planPick.has || planPick.html)
+        problems.push("plan 框仍会显示 Type / box_2d 通用状态卡");
       const normal = JSON.parse(vm.runInContext(
         "JSON.stringify({"
         + "nodes:(LT_NODES.get(__patternNumber)||[]).map(n=>({tag:n.tagName,"
@@ -1293,7 +1306,8 @@ for (const rel of urls) {
         problems.push("All pattern 框没有随类型 focus，其余类型没有 dim");
       context.showAllTypeDetail(allM2);
       const detail = context.document.getElementById("sel").innerHTML;
-      if (!detail.includes("source Method 2")
+      if (!context.document.getElementById("sel").classList.contains("has")
+          || !detail.includes("source Method 2")
           || !detail.includes("2 confirmed pattern instances boxed"))
         problems.push("All 详情没有 Method 2 来源/confirmed pattern 数");
       context.renderList();
@@ -1358,7 +1372,7 @@ for (const rel of urls) {
     console.log(`  FAIL Method 2 pattern 框: ${problems.join("; ")}`);
     failures += 1;
   } else if (!skipped) {
-    console.log("  OK   Method 2 pattern 框: normal/All 仅框 confirmed Method 2；来源、focus、开关缓存通过");
+    console.log("  OK   普通框详情已隐藏；Method 2 normal/All 来源、pattern、focus、开关缓存通过");
   }
 }
 

@@ -2172,16 +2172,9 @@ function pick(key,fly){
   clearScopeSelection();
   if(picked&&LOOK[picked])LOOK[picked].rect.classList.remove('pick');
   picked=key; e.rect.classList.add('pick');
-  // #sel 默认 display:none，只有 .has 才显示。以前这里靠上一行的
-  // clearScopeSelection() 顺手摘 has，于是这张框详情卡一直写了却看不见。
-  $('sel').classList.add('has');
-  const rows=[['Type',e.kind],['label',e.label],['text',e.text],
-              ['box_2d','['+e.box.map(v=>Math.round(v*10)/10).join(', ')+']'],
-              ['union idx',e.idx==null?'—':e.idx],['Note',e.note]];
-  $('sel').innerHTML='<div class="item on"><div class="meta">'
-    +rows.filter(r=>r[1]!==''&&r[1]!=null)
-         .map(r=>'<div><b>'+esc(r[0])+'</b>: '+esc(r[1])+'</div>').join('')
-    +'</div></div>';
+  /* 普通几何框（plan / text / symbol / placement / group）的 Type、label、
+     text、box_2d、union idx 调试卡不再展示。保留 pick 选框和 fly 定位；
+     #sel 只给 All line types 的方法来源、pattern 等专用详情使用。 */
   document.querySelectorAll('#list .item').forEach(n=>
     n.classList.toggle('on',n.dataset.k===key));
   if(fly){
