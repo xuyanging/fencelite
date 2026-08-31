@@ -1,13 +1,17 @@
 """VLM 原始响应的缓存身份契约 —— 付费产物只在身份完全一致时才复用.
 
 Raw page responses are paid artifacts.  Reusing one is safe only when the
-input PDF revision, the *resolved* model id, and the exact prompt bytes all
-match the current call.  The prompt digest is derived from its content so a
-prompt edit cannot be forgotten behind a hand-maintained version number.
+input PDF revision, the *resolved* model id, and the exact **base semantic
+prompt** bytes all match the current call.  The digest is derived from that
+content so a changed target cannot be forgotten behind a hand-maintained
+version number.  Ephemeral retry metadata/nonces used only to escape a cached
+malformed provider response are deliberately excluded: they request the same
+semantic result and must not make a successful retry stale immediately.
 
 两种角色，各自独立落盘（绝不把 union 结果伪装成一条 raw）：
   primary         —— 配置主模型的整页扫描，写 vlm.json
-  secondary_union —— 无文字层扫描页的第二模型（Flash）扫描，写 vlm_flash.json
+  secondary_union —— 准确率模式下每页的第二模型（Flash）扫描，
+                      选择性模式下仅用于无文字层页，写 vlm_flash.json
 
 没有 ``vlm_identity`` 的记录（外部导入的旧缓存）故意不通过
 :func:`is_current_vlm_record`；要复用就由 tools/ 下的导入脚本显式改写
@@ -45,7 +49,11 @@ def vlm_identity_for_revision(revision: str, model, prompt: str) -> dict:
 
 
 def vlm_identity(pdf_path, model, prompt: str) -> dict:
-    """Build the identity of the call that ``scan_page`` will execute."""
+    """Build the durable identity from the base semantic scan prompt.
+
+    A transport retry may append a non-semantic validation nonce to the wire
+    prompt.  That suffix is intentionally not part of this cache identity.
+    """
     return vlm_identity_for_revision(
         pdf_revision(Path(pdf_path)), model, prompt)
 
@@ -104,7 +112,7 @@ def is_current_primary_record(record, expected_identity: dict) -> bool:
 
 
 def is_current_secondary_record(record, expected_identity: dict) -> bool:
-    """Validate the separately stored no-text-layer union source."""
+    """Validate the separately stored second-model union source."""
     return (isinstance(record, dict)
             and record.get(ROLE_FIELD) == SECONDARY_UNION_ROLE
             and is_current_vlm_record(record, expected_identity))

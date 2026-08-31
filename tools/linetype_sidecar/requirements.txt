@@ -5,7 +5,8 @@
 # 装成别的版本 → 摘要变 → 全站线型缓存作废、每页重算约 100 s。
 # 数字来自开发机 venv 里的 dist-info 目录名，逐字抄。
 #
-# Python 必须是 3.10（原 venv 是 3.10.20）。
+# 生产边车当前使用 Python 3.12.3。前台（cpu_budget=4）与低优先级 refresh
+#（cpu_budget=2）复用这套依赖；budget 已验证不改变结果，因此不进缓存签名。
 pymupdf==1.28.2
 pypdf==6.14.2
 scipy==1.15.3

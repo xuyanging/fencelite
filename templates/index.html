@@ -73,6 +73,9 @@ h2:first-child{margin-top:0}
 .fname{font-size:12px;color:var(--mut);overflow:hidden;text-overflow:ellipsis;
        white-space:nowrap;min-width:0;flex:1}
 .fname.has{color:var(--fg)}
+.upload-status{color:var(--mut);font-size:12px;min-height:16px;white-space:pre-line}
+.upload-status.bad{color:#b91c1c}
+.upload-status.good{color:#166534}
 .tag.time{background:rgba(59,130,246,.12);color:#1d4ed8;border-color:rgba(59,130,246,.28)}
 .tag.time.dim{background:rgba(100,116,139,.10);color:#475569;border-color:rgba(100,116,139,.22)}
 .tag.cost{background:#fef3c7;color:#92400e}
@@ -113,11 +116,13 @@ h2:first-child{margin-top:0}
 .job{border:1px solid var(--bd);border-left:3px solid var(--c-uni);border-radius:7px;
      padding:7px 8px;margin-bottom:7px;background:#fff}
 .job.err{border-left-color:#dc2626}
+.job.warn{border-left-color:#d97706;background:#fffbeb}
 .job.ok{border-left-color:#16a34a}
 .job .jt{display:flex;gap:6px;align-items:center;font-size:12.5px}
 .job .jt b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .job .js{color:var(--mut);font-size:11.5px;margin-top:3px}
 .job .js.e{color:#b91c1c}
+.job .js.w{color:#a16207}
 .bar{height:6px;background:#eceef1;border-radius:4px;overflow:hidden;margin-top:6px}
 .bar i{display:block;height:100%;background:var(--c-uni);transition:width .3s}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:1px 8px;margin-top:6px;font-size:11.5px}
@@ -176,7 +181,7 @@ rect.bx.bx-plc:hover,rect.bx.bx-plc.pick{fill:rgba(124,58,237,.62);
 .lt-line{fill:none;stroke-width:3.2;stroke-opacity:.7;stroke-linecap:round;
          stroke-linejoin:round;pointer-events:none;vector-effect:non-scaling-stroke;
          transition:stroke-opacity .12s ease,stroke-width .12s ease}
-/* 从 FENCELINE 那一节选中某个 callout 时：它对应的线型显著一点，其余线型压暗。
+/* 选中任何已经绑定线型的 callout / 箭头时：它对应的线型显著一点，其余线型压暗。
    颜色跟 callout 同一套（fence 蓝 / gate 红），所以不需要另一套调色板。 */
 .lt-line.lt-focus{stroke-width:5;stroke-opacity:1;
                   filter:drop-shadow(0 0 3px rgba(15,23,42,.45))}
@@ -281,7 +286,7 @@ body{background:#eef1f4;overflow:hidden}
 #bar::-webkit-scrollbar{height:5px}
 #bar::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
 #bar::-webkit-scrollbar-track{background:transparent}
-/* 图层控制条不是给客户看的，默认收起。用 class 控制而不是改 #bar 的 display —— 
+/* 图层控制条不是给客户看的，默认收起。用 class 控制而不是改 #bar 的 display ——
    那条 display:flex 是和 #top 共用的（见 :31），动它会连顶栏一起改。 */
 #bar.tucked{display:none}
 #bar .scope-legend{display:flex;align-items:center;gap:10px;margin-right:3px;white-space:nowrap;color:#475569;font-size:11.5px}
@@ -429,7 +434,7 @@ svg polyline.scope-focus{stroke-width:3.2;opacity:1;filter:drop-shadow(0 0 2px r
 <div id="top">
   <button class="iconbtn" id="bProjectMenu" title="Projects and jobs" aria-label="Open project list">☰</button>
   <select id="projectSelect" title="Select PDF" aria-label="Select PDF"><option value="">No PDF</option></select>
-  <button class="primary" id="bUp">Upload PDF</button>
+  <button class="primary" id="bUp">Upload PDFs</button>
   <div id="jobStatus"></div>
   <span id="mdlSwitch" class="mdlsw"></span>
   <span class="sp"></span>
@@ -485,20 +490,20 @@ svg polyline.scope-focus{stroke-width:3.2;opacity:1;filter:drop-shadow(0 0 2px r
 
 <div id="modal">
   <div class="box">
-    <h3>Upload PDF</h3>
+    <h3>Upload PDFs</h3>
     <div class="frow">
-      <input id="upFile" type="file" accept="application/pdf" hidden>
-      <button type="button" id="upPick">Choose PDF…</button>
-      <span id="upName" class="fname">No file selected</span>
+      <input id="upFile" type="file" accept=".pdf,application/pdf" multiple hidden>
+      <button type="button" id="upPick">Choose PDFs…</button>
+      <span id="upName" class="fname">No files selected</span>
     </div>
-    <div>Detection target (what to find) — change it to doors / trees / hydrants, etc.</div>
+    <div>Detection target for every selected PDF — change it to doors / trees / hydrants, etc.</div>
     <textarea id="upTarget" spellcheck="false"></textarea>
     <div class="note">
       default target = Find fence-related text — runs all four steps: text → Legend sample symbols → View classification →
       in-plan symbol matching.<b>Change the target to anything else and only the text step runs</b> —
       Legend symbols and in-plan placement are fence-specific logic; they do not apply to an arbitrary target and are skipped automatically.
     </div>
-    <div class="err" id="upErr"></div>
+    <div class="upload-status" id="upErr" aria-live="polite"></div>
     <div class="frow" style="justify-content:flex-end">
       <button id="upCancel">Cancel</button>
       <button class="primary" id="upRun">Start processing</button>
@@ -512,18 +517,24 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const STAGE_CN={queued:'Queued',text:'Step 1 · Find text',symbols:'Step 2 · Legend sample symbols',
   views:'Step 3 · View classification',placements:'Step 4 · in-plan symbol matching',
-  arrows:'Extra · Arrows & leaders',done:'Done',error:'failed',cancelled:'Cancelled',
+  arrows:'Extra · Arrows & leaders',linetypes:'Extra · Line types',done:'Done',error:'failed',cancelled:'Cancelled',
   interrupted:'Interrupted (service restart)'};
 
 let PRESET='';                 // 预置检测目标
 let OV=[];                     // /api/overview
 let JOBS={};                   // slug -> job status
-let POLL={};                   // slug -> interval id
+let POLL={};                   // slug -> watcher generation
+let POLL_TIMER=null;           // 全部活跃任务共用一个 2s timer
+let POLL_INFLIGHT=false;       // 全局 tick 不重入，避免旧响应覆盖新状态
+let POLL_SEQ=0;                // 删除后同 slug 重跑时隔离旧 tick
+let UPLOAD_BUSY=false;         // 批量上传/收口中锁定文件选择与 target
+let UPLOAD_RESULT_PENDING=null;// 隐藏弹窗后仍可找回的失败摘要
 let CUR=null;                  // {slug,page}
 let PAGE=null;                 // /api/page payload
 let LOOK={};                   // key -> {kind,label,text,box,idx,rect,note}
 let picked=null;
 let svg=null, scale=1, fitS=1, epoch=0;
+let LT_PAGE_POLL=null;         // 当前页线型后台更新完成后自动重载
 let SCOPE_GROUPS=[];           // 本页去重后的文字 scope
 let SCOPE_BY_INDEX=new Map();  // union index -> scope
 let SCOPE_BY_SYMBOL=new Map(); // symbol index -> scope
@@ -550,9 +561,7 @@ const scopeColor=g=>g&&g.gate?'#e53935':'#1976d2';
 
 function makeScopeModel(){
   SCOPE_GROUPS=[]; SCOPE_BY_INDEX=new Map(); SCOPE_BY_SYMBOL=new Map();
-  // LT_LINES_ON 必须跟着一起清：换页后 SCOPE_GROUPS 全新，残留的 true 会让
-  // 「在新页上随手点一个 scope 框」莫名连带打开线型层并压暗其余线型。
-  selectedScope=null; selectedRow=null; LT_LINES_ON=false;
+  selectedScope=null; selectedRow=null;
   if($('sel')){$('sel').classList.remove('has');$('sel').innerHTML=''}
   if(!PAGE)return;
   const byKey=new Map(), markers=new Set(PAGE.marker_codes||[]),
@@ -605,9 +614,6 @@ function makeScopeModel(){
    所以这里只做连接，不重新判断谁该有线：gate 不找线、plan 显示闸、residual
    全部是后端的结论。 */
 let LT_NODES=new Map();        // 线型编号 -> [polyline 节点]
-// 当前选中是否要连带高亮线型。只有从 FENCELINE 那一节点进来才是 true；
-// 图层开关变化后会 re-select 一次，靠它把状态原样恢复。
-let LT_LINES_ON=false;
 let LT_INDEX={types:[],rows:[],orphans:[],orphanNumbers:new Set(),
               scopesByNumber:new Map(),numberByScope:new Map()};
 
@@ -861,17 +867,54 @@ function renderThumbs(force){
   syncThumbSelection(true);
 }
 
+/* A running job's useful progress is the progress within its current stage.
+   The old weighted whole-pipeline value only moved from 98% to 100% while all
+   line-type sheets ran, which made 3/9 sheets look like 99% complete. */
+function jobProgress(j){
+  const total=Number(j&&j.stage_total), rawDone=Number(j&&j.stage_done);
+  const staged=!!j&&!j.done&&Number.isFinite(total)&&total>0;
+  const done=Number.isFinite(rawDone)?Math.max(0,rawDone):0;
+  const raw=staged?(done/total*100):(Number(j&&j.progress)||0)*100;
+  let pct=Math.max(0,Math.min(100,Math.round(raw)));
+  if(j&&!j.done)pct=Math.min(99,pct); // 100% is reserved for a completed job
+  return {pct,staged,done,total};
+}
+function jobStageProgress(j,p){
+  p=p||jobProgress(j);
+  if(!p.staged)return '';
+  if(j.stage_unit==='percent')return p.pct+'%';
+  return p.done+'/'+p.total+' sheets';
+}
+function jobOutcome(j){
+  if(!j||!j.done)return 'active';
+  /* Jobs persisted before `outcome` existed retain the old ok semantics.  In
+     particular, an old done+ok job with a historical warning stays hidden. */
+  return j.outcome||(j.ok?'success':'failed');
+}
+function jobHeartbeat(j){
+  if(!j||j.done||!Number(j.updated_at))return '';
+  const stamp=Number(j.updated_at)>1e12?Number(j.updated_at)/1000:Number(j.updated_at);
+  const age=Math.max(0,Math.floor(Date.now()/1000-stamp));
+  return 'Engine active · updated '+age+'s ago';
+}
+
 function renderTopJobStatus(list){
   const box=$('jobStatus');
-  const j=(list||[])[0];
+  const active=(list||[]).filter(j=>jobOutcome(j)==='active');
+  /* 批量时最新创建的通常还在 queued；优先显示真正运行中的那份。全部 queued
+     时显示最早入队的任务，避免顶栏长期停在“最新一份 0%”。 */
+  const j=active.find(j=>j.stage&&j.stage!=='queued')
+    ||active.slice().sort((a,b)=>(a.started||0)-(b.started||0))[0]
+    ||(list||[])[0];
   if(!j){box.className='';box.innerHTML='';return}
-  const pct=Math.max(0,Math.min(100,Math.round((j.progress||0)*100)));
-  const failed=j.done&&!j.ok;
-  const pagey=!j.done&&Number(j.stage_total)>0;
-  const detail=failed?'Processing failed':(STAGE_CN[j.stage]||j.stage||'Processing')
-    +(pagey?' '+(j.stage_done||0)+'/'+j.stage_total:'');
+  const prog=jobProgress(j), pct=prog.pct, outcome=jobOutcome(j);
+  const failed=outcome==='failed', partial=outcome==='partial';
+  const stageProgress=jobStageProgress(j,prog);
+  const detail=failed?'Processing failed':partial?'Completed with issues':
+    (STAGE_CN[j.stage]||j.stage||'Processing')+(stageProgress?' '+stageProgress:'');
   box.className='on';
-  box.innerHTML='<span title="'+esc(baseSlug(j.slug))+'">'+esc(detail)+'</span>'
+  const batch=active.length>1?active.length+' PDFs · ':'';
+  box.innerHTML='<span title="'+esc(baseSlug(j.slug)+(j.detail?' — '+j.detail:''))+'">'+esc(batch+detail)+'</span>'
     +'<span class="mini-progress"><i style="width:'+pct+'%"></i></span><b>'+pct+'%</b>';
 }
 
@@ -881,74 +924,269 @@ function renderTopJobStatus(list){
    当前页面所在目录为基准拼。直接挂在根目录时 BASE='/'，行为不变。 */
 const BASE=location.pathname.replace(/[^/]*$/,'');
 const U=p=>BASE+String(p).replace(/^\//,'');
-async function api(url,opt){
-  const r=await fetch(U(url),opt);
-  let j=null;
-  try{ j=await r.json(); }catch(e){}
-  return {ok:r.ok,status:r.status,body:j};
+async function api(url,opt,timeoutMs=15000){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),timeoutMs);
+  try{
+    // Results are signature-gated on the server; make the browser obey the
+    // same latest-only rule instead of reusing a cached JSON response for the
+    // same slug/page while a background line-type refresh has just finished.
+    const r=await fetch(U(url),{...(opt||{}),cache:'no-store',signal:controller.signal});
+    let j=null;
+    try{ j=await r.json(); }catch(e){}
+    return {ok:r.ok,status:r.status,body:j};
+  }catch(e){
+    /* A worker restart / brief network loss must not leave upload buttons in
+       an unresolved Promise forever. Pollers keep retrying; one-shot actions
+       receive an ordinary error object and restore their UI state. */
+    const timedOut=e&&e.name==='AbortError';
+    return {ok:false,status:0,
+            body:{error:(timedOut?'Request timed out':'Network error')+': '
+                        +((e&&e.message)||'request failed')}};
+  }finally{ clearTimeout(timer); }
 }
 const fmtUsd=v=>'$'+(Number(v||0)).toFixed(Number(v||0)<1?4:2);
 const fmtSec=v=>{const s=Number(v||0);return s<60?s.toFixed(1)+'s':Math.floor(s/60)+'m'+Math.round(s%60)+'s'};
 
 /* =============== 上传 =============== */
 $('bUp').onclick=async()=>{
+  /* 上传弹窗可在后台上传时隐藏；再次点顶栏只负责把进度找回来，绝不能重置
+     FileList / target 或启动第二批。 */
+  if(UPLOAD_BUSY){$('modal').style.display='flex';return}
+  if(UPLOAD_RESULT_PENDING){$('modal').style.display='flex';return}
   if(!PRESET){
     const r=await api('/api/preset_target');
     PRESET=(r.body&&r.body.target)||'';
   }
   $('upTarget').value=PRESET;
-  $('upFile').value=''; $('upErr').textContent='';
-  $('upName').textContent='No file selected'; $('upName').classList.remove('has');
+  $('upFile').value=''; uploadMessage('');
+  $('upCancel').textContent='Cancel';
+  renderUploadSelection();
   $('modal').style.display='flex';
 };
 /* 自己的按钮代替原生 file input：点它转发给隐藏的 input，选完把文件名写出来。
    原生控件的 "选择文件 / 未选择文件" 由浏览器界面语言渲染，页面改不到。 */
 $('upPick').onclick=()=>$('upFile').click();
+function selectedPdfFiles(){return Array.from($('upFile').files||[])}
+function uploadSelectionText(files){
+  files=files||[];
+  if(!files.length)return 'No files selected';
+  if(files.length===1)return files[0].name;
+  const shown=files.slice(0,3).map(f=>f.name).join(', ');
+  return files.length+' PDFs selected · '+shown
+    +(files.length>3?' · +'+(files.length-3)+' more':'');
+}
+function renderUploadSelection(){
+  const files=selectedPdfFiles(), name=$('upName'), run=$('upRun');
+  name.textContent=uploadSelectionText(files);
+  name.title=files.map(f=>f.name).join('\n');
+  name.classList.toggle('has',files.length>0);
+  run.textContent=files.length>1?'Start '+files.length+' PDFs':'Start processing';
+  run.disabled=UPLOAD_BUSY||!files.length;
+  return files;
+}
+function uploadMessage(message,tone){
+  const box=$('upErr');
+  box.textContent=message||'';
+  box.classList.toggle('bad',tone==='bad');
+  box.classList.toggle('good',tone==='good');
+}
+function updateUploadButton(){
+  $('bUp').textContent=UPLOAD_BUSY?'Uploading…':
+    (UPLOAD_RESULT_PENDING?UPLOAD_RESULT_PENDING.label:'Upload PDFs');
+}
+function setUploadResultPending(label){
+  UPLOAD_RESULT_PENDING={label:label||'Upload failed'};
+  updateUploadButton();
+}
+function clearUploadResultPending(){
+  UPLOAD_RESULT_PENDING=null;
+  updateUploadButton();
+}
+function setUploadBusy(busy){
+  UPLOAD_BUSY=!!busy;
+  $('upPick').disabled=UPLOAD_BUSY;
+  $('upTarget').disabled=UPLOAD_BUSY;
+  $('upCancel').disabled=false;
+  $('upCancel').textContent=UPLOAD_BUSY?'Hide':'Cancel';
+  updateUploadButton();
+  $('upRun').disabled=UPLOAD_BUSY||!selectedPdfFiles().length;
+}
 $('upFile').onchange=()=>{
-  const f=$('upFile').files[0];
-  $('upName').textContent=f?f.name:'No file selected';
-  $('upName').classList.toggle('has',!!f);
+  clearUploadResultPending();uploadMessage('');renderUploadSelection();
 };
-$('upCancel').onclick=()=>{$('modal').style.display='none'};
-$('modal').onclick=e=>{if(e.target===$('modal'))$('modal').style.display='none'};
+$('upCancel').onclick=()=>{
+  if(!UPLOAD_BUSY)clearUploadResultPending();
+  $('modal').style.display='none';
+};
+$('modal').onclick=e=>{
+  if(e.target===$('modal')){
+    if(!UPLOAD_BUSY)clearUploadResultPending();
+    $('modal').style.display='none';
+  }
+};
+
+const UPLOAD_TOKEN_PREFIX='fence_lite.upload.';
+const uploadFileFingerprint=(file,target)=>JSON.stringify([
+  file.name,file.size||0,file.lastModified||0,String(target||'').trim()
+]);
+function newUploadToken(){
+  if(globalThis.crypto&&typeof globalThis.crypto.randomUUID==='function')
+    return globalThis.crypto.randomUUID().replace(/-/g,'');
+  return 'u_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2)
+    +Math.random().toString(36).slice(2);
+}
+function uploadTokenFor(file,target){
+  const key=UPLOAD_TOKEN_PREFIX+uploadFileFingerprint(file,target);
+  let token='';
+  try{token=sessionStorage.getItem(key)||''}catch(e){}
+  if(!token){
+    token=newUploadToken();
+    try{sessionStorage.setItem(key,token)}catch(e){}
+  }
+  return token;
+}
+function forgetUploadToken(file,target){
+  try{sessionStorage.removeItem(
+    UPLOAD_TOKEN_PREFIX+uploadFileFingerprint(file,target))}
+  catch(e){}
+}
+async function uploadPdfFile(file,target){
+  const token=uploadTokenFor(file,target);
+  const send=()=>{
+    const fd=new FormData();
+    fd.append('pdf',file);
+    fd.append('target',target);
+    fd.append('upload_token',token);
+    return api('/api/upload',{method:'POST',body:fd},30*60*1000);
+  };
+  /* Large drawings can be hundreds of MB, so upload gets a long—but still
+     finite—deadline. A half-open connection can no longer disable the button
+     forever. One transport failure is retried with the SAME server-side token,
+     so a lost success response cannot create/charge for a duplicate job. */
+  let r=await send();
+  if(r.status===0)r=await send();
+  return r;
+}
+function uploadResponseError(r){
+  return (r&&r.body&&r.body.error)||('HTTP '+((r&&r.status)||0));
+}
+function registerUploadedJob(item){
+  JOBS[item.slug]=item.job||{slug:item.slug,stage:'queued'};
+  renderJobs();
+  startPoll(item.slug);
+}
+/* 每份 PDF 是一个独立请求/任务。某一份损坏、超限或网络失败时记录它并继续，
+   已经成功的任务立即出现在任务卡里；后端的处理锁会把算法任务逐份排队。 */
+async function enqueuePdfUploads(files,target,onProgress,handlers){
+  const successes=[],failures=[],total=files.length;
+  const uploadOne=(handlers&&handlers.uploadOne)||uploadPdfFile;
+  const onQueued=(handlers&&handlers.onQueued)||registerUploadedJob;
+  for(let i=0;i<total;i++){
+    const file=files[i];
+    if(onProgress)onProgress({phase:'uploading',file,index:i+1,total,
+      completed:i,queued:successes.length,failed:failures.length});
+    let r=null,error='';
+    try{r=await uploadOne(file,target)}
+    catch(e){error=(e&&e.message)||String(e)}
+    if(!error&&r&&r.ok&&r.body&&!r.body.error&&r.body.slug){
+      const item={file,slug:r.body.slug,job:r.body.job};
+      successes.push(item);
+      forgetUploadToken(file,target);
+      try{onQueued(item)}catch(e){console.error('Failed to render queued PDF',e)}
+    }else{
+      error=error||uploadResponseError(r);
+      failures.push({file,error});
+    }
+    if(onProgress)onProgress({phase:'submitted',file,index:i+1,total,
+      completed:i+1,queued:successes.length,failed:failures.length});
+  }
+  return {successes,failures,total};
+}
+
 $('upRun').onclick=async()=>{
-  const f=$('upFile').files[0];
-  if(!f){ $('upErr').textContent='Pick a PDF file first'; return; }
-  const fd=new FormData();
-  fd.append('pdf',f);
-  // 没动过就发空串 → 后端用默认 fence 目标（完整四步）
-  const t=$('upTarget').value||'';
-  fd.append('target', t.trim()===PRESET.trim()?'':t);
-  $('upRun').disabled=true; $('upErr').textContent='Uploading…';
-  const r=await api('/api/upload',{method:'POST',body:fd});
-  $('upRun').disabled=false;
-  if(!r.ok||!r.body||r.body.error){
-    $('upErr').textContent='failed: '+((r.body&&r.body.error)||('HTTP '+r.status));
+  if(UPLOAD_BUSY)return;
+  const files=selectedPdfFiles();
+  if(!files.length){uploadMessage('Pick one or more PDF files first','bad');return}
+  // 没动过就发空串 → 后端用默认 fence 目标（完整四步）；整批共用一个目标。
+  const rawTarget=$('upTarget').value||'';
+  const target=rawTarget.trim()===PRESET.trim()?'':rawTarget;
+  setUploadBusy(true);
+  let batch=null;
+  let fatalError='';
+  try{
+    batch=await enqueuePdfUploads(files,target,p=>{
+      if(p.phase==='uploading'){
+        uploadMessage('Uploading '+p.index+'/'+p.total+' · '+p.file.name);
+      }else{
+        uploadMessage('Submitted '+p.completed+'/'+p.total+' · '
+          +p.queued+' queued'+(p.failed?' · '+p.failed+' failed':''),
+          p.failed?'bad':'');
+      }
+    });
+  }catch(e){
+    fatalError='Batch upload stopped: '+((e&&e.message)||String(e));
+  }
+  /* Clear immediately, but keep UPLOAD_BUSY true through overview + final UI
+     settlement.  A new batch cannot start and then be overwritten by this
+     handler when the older overview request finally returns. */
+  $('upFile').value='';
+  if(!batch){
+    renderUploadSelection();
+    uploadMessage(fatalError||'Batch upload stopped','bad');
+    setUploadBusy(false);
+    setUploadResultPending('Upload failed');
     return;
   }
-  $('modal').style.display='none';
-  toggleProjectDrawer(false);
-  JOBS[r.body.slug]=r.body.job||{slug:r.body.slug,stage:'queued'};
-  renderJobs(); await loadOverview();
-  startPoll(r.body.slug);
-  show(r.body.slug,1);
+  let overviewError='';
+  if(batch.successes.length){
+    try{await loadOverview()}
+    catch(e){overviewError=(e&&e.message)||String(e)}
+  }
+  if(!batch.failures.length){
+    $('modal').style.display='none';
+    if(batch.total===1&&!overviewError){
+      toggleProjectDrawer(false);
+      show(batch.successes[0].slug,1);
+    }else{
+      toggleProjectDrawer(true);
+    }
+    setUploadBusy(false);
+    return;
+  }
+  /* FileList 不能删掉其中已经成功的项。整批结束后清空选择，避免用户直接再点
+     Start 时把成功文件重复上传；只需重新选择上面列出的失败文件。 */
+  renderUploadSelection();
+  $('upName').textContent=batch.successes.length+'/'+batch.total+' queued · '
+    +batch.failures.length+' failed';
+  $('upName').title=batch.failures.map(x=>x.file.name).join('\n');
+  $('upCancel').textContent='Close';
+  uploadMessage(batch.successes.length+'/'+batch.total+' PDFs queued. '
+    +batch.failures.length+' failed; select those files again to retry:\n'
+    +batch.failures.map(x=>'• '+x.file.name+': '+x.error).join('\n')
+    +(overviewError?'\nProject list refresh failed: '+overviewError:''),'bad');
+  if(batch.successes.length)toggleProjectDrawer(true);
+  setUploadBusy(false);
+  $('upCancel').textContent='Close';
+  setUploadResultPending(batch.failures.length===1?'1 upload failed':
+    batch.failures.length+' uploads failed');
 };
 
 /* =============== 任务卡片 =============== */
 function renderJobs(){
   const box=$('jobs'), list=Object.values(JOBS).filter(j=>j&&j.slug)
-    .filter(j=>!(j.done&&j.ok))
+    .filter(j=>jobOutcome(j)!=='success')
     .sort((a,b)=>(b.started||0)-(a.started||0));
   renderTopJobStatus(list);
   box.innerHTML='';
   if(!list.length){ box.innerHTML='<div class="empty">No jobs</div>'; return; }
   for(const j of list){
     const llm=j.llm||{}, by=llm.by_model||{};
-    const failed=j.done&&!j.ok;
+    const outcome=jobOutcome(j), failed=outcome==='failed', partial=outcome==='partial';
     const d=document.createElement('div');
-    d.className='job'+(failed?' err':'');
-    const pct=Math.max(0,Math.min(100,Math.round((j.progress||0)*100)));
-    const pagey=!j.done&&Number(j.stage_total)>0;
+    d.className='job'+(failed?' err':partial?' warn':'');
+    const prog=jobProgress(j), pct=prog.pct;
+    const stageProgress=jobStageProgress(j,prog);
     /* 显示「PDF 名 + 哪个模型」，而不是带 __<model> 后缀的原始 slug ——
        后缀是存储实现，不该出现在界面上。 */
     const jbase=baseSlug(j.slug), jmodel=j.model||slugModel(j.slug);
@@ -958,11 +1196,17 @@ function renderJobs(){
       +'<span class="tag mode">'+(j.mode==='custom'?'custom target':'fence')+'</span></div>';
     if(failed){
       h+='<div class="js e">'+(j.cancelled?'Cancelled':'failed: '+esc(j.error||'Unknown error'))+'</div>';
+    }else if(partial){
+      h+='<div class="js w">Completed with issues; available results are ready to view.</div>';
+      if(j.detail)h+='<div class="js">'+esc(j.detail)+'</div>';
     }else{
       h+='<div class="js">'+esc(STAGE_CN[j.stage]||j.stage||'Processing')
-        +(pagey?' · '+(j.stage_done||0)+'/'+j.stage_total+'  sheets':'')+'</div>';
+        +(stageProgress?' · '+stageProgress:'')+'</div>';
+      if(j.detail)h+='<div class="js">'+esc(j.detail)+'</div>';
+      const heartbeat=jobHeartbeat(j);
+      if(heartbeat)h+='<div class="js">'+esc(heartbeat)+'</div>';
     }
-    for(const w of (j.warnings||[]))h+='<div class="js e">⚠ '+esc(w)+'</div>';
+    for(const w of (j.warnings||[]))h+='<div class="js '+(partial?'w':'e')+'">⚠ '+esc(w)+'</div>';
     h+='<div class="kv">'
       +'<span>Model calls</span><b>'+(llm.calls||0)+'  calls</b>'
       +'<span>Model time</span><b>'+fmtSec(llm.model_seconds)+'</b>'
@@ -978,29 +1222,83 @@ function renderJobs(){
         +'<div class="jfoot"><span class="pct">'+pct+'%</span>'
         +'<button class="jc"'+(j.cancel_requested?' disabled':'')+'>'
         +(j.cancel_requested?'Cancelling…':'Cancel')+'</button></div>';
-    }else if(failed){
-      h+='<div class="jfoot"><span class="pct"></span><button class="jd">Delete project</button></div>';
+    }else if(partial||failed){
+      h+='<div class="jfoot"><span class="pct"></span>'
+        +'<button class="jr">Retry unresolved sheets</button>'
+        +(failed?'<button class="jd">Delete project</button>':'')+'</div>';
     }
     d.innerHTML=h;
     const c=d.querySelector('.jc'); if(c)c.onclick=()=>cancelJob(j.slug);
+    const r=d.querySelector('.jr'); if(r)r.onclick=()=>retryUnresolved(j.slug,r);
     const x=d.querySelector('.jd'); if(x)x.onclick=()=>delProject(j.slug);
     box.appendChild(d);
   }
 }
-function startPoll(slug){
-  if(POLL[slug])return;
-  const tick=async()=>{
-    const r=await api('/api/job/'+encodeURIComponent(slug));
-    const j=r.body;
-    if(!j||j.error)return;
-    JOBS[slug]=j; renderJobs();
-    if(j.done){
-      clearInterval(POLL[slug]); delete POLL[slug];
-      await loadOverview();
-      if(j.ok&&CUR&&CUR.slug===slug)show(slug,CUR.page);
+const isPolling=slug=>Object.prototype.hasOwnProperty.call(POLL,slug);
+function schedulePoll(delay=2000){
+  if(POLL_TIMER!==null||POLL_INFLIGHT||!Object.keys(POLL).length)return;
+  POLL_TIMER=setTimeout(pollJobsTick,delay);
+}
+function stopPoll(slug){
+  if(isPolling(slug))delete POLL[slug];
+  if(!Object.keys(POLL).length&&POLL_TIMER!==null){
+    clearTimeout(POLL_TIMER); POLL_TIMER=null;
+  }
+}
+async function pollJobsTick(){
+  POLL_TIMER=null;
+  if(POLL_INFLIGHT){schedulePoll();return}
+  /* Capture generations as well as names.  If a project is deleted and the
+     same slug is re-run while this GET is live, its old response must not be
+     allowed to overwrite the new queued job. */
+  const wanted=Object.entries(POLL);
+  if(!wanted.length)return;
+  POLL_INFLIGHT=true;
+  try{
+    const r=await api('/api/jobs');
+    if(!r.ok||!Array.isArray(r.body)){
+      for(const [slug,generation] of wanted){
+        if(POLL[slug]!==generation||!JOBS[slug])continue;
+        JOBS[slug]={...JOBS[slug],detail:'Connection interrupted; retrying…'};
+      }
+      renderJobs();                         // exactly one render per failed tick
+      return;
     }
-  };
-  tick(); POLL[slug]=setInterval(tick,2000);
+    const bySlug=new Map(r.body.filter(j=>j&&j.slug).map(j=>[j.slug,j]));
+    const finished=[];
+    for(const [slug,generation] of wanted){
+      if(POLL[slug]!==generation)continue;   // deleted/restarted while GET was live
+      const j=bySlug.get(slug);
+      /* /api/jobs is the authoritative session list.  A watched slug missing
+         from it is the batch equivalent of the old /api/job/<slug> 404. */
+      if(!j){
+        JOBS[slug]={...(JOBS[slug]||{slug}),done:true,ok:false,stage:'error',
+                    error:'Job status no longer exists on the server'};
+        stopPoll(slug);
+        continue;
+      }
+      JOBS[slug]=j;
+      if(j.done){stopPoll(slug);finished.push(j)}
+    }
+    renderJobs();                            // 30 statuses still produce one DOM rebuild
+    if(finished.length){
+      /* Several jobs may complete between two ticks.  Refresh the gallery
+         once, then reopen at most the one completed project currently shown. */
+      try{await loadOverview()}catch(e){}
+      const j=finished.find(x=>CUR&&CUR.slug===x.slug);
+      if(j&&(j.results_available||j.ok)&&CUR)show(j.slug,CUR.page);
+    }
+  }finally{
+    POLL_INFLIGHT=false;
+    /* Recursive timeout keeps one batch GET in flight at a time.  A slow
+       overview refresh therefore cannot overlap an older/newer status tick. */
+    schedulePoll(2000);
+  }
+}
+function startPoll(slug){
+  if(!slug||isPolling(slug))return;
+  POLL[slug]=++POLL_SEQ;
+  schedulePoll(0);
 }
 async function resumeJobs(){
   const r=await api('/api/jobs');            // 数组，最新的在前
@@ -1015,6 +1313,20 @@ async function cancelJob(slug){
   if(JOBS[slug]){JOBS[slug].cancel_requested=true;renderJobs()}
   await api('/api/cancel/'+encodeURIComponent(slug),{method:'POST'});
 }
+async function retryUnresolved(slug,button){
+  if(button){button.disabled=true;button.textContent='Starting retry…'}
+  const r=await api('/api/rerun/'+encodeURIComponent(slug),
+    {method:'POST',headers:{'Content-Type':'application/json'},
+     body:JSON.stringify({reset:false})});
+  if(!r.ok||!r.body||r.body.error){
+    if(button){button.disabled=false;button.textContent='Retry unresolved sheets'}
+    alert('Retry failed: '+((r.body&&r.body.error)||r.status));return;
+  }
+  JOBS[slug]=r.body.job||{slug,stage:'queued',done:false,ok:false};
+  renderJobs();
+  startPoll(slug);
+  await loadOverview();
+}
 async function delProject(slug){
   /* 一行 = 一个 PDF，所以删除的单位也是整个 PDF：后端会级联删掉它的对比运行，
      否则那些运行会变成画廊里看不见、却还占着盘的孤儿。 */
@@ -1028,7 +1340,7 @@ async function delProject(slug){
   const r=await api('/api/project/'+encodeURIComponent(slug),{method:'DELETE'});
   if(!r.ok||!r.body||r.body.error){alert('Delete failed: '+((r.body&&r.body.error)||r.status));return}
   for(const s of [slug,...sibs.map(x=>x.slug)]){
-    if(POLL[s]){clearInterval(POLL[s]);delete POLL[s]}
+    stopPoll(s);
     delete JOBS[s];
     if(CUR&&CUR.slug===s){CUR=null;PAGE=null;clearViewer('Pick a project on the left')}
   }
@@ -1263,6 +1575,7 @@ function pageList(slug){
 
 /* =============== 打开一页 =============== */
 function clearViewer(msg){
+  if(LT_PAGE_POLL){clearTimeout(LT_PAGE_POLL);LT_PAGE_POLL=null}
   const vp=$('viewport');
   vp.querySelectorAll('svg').forEach(s=>s.remove());
   svg=null; LOOK={}; picked=null; selectedScope=null; selectedRow=null;
@@ -1277,6 +1590,7 @@ function clearViewer(msg){
   updateWorkspaceHeader(); syncThumbSelection(false);
 }
 async function show(slug,page){
+  if(LT_PAGE_POLL){clearTimeout(LT_PAGE_POLL);LT_PAGE_POLL=null}
   const prevSlug=CUR&&CUR.slug;
   CUR={slug,page:Number(page)||1};
   const my=++epoch;
@@ -1308,6 +1622,19 @@ async function show(slug,page){
   build();
   renderList();
   updateWorkspaceHeader(); syncThumbSelection(true);
+  // 调试层开着时，同页自动刷新也要按新的页面代次重新向后端取；build()
+  // 已经清除了旧 key 的节点，不能让用户再手动切一次开关才看到当期结果。
+  if($('tgAll').querySelector('input').checked)ensureAllLinetypes();
+  // 旧签名绝不发布，但也不让用户手动刷新猜什么时候算完。后台 worker
+  // 原子换成当前结果后，这一页会自动重载并立即出现 FENCELINE。
+  if(PAGE&&PAGE.record&&PAGE.record.linetypes_status
+      &&PAGE.record.linetypes_status.state==='updating'){
+    const waitSlug=CUR.slug,waitPage=CUR.page;
+    LT_PAGE_POLL=setTimeout(()=>{
+      LT_PAGE_POLL=null;
+      if(CUR&&CUR.slug===waitSlug&&CUR.page===waitPage)show(waitSlug,waitPage);
+    },5000);
+  }
 }
 /* 翻页按钮去掉了 —— 换页走 sheets 预览。step() 留着：键盘左右方向键还在用。 */
 function step(dir){
@@ -1353,6 +1680,7 @@ const LT_STATE={
   'no-arrows':['No terminals','the arrow layer is stale or this sheet has no terminals — nothing to bind to','off'],
   'not-run':['not run','it should have run but has no result — the job may not have reached this sheet','warn'],
   failed:['failed','the line-type sidecar failed — see the note','bad'],
+  updating:['Updating','the old result is not shown; the current line-type engine is refreshing this sheet','warn'],
   stale:['stale','results exist on disk but the signature/version does not match, so the page does not show them','warn'],
   'hidden-no-plan':['No  plan','computed, but this sheet has no plan view box, so the display gate hides everything','off'],
   'hidden-outside-plan':['Terminals outside plan','computed, but no terminal falls inside a plan (normal for detail sheets)','off'],
@@ -1624,9 +1952,9 @@ function build(){
     // 拖拽结束时浏览器会补发一次 click —— 那不是选择动作，吃掉它。
     if(PANNED){PANNED=false;return}
     const sid=e.target&&e.target.dataset?e.target.dataset.scope:null;
-    // 点另一个 callout 才允许换，并且**沿用当前的 withLines** —— 不传的话
-    // LT_LINES_ON 会被置回 false，从 FENCELINE 选出来的线型高亮一点就没。
-    if(sid){selectScope(sid,false,LT_LINES_ON);return}
+    // 任何带 scope 的文字框 / 引线 / 箭头都走同一条选择语义：有当期绑定就
+    // 自动聚焦对应线型；gate / residual 没有绑定，自然不会聚焦任何线。
+    if(sid){selectScope(sid,false);return}
     const k=e.target&&e.target.dataset?e.target.dataset.k:null;
     // 已经选中某个 callout 时，点图上别的东西一律不动它 —— pick() 会
     // clearScopeSelection()，那就违反了「不切换 callout 就保持不变」。
@@ -1640,9 +1968,11 @@ function build(){
   $('hint').style.display='none';
   // 调试层的几何在 ALL_LT 里缓存着，build() 会清空 svg，所以要重画一遍。
   // 翻页后 key 不同 —— 那时作废，绝不能把上一页的几何画到这一页上。
-  if(ALL_LT&&ALL_LT_KEY!==allKey()){ALL_LT=null;ALL_LT_STATE='idle';ALL_FOCUS=null}
+  if(ALL_LT_KEY&&ALL_LT_KEY!==allKey()){
+    ALL_LT=null;ALL_LT_KEY='';ALL_LT_STATE='idle';ALL_LT_DETAIL='';ALL_FOCUS=null;
+  }
   drawAllLinetypes();
-  if(selectedScope)selectScope(selectedScope,false,LT_LINES_ON);
+  if(selectedScope)selectScope(selectedScope,false,selectedRow);
 }
 const LAYERS=[['tgTxt',['gUni','gVlm','gAdd','gCov']],['tgSym',['gSym']],
               ['tgPlc',['gPlc']],['tgPlan',['gPlan']],['tgGrp',['gGrp']],
@@ -1674,16 +2004,14 @@ for(const [tg] of LAYERS){
 }
 
 /* =============== 选中 / 详情 =============== */
-function selectScope(id,fly,withLines,rowKey){
-  // withLines 只由 FENCELINE 那一节的行传 true；图上点框传当前的 LT_LINES_ON。
-  //
-  // **必须先折成真布尔**：classList.toggle 的第二参传 undefined 等同「没传」，
-  // 语义会从「置位」退化成「翻转」。FENCE TEXT & GATES 的行调用时不传第三参，
-  // 于是下面那圈 lt-focus/lt-dim 会把全部线型原地反转 —— 上一个选中的那条
-  // 隐身、其余全部加粗亮起，看起来就是「两个 callout 的高亮并存」。
-  withLines=!!withLines;
+function selectScope(id,fly,rowKey){
   const g=SCOPE_GROUPS.find(x=>x.id===id);
   if(!g||!svg)return;
+  // 是否聚焦线型只看**当前后端绑定**。同一个 callout 在两个分节各有一行，
+  // 或从图上的文字 / 引线 / 箭头进入，都必须得到同一个答案；gate、residual、
+  // plan 外目标没有 numberByScope 条目，因而 fail-closed 地不聚焦任何线。
+  const ltNumber=LT_INDEX.numberByScope.get(id);
+  const withLines=ltNumber!=null;
   selectedScope=id;
   /* 没传 rowKey（从图上点框进来）时退回"第一个匹配这个 scope 的行"，保证图上
      点选也总有且只有一行亮，而不是一行都不亮。 */
@@ -1692,9 +2020,7 @@ function selectScope(id,fly,withLines,rowKey){
   const need=['tgTxt','tgArw'];
   if(g.symbols.length)need.push('tgSym');
   if(g.placements.length)need.push('tgPlc');
-  const ltNumber=LT_INDEX.numberByScope.get(id);
-  LT_LINES_ON=!!withLines;
-  if(withLines&&ltNumber!=null)need.push('tgLt');
+  if(withLines)need.push('tgLt');
   for(const tg of need){
     const input=$(tg).querySelector('input'); input.checked=true; $(tg).classList.remove('off');
   }
@@ -1713,13 +2039,9 @@ function selectScope(id,fly,withLines,rowKey){
     const on=n.dataset.row===selectedRow;
     n.classList.toggle('on',on); n.setAttribute('aria-pressed',String(on));
   });
-  // 这个 callout 对应的线型加重，其余线型压暗。颜色本来就是 scope 的颜色，
-  // 所以「引线 / 箭头 / 线」三样在选中时是同一个色。
-  // 压暗的判据是「**有没有选中 scope**」，不是「这次选中带不带线」。
-  // 写成 withLines&&!on 的话，点 FENCE TEXT & GATES 的行（不传 withLines）
-  // 会把 lt-dim 一并移除，所有线型回到默认的正常显示 —— 上一个 FENCELINE
-  // 选中的那条线还在图上，看起来就是两个 callout 的高亮并存。
-  // selectScope 一被调用就必然有选中项，所以这里恒该压暗非目标线型。
+  // 有绑定时只加重这个 callout 对应的线型，其余全部隐藏。没有绑定时（gate /
+  // residual / plan 外）全部隐藏，绝不让上一个 callout 的线型焦点残留。
+  // 颜色本来就是 scope 的颜色，所以「引线 / 箭头 / 线」三样在选中时一致。
   for(const [number,nodes] of LT_NODES){
     const on=withLines&&(number===ltNumber);
     for(const n of nodes){
@@ -1758,7 +2080,7 @@ function selectScope(id,fly,withLines,rowKey){
   }
 }
 function clearScopeSelection(){
-  selectedScope=null; selectedRow=null; LT_LINES_ON=false;
+  selectedScope=null; selectedRow=null;
   if(svg)svg.querySelectorAll('[data-scope]').forEach(n=>{
     n.classList.remove('scope-focus','scope-dim');
   });
@@ -1772,7 +2094,7 @@ function clearScopeSelection(){
 }
 function pick(key,fly){
   const e=LOOK[key]; if(!e)return;
-  if(e.scopeId){selectScope(e.scopeId,fly,LT_LINES_ON);return}
+  if(e.scopeId){selectScope(e.scopeId,fly);return}
   clearScopeSelection();
   if(picked&&LOOK[picked])LOOK[picked].rect.classList.remove('pick');
   picked=key; e.rect.classList.add('pick');
@@ -1816,7 +2138,10 @@ let ALL_FOCUS=null;            // 当前聚焦的线型编号
 let ALL_FILTER='';
 
 function allKey(){
-  return (CUR&&CUR.slug?CUR.slug:'')+'|'+((PAGE&&PAGE.page)||'');
+  // epoch 是一次 /api/page 装载的代次。同一 slug/page 后台从 updating
+  // 切到 current 时也必须换 key；否则此前加载的调试几何会跨代次重画，
+  // 绕过后端的签名发布闸。
+  return (CUR&&CUR.slug?CUR.slug:'')+'|'+((PAGE&&PAGE.page)||'')+'|'+epoch;
 }
 // 编号 -> 稳定颜色。黄金角散布，相邻编号不会撞色；同一页刷新颜色不变。
 function alColor(n){
@@ -2078,7 +2403,7 @@ function renderList(){
         +'<span class="scope-text">'+esc(g.text)+'</span><span class="scope-meta">'
         +esc(meta.join(' · '))+'</span></span><span class="scope-n">'+g.calloutCount+'</span>';
       b.classList.toggle('on',selectedRow===b.dataset.row);
-      b.onclick=()=>selectScope(g.id,true,false,b.dataset.row);
+      b.onclick=()=>selectScope(g.id,true,b.dataset.row);
       box.appendChild(b);
     }
   };
@@ -2112,7 +2437,7 @@ function renderList(){
         +esc(meta.join(' · '))+'</span></span><span class="scope-n">#'
         +row.number+'</span>';
       b.classList.toggle('on',selectedRow===b.dataset.row);
-      b.onclick=()=>selectScope(row.scopeId,true,true,b.dataset.row);
+      b.onclick=()=>selectScope(row.scopeId,true,b.dataset.row);
       box.appendChild(b);
     }
     for(const row of LT_INDEX.orphans){
@@ -2142,6 +2467,16 @@ function setScale(s,cx,cy){
   vp.scrollLeft=ix*scale-ax; vp.scrollTop=iy*scale-ay;
 
 }
+/* 浏览器会把鼠标滚轮、触控板分别报成像素/行/页。按实际 delta 平滑缩放，
+   避免触控板的每个微小事件都触发一次固定 18% 跳变。 */
+const WHEEL_ZOOM_SENSITIVITY=.00075;
+function wheelZoomFactor(e){
+  let dy=Number(e&&e.deltaY)||0;
+  if(e&&e.deltaMode===1)dy*=16;
+  else if(e&&e.deltaMode===2)dy*=Math.max(200,$('viewport').clientHeight||800);
+  dy=Math.max(-100,Math.min(100,dy));
+  return Math.exp(-dy*WHEEL_ZOOM_SENSITIVITY);
+}
 /* 缩放控件全部去掉了。复位靠双击画布 —— 滚轮能放大缩小，但没有任何复位入口
    会很难用，而这是唯一不占顶栏空间的做法。 */
 $('viewport').ondblclick=()=>{
@@ -2152,7 +2487,7 @@ $('viewport').ondblclick=()=>{
 $('viewport').addEventListener('wheel',e=>{
   if(!PAGE)return;
   e.preventDefault();
-  setScale(scale*(e.deltaY<0?1.18:1/1.18),e.clientX,e.clientY);
+  setScale(scale*wheelZoomFactor(e),e.clientX,e.clientY);
 },{passive:false});
 (()=>{   // 拖拽平移；移动阈值以内仍然算点击
   const vp=$('viewport'); let st=null;

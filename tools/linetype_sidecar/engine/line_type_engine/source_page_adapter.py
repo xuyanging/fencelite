@@ -49,7 +49,7 @@ from .source_content import (
 
 
 SOURCE_PAGE_ADAPTER_VERSION = (
-    "source-aligned-page-ir-r10-source-text-image-style-2026-08-24"
+    "source-aligned-page-ir-r11-coalesced-render2-runs-2026-08-29"
 )
 SOURCE_ALIGNMENT_AUDIT_SCHEMA_VERSION = 4
 SOURCE_ALIGNED_PAGE_IR_PRODUCER = (
@@ -486,11 +486,14 @@ def _aligned_text_operations(
 ) -> tuple[tuple[TextOperationIR, ...], int, int, int, int, int]:
     """Join authored shows to the MuPDF glyph trace without changing identity.
 
-    MuPDF exposes render mode 2 as two adjacent, geometrically identical mode
-    0/1 traces.  The frozen Scene has one authored text paint, so that pair is
-    consumed and collapsed.  Fully clipped shows and render mode 3 are also
-    consumed from the trace but deliberately do not emit PageIR operations.
-    Every other unexplained cardinality or style difference fails closed.
+    MuPDF exposes render mode 2 as geometrically identical mode 0/1 traces.
+    Usually one source show becomes one adjacent fill/stroke pair.  It may also
+    coalesce consecutive shows in one text object into a whole fill run followed
+    by the matching whole stroke run.  Both forms are consumed only after every
+    source slice and every duplicate glyph have been joined exactly.  Fully
+    clipped shows and render mode 3 are also consumed from the trace but
+    deliberately do not emit PageIR operations.  Every other unexplained
+    cardinality or style difference fails closed.
     """
 
     trace_spans = tuple(span for span in base_texts if span.characters)
@@ -505,7 +508,9 @@ def _aligned_text_operations(
     mixed_style_count = 0
     collapsed_duplicate_glyph_count = 0
     consumed_hidden_glyph_count = 0
-    for event in source_events:
+    event_index = 0
+    while event_index < len(source_events):
+        event = source_events[event_index]
         if event.glyph_count <= 0:
             raise SourceAlignmentError(
                 f"source text show {event.text_show_ordinal} has no joinable glyphs"
@@ -525,20 +530,52 @@ def _aligned_text_operations(
                 f"trace {_literal(tuple(record.character for record in records))!r}"
             )
         cursor = end
+        joined_events = [(event, records)]
+        next_event_index = event_index + 1
 
         # MuPDF traces PDF render mode 2 as a fill pass followed by a stroke
-        # pass, while the authored/frozen Scene retains one operation.
+        # pass, while the authored/frozen Scene retains one operation.  A
+        # display span may coalesce several consecutive source shows: in that
+        # case its ordering is all fills, then all strokes, rather than an
+        # adjacent pair per show.  Extend the fill run only across source shows
+        # whose exact text slices are present as mode-0 trace glyphs.  The
+        # equally sized mode-1 run below must then duplicate every glyph exactly
+        # or alignment still fails closed.
         if event.render_mode == 2 and all(
             record.span.render_mode == 0 for record in records
         ):
-            duplicate_end = cursor + event.glyph_count
+            while next_event_index < len(source_events):
+                candidate = source_events[next_event_index]
+                if candidate.render_mode != 2 or candidate.glyph_count <= 0:
+                    break
+                candidate_end = cursor + candidate.glyph_count
+                candidate_records = trace[cursor:candidate_end]
+                if (
+                    len(candidate_records) != candidate.glyph_count
+                    or not all(
+                        record.span.render_mode == 0
+                        for record in candidate_records
+                    )
+                    or not _trace_text_matches_source(candidate, candidate_records)
+                ):
+                    break
+                joined_events.append((candidate, candidate_records))
+                cursor = candidate_end
+                next_event_index += 1
+
+            fill_records = tuple(
+                record
+                for _joined_event, joined_records in joined_events
+                for record in joined_records
+            )
+            duplicate_end = cursor + len(fill_records)
             duplicates = trace[cursor:duplicate_end]
             if (
-                len(duplicates) != event.glyph_count
+                len(duplicates) != len(fill_records)
                 or not all(record.span.render_mode == 1 for record in duplicates)
                 or not all(
                     _same_trace_glyph(left, right)
-                    for left, right in zip(records, duplicates)
+                    for left, right in zip(fill_records, duplicates)
                 )
             ):
                 raise SourceAlignmentError(
@@ -546,7 +583,7 @@ def _aligned_text_operations(
                     f"show {event.text_show_ordinal}"
                 )
             cursor = duplicate_end
-            collapsed_duplicate_glyph_count += event.glyph_count
+            collapsed_duplicate_glyph_count += len(fill_records)
         elif any(record.span.render_mode != event.render_mode for record in records):
             modes = sorted({record.span.render_mode for record in records})
             raise SourceAlignmentError(
@@ -554,68 +591,73 @@ def _aligned_text_operations(
                 f"{event.text_show_ordinal}: {event.render_mode} vs {modes}"
             )
 
-        if not event.visible:
-            consumed_hidden_glyph_count += event.glyph_count
-            continue
+        for joined_event, joined_records in joined_events:
+            if not joined_event.visible:
+                consumed_hidden_glyph_count += joined_event.glyph_count
+                continue
 
-        styles = {_text_style_key(record.span) for record in records}
-        if len(styles) != 1:
-            mixed_style_count += 1
-            raise SourceAlignmentError(
-                "one source text show crosses incompatible PyMuPDF trace styles: "
-                f"show {event.text_show_ordinal}, {len(styles)} styles"
-            )
-        first = records[0].span
-        characters = tuple(record.character for record in records)
-        if event.paint_order is None:
-            raise SourceAlignmentError("visible source text show has no paint order")
-        if event.visible_bounds is None:
-            raise SourceAlignmentError(
-                f"visible source text show {event.text_show_ordinal} has no source bounds"
-            )
-        ordinal = len(aligned)
-        aligned.append(TextOperationIR(
-            operation_id=f"text:{ordinal:08d}",
-            paint_order=event.paint_order,
-            ordinal=ordinal,
-            span_index=first.span_index,
-            # Geometry comes from the authored text matrix/font widths and the
-            # frozen Scene ascent/descent envelope.  PyMuPDF remains the
-            # glyph/style trace, but its font-engine bbox is not the grouping
-            # contract and can drift across the exact split threshold.
-            bounds=event.visible_bounds,
-            literal_text=event.decoded_text,
-            characters=characters,
-            font_name=first.font_name,
-            font_size=first.font_size,
-            direction=first.direction,
-            render_mode=event.render_mode,
-            color=first.color,
-            opacity=first.opacity,
-            line_width=first.line_width,
-            writing_mode=first.writing_mode,
-            flags=first.flags,
-            bidi_level=first.bidi_level,
-            bidi_direction=first.bidi_direction,
-            layer=first.layer,
-            structure_before=event.structure_before,
-            content_stream_index=event.location.page_content_stream_index,
-            form_instance_path=event.location.form_instance_path,
-            source_provenance_exact=True,
-            source_font_name=event.font_resource_name,
-            source_font_size=max(0.1, abs(event.font_size)),
-            source_matrix=event.text_matrix,
-            source_glyph_advance=max(0.001, abs(event.glyph_advance)),
-            source_horizontal_scale=event.horizontal_scale,
-            source_rise=event.rise,
-            source_unclipped_bounds=_source_text_unclipped_bounds(event),
-            source_fill_color=event.fill_color,
-            source_stroke_color=event.stroke_color,
-            source_fill_opacity=event.fill_opacity,
-            source_stroke_opacity=event.stroke_opacity,
-            source_line_width=max(0.25, event.line_width),
-            source_blend_mode=event.blend_mode,
-        ))
+            styles = {_text_style_key(record.span) for record in joined_records}
+            if len(styles) != 1:
+                mixed_style_count += 1
+                raise SourceAlignmentError(
+                    "one source text show crosses incompatible PyMuPDF trace styles: "
+                    f"show {joined_event.text_show_ordinal}, {len(styles)} styles"
+                )
+            first = joined_records[0].span
+            characters = tuple(record.character for record in joined_records)
+            if joined_event.paint_order is None:
+                raise SourceAlignmentError("visible source text show has no paint order")
+            if joined_event.visible_bounds is None:
+                raise SourceAlignmentError(
+                    f"visible source text show {joined_event.text_show_ordinal} "
+                    "has no source bounds"
+                )
+            ordinal = len(aligned)
+            aligned.append(TextOperationIR(
+                operation_id=f"text:{ordinal:08d}",
+                paint_order=joined_event.paint_order,
+                ordinal=ordinal,
+                span_index=first.span_index,
+                # Geometry comes from the authored text matrix/font widths and
+                # the frozen Scene ascent/descent envelope.  PyMuPDF remains
+                # the glyph/style trace, but its font-engine bbox is not the
+                # grouping contract and can drift across the exact split threshold.
+                bounds=joined_event.visible_bounds,
+                literal_text=joined_event.decoded_text,
+                characters=characters,
+                font_name=first.font_name,
+                font_size=first.font_size,
+                direction=first.direction,
+                render_mode=joined_event.render_mode,
+                color=first.color,
+                opacity=first.opacity,
+                line_width=first.line_width,
+                writing_mode=first.writing_mode,
+                flags=first.flags,
+                bidi_level=first.bidi_level,
+                bidi_direction=first.bidi_direction,
+                layer=first.layer,
+                structure_before=joined_event.structure_before,
+                content_stream_index=(
+                    joined_event.location.page_content_stream_index
+                ),
+                form_instance_path=joined_event.location.form_instance_path,
+                source_provenance_exact=True,
+                source_font_name=joined_event.font_resource_name,
+                source_font_size=max(0.1, abs(joined_event.font_size)),
+                source_matrix=joined_event.text_matrix,
+                source_glyph_advance=max(0.001, abs(joined_event.glyph_advance)),
+                source_horizontal_scale=joined_event.horizontal_scale,
+                source_rise=joined_event.rise,
+                source_unclipped_bounds=_source_text_unclipped_bounds(joined_event),
+                source_fill_color=joined_event.fill_color,
+                source_stroke_color=joined_event.stroke_color,
+                source_fill_opacity=joined_event.fill_opacity,
+                source_stroke_opacity=joined_event.stroke_opacity,
+                source_line_width=max(0.25, joined_event.line_width),
+                source_blend_mode=joined_event.blend_mode,
+            ))
+        event_index = next_event_index
     if cursor != len(trace):
         raise SourceAlignmentError(
             "PyMuPDF text trace remains after strict source-event join: "

@@ -21,6 +21,9 @@ Run:  venv\\Scripts\\python.exe webapp.py   →  http://127.0.0.1:5060/
 """
 import os
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -34,10 +37,11 @@ import job
 from core.config import BASE_DIR, MODEL_NAME, PRICING
 from core.pdfio import render_pdf_page
 from steps import arrows, linetypes, store
+from steps.linetypes import refresh_state as linetype_refresh_state
 from steps.placements import has_current_placements
 from steps.symbols import (has_current_symbols, marker_code_indices,
                           symbols_dropped_view)
-from steps.text.target import TARGET_DEFAULT
+from steps.text.target import TARGET_DEFAULT, is_default_target
 from steps.versions import FUSED_VERSION
 from steps.views import (groups_need_classification, has_current_view_types,
                          merge_view_types, plan_boxes)
@@ -258,7 +262,7 @@ def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
       no-arrows           箭头层不当期，或这页没有任何末端 —— 没有可绑的对象
       not-run             该跑却没有结果条目
       failed              边车算失败，detail 里有原因
-      stale               有结果但签名/版本不当期，页面不会显示它
+      updating            结果缺失或签名/版本不当期，后台正排队重算当前版本
       hidden-no-plan      算过了，但这页没有 plan 框 → 一条都不显示
       hidden-outside-plan 有 plan 框，但没有末端落在里面（详图页的常态）
       all-gate            这页的 callout 全是 gate —— gate 不找线，不是失败
@@ -288,14 +292,32 @@ def _attach_linetypes(record, slug, page, items, revision, plan_regions=None):
         return
     sig = linetypes.linetypes_signature(arrows_sig)
     entry = linetypes.load_page(slug, page)
-    if isinstance(entry, dict) and entry.get("error"):
+    # Signature mismatch is never publishable, including an error produced by
+    # an older engine.  The low-priority refresh worker will replace it
+    # atomically; keep text/arrows visible and tell the browser to poll instead
+    # of silently presenting an empty FENCELINE section.
+    signature_matches = bool(
+        isinstance(entry, dict) and entry.get("sig") == sig)
+    retry_with_larger_budget = bool(
+        signature_matches and entry.get("error")
+        and job._linetype_failure_budget_increased(
+            slug, page, arrow_entry, entry.get("error")))
+    if signature_matches and entry.get("error") \
+            and not retry_with_larger_budget:
         record["linetypes_status"] = {"state": "failed",
                                      "detail": str(entry["error"])[:200]}
         return
-    if not linetypes.has_current_linetypes(entry, sig):
+    if (not signature_matches
+            or not linetypes.has_current_linetypes(entry, sig)):
+        refresh = linetype_refresh_state.page_refresh_status(slug, page)
+        detail = {
+            "running": "Current line-type engine is refreshing this sheet",
+            "waiting": "Queued; a foreground upload/rerun has priority",
+            "queued": "Queued for the current line-type engine",
+        }.get(refresh, "Queued for the next automatic line-type refresh scan")
         record["linetypes_status"] = {
-            "state": "stale" if entry is not None else "not-run",
-            "targets": len(anchors)}
+            "state": "updating", "refresh": refresh or "queued",
+            "detail": detail, "targets": len(anchors)}
         return
 
     owners = linetypes.symbol_owners_of(
@@ -604,7 +626,10 @@ def jobs():
 def job_status(slug):
     if not store.is_valid_slug(slug):
         return jsonify({"error": "bad slug"}), 400
-    return jsonify(job.get_job(slug))
+    status = job.get_job(slug)
+    if status is None:
+        return jsonify({"error": "job not found"}), 404
+    return jsonify(status)
 
 
 @app.route("/api/cancel/<slug>", methods=["POST"])
@@ -616,9 +641,215 @@ def cancel_job(slug):
         return jsonify({"error": "cross-site write rejected"}), 403
     if not store.is_valid_slug(slug):
         return jsonify({"error": "bad slug"}), 400
+    if job.get_job(slug) is None:
+        return jsonify({"error": "job not found"}), 404
     result = job.request_cancel(slug)
     return jsonify({"ok": True, "was_running": bool(result.get("was_running")),
                     "job": result.get("job")})
+
+
+_UPLOAD_TOKEN_LOCKS = {}
+_UPLOAD_TOKEN_LOCKS_GUARD = threading.Lock()
+
+
+def _valid_upload_token(token):
+    """A browser-generated opaque id used only as a safe path component."""
+    return (16 <= len(token) <= 128
+            and all(c.isalnum() or c in "-_" for c in token))
+
+
+def _upload_token_path(token):
+    return store.JOBS_DIR / ".upload-tokens" / f"{token}.json"
+
+
+def _upload_token_lock_path(token):
+    return store.JOBS_DIR / ".upload-tokens" / f"{token}.lock"
+
+
+@contextmanager
+def _upload_token_lock(token):
+    """Serialize one idempotency key across threads and gunicorn workers.
+
+    The lock file is stable and is never unlinked, so stale-marker recovery
+    cannot suffer an unlink/recreate ABA race.  ``flock`` is released by the
+    kernel on process death; the in-process mutex is the portable fallback.
+    """
+    lock_path = _upload_token_lock_path(token)
+    key = str(lock_path.absolute())
+    with _UPLOAD_TOKEN_LOCKS_GUARD:
+        local_lock = _UPLOAD_TOKEN_LOCKS.setdefault(key, threading.Lock())
+    with local_lock:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as handle:
+            try:
+                import fcntl                                  # noqa: PLC0415
+            except ImportError:
+                yield
+                return
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _fsync_upload_token_dir(path):
+    """Make marker create/replace/unlink durable across a machine crash."""
+    fd = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(path.parent, flags)
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _save_upload_token(path, payload):
+    store.save_json(path, payload)
+    _fsync_upload_token_dir(path)
+
+
+def _release_upload_token(path):
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        return
+    _fsync_upload_token_dir(path)
+
+
+def _upload_target_identity(target):
+    return "" if is_default_target(target) else (target or "").strip()
+
+
+def _upload_request_identity(filename, size, target):
+    clean_name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return {"filename": clean_name, "size": int(size),
+            "target": _upload_target_identity(target)}
+
+
+def _token_project(marker):
+    """Return ``(slug, status)`` only while marker still owns that PDF."""
+    slug = marker.get("slug") if isinstance(marker, dict) else None
+    if not isinstance(slug, str) or not store.is_valid_slug(slug):
+        return None, None
+    pdf = store.pdf_path(slug)
+    try:
+        current = pdf.exists() and store.pdf_revision(pdf)
+    except OSError:
+        current = None
+    if not current or current != marker.get("pdf_revision"):
+        return None, None
+    status = (job.get_job(slug)
+              or store.load_json(store.JOBS_DIR / f"{slug}.json", None)
+              or marker.get("job"))
+    return slug, status if isinstance(status, dict) else None
+
+
+def _finish_upload_marker(path, token, identity, slug, target, status):
+    revision = store.pdf_revision(store.pdf_path(slug))
+    _save_upload_token(path, {
+        "token": token, "state": "started", "request": identity,
+        "slug": slug, "pdf_revision": revision, "target": target,
+        "job": status, "updated_at": time.time(),
+    })
+
+
+def _replay_or_recover_upload(path, token, identity, target):
+    """Return a prior/recovered response, or None to create a fresh project.
+
+    Caller holds ``_upload_token_lock(token)``.  Therefore a ``created``
+    marker with no job can only be residue from a dead owner and is safe to
+    resume exactly once.
+    """
+    marker = store.load_json(path, None)
+    if not isinstance(marker, dict):
+        _release_upload_token(path)
+        return None
+    previous_identity = marker.get("request")
+    if previous_identity != identity:
+        return ({"error": "upload token was already used for a different "
+                           "filename, file size, or detection target"}, 409)
+    slug, status = _token_project(marker)
+    if slug and status:
+        try:
+            _finish_upload_marker(path, token, identity, slug, target, status)
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[upload] could not refresh token {token}: {exc}", flush=True)
+        return ({"slug": slug, "job": status, "deduplicated": True}, 200)
+    if slug and marker.get("state") == "created":
+        # Source PDF was committed but the former process died before its
+        # worker was registered.  Recover in place; never upload/pay twice.
+        try:
+            status = job.start_job(slug, target=target)
+        except job.JobStartError as exc:
+            try:
+                job.delete_project(slug, cascade=False)
+            except Exception:                                 # noqa: BLE001
+                pass
+            _release_upload_token(path)
+            return ({"error": f"{type(exc).__name__}: {exc}"}, 500)
+        except Exception as exc:                              # noqa: BLE001
+            return ({"error": f"{type(exc).__name__}: {exc}"}, 500)
+        try:
+            _finish_upload_marker(path, token, identity, slug, target, status)
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[upload] could not finalize recovered token {token}: {exc}",
+                  flush=True)
+        return ({"slug": slug, "job": status, "deduplicated": True,
+                 "recovered": True}, 200)
+    # A stable lock proves no live request still owns a receiving marker.
+    # A missing/replaced PDF similarly means this token no longer owns a job.
+    _release_upload_token(path)
+    return None
+
+
+def _create_uploaded_project(stream, filename, target, token=None,
+                             token_path=None, identity=None):
+    slug = None
+    try:
+        slug = job.create_project_stream(stream, filename)
+        if token_path is not None:
+            revision = store.pdf_revision(store.pdf_path(slug))
+            _save_upload_token(token_path, {
+                "token": token, "state": "created", "request": identity,
+                "slug": slug, "pdf_revision": revision, "target": target,
+                "updated_at": time.time(),
+            })
+    except Exception as exc:                                  # noqa: BLE001
+        if slug:
+            try:
+                job.delete_project(slug, cascade=False)
+            except Exception:                                 # noqa: BLE001
+                pass
+        _release_upload_token(token_path)
+        return ({"error": f"{type(exc).__name__}: {exc}"}, 500)
+    try:
+        status = job.start_job(slug, target=target)
+    except job.JobStartError as exc:
+        try:
+            job.delete_project(slug, cascade=False)
+        except Exception:                                     # noqa: BLE001
+            pass
+        _release_upload_token(token_path)
+        return ({"error": f"{type(exc).__name__}: {exc}"}, 500)
+    except Exception as exc:                                  # noqa: BLE001
+        # Leave the created marker and exact source in place. A retry under
+        # the stable token lock will inspect/recover it without duplicating.
+        return ({"error": f"{type(exc).__name__}: {exc}"}, 500)
+    if token_path is not None:
+        try:
+            _finish_upload_marker(
+                token_path, token, identity, slug, target, status)
+        except Exception as exc:                              # noqa: BLE001
+            # The task is live. Returning success avoids inviting a duplicate;
+            # its created marker can be finalized by any later replay.
+            print(f"[upload] could not finalize token {token}: {exc}", flush=True)
+    return ({"slug": slug, "job": status}, 200)
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -630,16 +861,45 @@ def upload():
     f = request.files.get("pdf")
     if f is None or not f.filename:
         return jsonify({"error": "no PDF uploaded (field 'pdf')"}), 400
-    data = f.read()
-    if not data[:5] == b"%PDF-":
+    stream = f.stream
+    try:
+        header = stream.read(5)
+        stream.seek(0, os.SEEK_END)
+        file_size = stream.tell()
+        stream.seek(0)
+    except (AttributeError, OSError, TypeError):
+        return jsonify({"error": "uploaded PDF stream is not readable"}), 400
+    if header != b"%PDF-":
         return jsonify({"error": "not a PDF file"}), 400
     # editable detection target ("what to find")
     target = request.form.get("target", "")
+    upload_token = request.form.get("upload_token", "").strip()
+    if not upload_token:
+        payload, code = _create_uploaded_project(stream, f.filename, target)
+        return jsonify(payload), code
+    if not _valid_upload_token(upload_token):
+        return jsonify({"error": "invalid upload token"}), 400
+    identity = _upload_request_identity(f.filename, file_size, target)
+    token_path = _upload_token_path(upload_token)
     try:
-        slug = job.create_project(data, f.filename)
-    except Exception as e:                                     # noqa: BLE001
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
-    return jsonify({"slug": slug, "job": job.start_job(slug, target=target)})
+        with _upload_token_lock(upload_token):
+            replay = _replay_or_recover_upload(
+                token_path, upload_token, identity, target)
+            if replay is not None:
+                payload, code = replay
+                return jsonify(payload), code
+            _save_upload_token(token_path, {
+                "token": upload_token, "state": "receiving",
+                "request": identity, "updated_at": time.time(),
+            })
+            payload, code = _create_uploaded_project(
+                stream, f.filename, target, token=upload_token,
+                token_path=token_path, identity=identity)
+            return jsonify(payload), code
+    except Exception as exc:                                  # noqa: BLE001
+        # This catches lock/marker I/O failures before a project can be safely
+        # associated with the token. Never turn them into an HTML 500.
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
 
 @app.route("/api/rerun/<slug>", methods=["POST"])
@@ -658,8 +918,6 @@ def rerun(slug):
         return jsonify({"error": "bad slug"}), 400
     if not store.pdf_path(slug).exists():
         return jsonify({"error": "project not found"}), 404
-    if job.job_running(slug):
-        return jsonify({"error": "this project is in progress"}), 409
     body = request.get_json(silent=True) or {}
     target = body.get("target")
     if target is None:
@@ -674,14 +932,16 @@ def rerun(slug):
         model = job.variant_model(slug)
     if model is not None and model not in PRICING:
         return jsonify({"error": f"unknown model: {model}"}), 400
-    cleared = []
-    if body.get("reset", True):
-        try:
-            cleared = job.reset_project_cache(slug)
-        except Exception as e:                                 # noqa: BLE001
-            return jsonify({"error": f"{type(e).__name__}: {e}"}), 409
+    try:
+        status, cleared = job.restart_job(
+            slug, target=target, model=model,
+            reset=body.get("reset", True))
+    except job.JobStartError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except Exception as exc:                                  # noqa: BLE001
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 409
     return jsonify({"slug": slug, "cleared": cleared, "model": model,
-                    "job": job.start_job(slug, target=target, model=model)})
+                    "job": status})
 
 
 @app.route("/api/models")
@@ -721,23 +981,18 @@ def make_variant(slug):
     model = body.get("model")
     if model not in PRICING:
         return jsonify({"error": f"unknown model: {model}"}), 400
-    try:
-        vslug = job.create_variant(slug, model)
-    except Exception as e:                                     # noqa: BLE001
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 400
-    if job.job_running(vslug):
-        return jsonify({"error": "this comparison run is in progress", "slug": vslug}), 409
     target = body.get("target")
     if target is None:
         target = job.stored_target(slug)   # compare like-for-like
-    # A fresh fork has no cache; an existing one is wiped so the re-run can't
-    # be shaped by an earlier attempt.
     try:
-        job.reset_project_cache(vslug)
-    except Exception:                                          # noqa: BLE001
-        pass
+        vslug, status, cleared = job.start_variant(
+            slug, model, target=target)
+    except job.JobStartError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except Exception as exc:                                  # noqa: BLE001
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 400
     return jsonify({"slug": vslug, "base": slug, "model": model,
-                    "job": job.start_job(vslug, target=target, model=model)})
+                    "cleared": cleared, "job": status})
 
 
 @app.route("/api/project/<slug>", methods=["DELETE"])
@@ -748,6 +1003,8 @@ def delete_project(slug):
         return jsonify({"error": "bad slug"}), 400
     try:
         removed = job.delete_project(slug)
+    except job.JobStartError as exc:
+        return jsonify({"error": str(exc)}), 409
     except Exception as e:                                     # noqa: BLE001
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
     return jsonify({"ok": True, "removed": removed})
@@ -796,6 +1053,22 @@ def page_data(slug, page):
         _, (w, h) = _ensure_base(slug, page)
     except Exception as e:                                  # noqa: BLE001
         return jsonify({"error": f"render failed: {e}"}), 500
+    # A reset=false rerun can begin while the base image is rendering and leave
+    # the previous results.json intact.  Rechecking only that file would then
+    # publish the old overlays during an active run.  Match the entry check and
+    # return the same bare-sheet preview until the new job finishes.
+    if job.job_running(slug):
+        pc = job.page_count_of(slug)
+        if not (1 <= page <= pc):
+            return jsonify({"error": "page not found"}), 404
+        return jsonify({"page": page, "page_count": pc, "mode": "fence",
+                        "w": w, "h": h, "img": f"/img/{slug}/{page}",
+                        "record": _empty_rec(), "items": [],
+                        "symbols": {"groups": [], "symbols": []},
+                        "dropped_symbols": [], "plan_boxes": [],
+                        "counts": {"text": 0, "symbols": 0, "placements": 0,
+                                   "plan_groups": 0},
+                        "processing": True})
     # Re-check after rendering: the PDF or the results cache can be replaced
     # while this request is producing the base image.
     res, stale_reason = _results_state(slug)
@@ -940,8 +1213,8 @@ def img(slug, page):
 
 
 if __name__ == "__main__":
-    # Mark any job interrupted by a previous server stop (never auto-relaunched:
-    # silently re-spending on a big PDF at startup is a surprise bill).
+    # Resume jobs interrupted by a previous server stop from their per-page
+    # identity-checked checkpoints.  Explicit user cancellations stay stopped.
     try:
         job.resume_interrupted()
     except Exception as exc:                                    # noqa: BLE001

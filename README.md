@@ -1,7 +1,8 @@
-# fence_lite —— 图纸上的 fence 文字 + fence 符号
+# fence_lite —— 图纸上的 fence 文字、符号、引线与线型
 
-给几个月后接手的人：这是生产服务 <http://44.226.26.124:5051/> 那套东西的**精简版**。
-只做一件事：上传一份施工图 PDF，把每一页里跟 fence 有关的**文字**和**符号**标出来。
+给几个月后接手的人：这是当前生产服务 <http://18.222.147.166:5051/> 的项目说明。
+上传一份施工图 PDF，把每一页里跟 fence 有关的**文字、符号、callout 引线和末端实际
+指到的线型**标出来。
 
 ## 1. 这个服务干什么
 
@@ -12,27 +13,30 @@
    - `shape` —— 闭合外框里带短码的符号（比如一个六边形里写 `SF-1`）
    - `line`  —— 线型样例（比如一段带叉的虚线）
 4. `shape` 样例 → 在**俯视图（plan）视图**里把全页同款符号都匹配出来（本地矢量几何，
-   零模型成本）；`line` **暂不匹配**，只标出样例本身；
-5. 保留时间 / 费用统计。
+   零模型成本）；
+5. callout / 放置锚 → 本地箭头边车恢复引线与末端；
+6. `line` 样例 → 独立 Python 边车聚类整页矢量线，再按 callout 末端绑定并高亮它实际
+   指到的线型（零模型成本）；同时保留时间 / 费用统计。
 
-最终用户看到的：**所有 fence 文字位置 + fence 相关 symbol 位置（样例框 + plan 视图内的全部放置）**。
+最终用户看到的：**所有 fence 文字位置 + fence 相关 symbol 位置（样例框 + plan 视图内的
+全部放置）+ callout 引线 / 箭头 + 末端实际指到的线型高亮**。
 
-### 和生产 5051 的关系
+### 当前生产代码基线
 
-算法代码是从 `C:\Users\Administrator\fence_takeoff_web`（5051 的本机同版副本）**逐字**
-搬过来的 —— 函数体、阈值、注释都没动，只改了 import 路径、删了砍掉的分支。
-所以「结果为什么是这样」的答案在那边依然有效。
+本轮整理前，本地当前算法源码已与 `18.222.147.166:5051` 远端磁盘版本逐字节校验
+一致；相关源码的修改时间也早于生产 worker 启动时间。本文因此以该 worker 实际
+加载、且生产开关当前会走到的调用链为准，不再把历史 Windows 副本当作实现基线。
 
 砍掉的（不要再找了，代码里一行都没有）：
 
 | 砍掉的东西 | 为什么 |
 |---|---|
-| 步骤4 fenceline 全套（三票定位、联合视觉裁判、representative 同文择优、`callout_selections.json`、`fencelines.json`、Notion 测试集、`/api/rescan`） | 产品只要「文字 + 符号」，不要整条围栏线 |
-| `line` 的整线矢量追踪（`find_fence_vectors` / `char_filter` / trace / 全部 line descriptor 与 sweep 机制） | line 暂不匹配 |
+| 旧参考项目的 fenceline 全套（三票定位、联合视觉裁判、representative 同文择优、`callout_selections.json`、`fencelines.json`、Notion 测试集、`/api/rescan`） | 不再沿用旧的整条围栏线流水线 |
+| 旧 `line` 整线矢量追踪（`find_fence_vectors` / `char_filter` / trace / 全部 line descriptor 与 sweep 机制） | 已由步骤6的独立线型引擎聚类 + callout 末端绑定替代 |
 | `fence_text_scan/` 历史 base 存储 + `primary_rescue` 三级优先 | 新项目只有一个 `vlm.json`，一处真相 |
 | 交互式付费接口 | 所有付费调用只发生在上传作业里，网页端**只读缓存** |
 
-## 2. 一页 PDF 的四步流程
+## 2. 一页 PDF 的六阶段流程
 
 ```
                         projects/<slug>/input.pdf
@@ -80,8 +84,26 @@
    │  输入：PDF 矢量几何 + shape 样例框 + 步骤3 认定的 plan 组框     │
    │  算法：纯本地几何 —— 拿样例框里的闭合形状当模板，在全页矢量里   │
    │        找同款，再用 plan 组框过滤（**fail-closed**：这一页没有  │
-   │        plan 组就一个放置都不留）。line 类直接跳过              │
+   │        plan 组就一个放置都不留）。line 类留给步骤6处理          │
    │  输出：symbols.json 的 result 上加 placements + plc_v          │
+   └──────────────────────────────┬──────────────────────────────┘
+                                  │
+   ┌──────────────────────────────┴──────────────────────────────┐
+   │ 步骤5  箭头 / 引线恢复                                      │  🆓 免费
+   │                                                              │
+   │  输入：PDF 矢量几何 + 文字 / shape 放置锚                     │
+   │  算法：Node 一次性边车恢复引线拓扑和箭头末端，几何兜底补回     │
+   │        边车漏掉的编号标记                                    │
+   │  输出：data/<slug>/arrows.json                               │
+   └──────────────────────────────┬──────────────────────────────┘
+                                  │
+   ┌──────────────────────────────┴──────────────────────────────┐
+   │ 步骤6  线型聚类、末端绑定与高亮                              │  🆓 免费
+   │                                                              │
+   │  输入：PDF 矢量几何 + 步骤5 的 callout 末端和自身笔画          │
+   │  算法：独立 Python venv 的 source-aligned 引擎聚类整页线型；   │
+   │        剔除 callout 自身几何后，以末端最近 path op 归属绑定     │
+   │  输出：data/<slug>/linetypes/<page>.json（一页一个原子缓存）   │
    └──────────────────────────────┬──────────────────────────────┘
                                   │
                         webapp 只读这些 JSON 画层
@@ -97,7 +119,7 @@ fence_lite/
 ├─ run.ps1                借 fence_detector 的 venv 起 webapp（端口 5060）
 ├─ .env                   GEMINI_API_KEY=...（不进 git）
 ├─ webapp.py              Flask：上传 / 画廊 / 单页 JSON / 底图，只读缓存
-├─ job.py                 上传作业编排：四步依次跑，唯一会花钱的地方
+├─ job.py                 上传作业编排：默认 fence 目标六阶段依次跑，唯一会花钱的地方
 ├─ core/
 │  ├─ config.py           env / 模型价目表 / DPI 与像素上限 / compute_cost
 │  ├─ gemini.py           gen_json（全项目唯一 generate_content 出口）+ RECORDER
@@ -120,7 +142,8 @@ fence_lite/
 │  ├─ symbols.py          步骤2：一次推理 + 两条硬闸 + 缓存编排
 │  ├─ views.py            步骤3：视图投影分类（独立付费缓存）
 │  ├─ placements.py       步骤4：本地矢量 shape 匹配 + plan 过滤（免费）
-│  ├─ arrows.py           箭头 / 引线：Node 边车 + 取景 + 回映射（ARROWS=1 打开）
+│  ├─ arrows.py           步骤5：箭头 / 引线 Node 边车 + 取景 + 回映射（免费）
+│  ├─ linetypes/          步骤6：线型边车调用、末端绑定、显示闸与逐页缓存（免费）
 │  └─ leaders.py          放置锚引线的几何兜底（边车漏掉的编号标记，见第 8 节）
 ├─ tools/
 │  ├─ import_project.py   把 5051 已算好的项目搬进来，零花费（见第 5 节）
@@ -167,7 +190,7 @@ python -B tools/import_project.py my_slug --from D:\some\other\fence_takeoff_web
 |---|---|
 | `vlm_extra.json` | `vlm.json`（改名） |
 | `results.json` / `vec.json` / `textjudge.json` / `symbols.json` / `view_types.json` / `vlm_flash.json` | 同名 |
-| `callout_selections.json` / `fencelines.json` | **不搬**（已砍的步骤4） |
+| `callout_selections.json` / `fencelines.json` | **不搬**（已砍的旧 fenceline 流水线） |
 | `base_P*.jpg` | **不搬**（底图按新 revision 自动重生） |
 
 ### 坑：跨机搬项目 pdf_revision 会变
@@ -214,12 +237,13 @@ pdf_revision = f"{size:x}-{mtime_ns:x}"      # steps.store.pdf_revision
 | 常量 | 控制什么 | bump 的代价 |
 |---|---|---|
 | `FUSED_VERSION = 2` | `results.json` 的融合语义（vlm_items / vec_added / vec_covered 三桶口径） | 🆓 免费 —— 从已缓存的 vec / 判词 / VLM raw 重建 |
-| `TEXT_JUDGE_VERSION = 1` | `textjudge.json` 的判词语义（无 `v` 的旧缓存视为 1） | 💰 重判所有字符串（纯文本，最便宜的一档） |
+| `TEXT_JUDGE_VERSION = 2` | `textjudge.json` 的判词语义（无 `v` 的旧缓存视为 1） | 💰 重判所有字符串（纯文本，最便宜的一档） |
 | `SYMBOL_PROMPT_V = 17` | 步骤2 的提示词 / response schema。**改 `steps/prompts.py` 必须同步 bump** | 💰 每页重新推理 |
 | `SYMBOL_VERSION = 19` | 步骤2 的发布过滤 schema（owner 硬闸 + 组内硬闸） | 🆓 只要 `SYMBOL_PROMPT_V` 不变，就是拿已存 raw 免费重过滤 |
 | `VIEW_VERSION = 1` | 步骤3 分类器（taxonomy / 提示词 / 判读策略） | 💰 只重付分类，不动 symbol raw |
 | `PLACEMENT_VERSION = 3` | 步骤4 本地 shape 匹配 + plan 过滤 | 🆓 纯几何，零模型调用 |
-| `steps/arrows.py: ARROWS_VERSION = 10` | 箭头步语义（边车 + `steps/leaders.py` 的几何兜底） | 🆓 本地边车 + 纯几何，零模型调用 |
+| `steps/arrows.py: ARROWS_VERSION = 17` | 步骤5箭头语义（边车 + `steps/leaders.py` 的几何兜底） | 🆓 本地边车 + 纯几何，零模型调用 |
+| `steps/linetypes/version.py: LINETYPE_VERSION = 5` | 步骤6绑定 / 发布语义；签名另含箭头签名、边车源码与依赖摘要 | 🆓 本地边车 + 纯几何；所有项目逐页重算 |
 
 不在这张表里但同样会作废缓存的东西：
 
@@ -252,8 +276,9 @@ venv/bin/python tools/check_rerun_cost.py <slug>
   所有按 `resolve_model(None)` 校验的缓存都读作过期，会用默认模型重新付费
   **并覆盖掉那份对比结果**。`/api/rerun` 现在会自动从 slug 把模型钉回去。
 
-注意 `vlm.json` 的页数**不该**等于总页数：有文字层但没有目标文字的页是故意不扫的
-（`steps/text/page.py` 的 `vlm_needed`），那正是省钱的地方 —— 别把它当成缺页。
+默认准确率模式下，`vlm.json` 和 `vlm_flash.json` 都应有每一页的当期记录。
+页上即使有可提取的标题栏文字，真正的 CAD 标注仍可能是纯描边 path，
+所以不能据此跳过读图。只有显式设 `SCAN_ALL_PAGES=0` 才回到选择性省钱口径。
 
 ## 7. 并发 / 成本旋钮
 
@@ -261,11 +286,23 @@ venv/bin/python tools/check_rerun_cost.py <slug>
 
 | 变量 | 默认 | 干什么 | 调高的风险 |
 |---|---|---|---|
+| `MAX_PARALLEL_JOBS` | 按 CPU/内存推导（本机 2） | 同时处理多少份 PDF；其余保持 queued | 多份大图同时渲染/聚类会抬高内存峰值 |
+| `GEMINI_MAX_CONCURRENCY` | 8 | 所有 PDF、Web/维护进程合计的 Gemini 在途调用上限 | 429 / 配额；必须让所有进程使用同一个值 |
+| `HEAVY_SIDECAR_SLOTS` | 按页级 worker 推导（生产显式 2） | 箭头与线型边车共享的跨进程总槽位 | CPU/内存超订；Web 与 refresh 必须使用同一个值 |
 | `TEXT_WORKERS` | 8 | 步骤1 整页 VLM 扫描，页级并行（线程） | 429 / 配额；每个 worker 都要先渲染一页，而渲染在 `FITZ_LOCK` 里**串行** |
+| `SCAN_ALL_PAGES` | 1 | 每页 Pro + Flash 取并集，避免混合 CAD 页假阴性 | 步骤1调用量增加；设 0 会重新漏掉纯 path 字样 |
 | `VEC_WORKERS` | `min(cpu, 6)` | 矢量文字层抽取，页级并行（**进程**，MuPDF 非线程安全） | 内存（大图纸每页几十 MB）；页数 < `VEC_MIN_PARALLEL`(24) 时自动退回单进程 |
 | `JUDGE_WORKERS` | 4 | 文字判词分块并行（纯网络） | 429；判词是最便宜的一档，没必要拉太高 |
 | `SYMBOLS_WORKERS` | 8 | 步骤2 页级并行 | 429 + `FITZ_LOCK` 渲染串行 |
-| `VIEW_WORKERS` | 6 | 步骤3 页级并行 | 同上（生产里这个变量叫 `VIEW_TYPE_WORKERS`） |
+| `VIEW_WORKERS` | 6 | 步骤3 页级并行 | 同上 |
+| `LINETYPE_PAGE_WORKERS` | 按 CPU 推导（生产显式 2） | 步骤6同时运行多少个单页边车 | 与页内 CPU budget 相乘后超订，且每页几何内存峰值不小 |
+| `LINETYPE_CPU_BUDGET` | 按 CPU 推导（生产前台 4；refresh 2） | 单页边车内部引擎的 worker 预算 | 高于甜点位通常不再提速，还会和其他页抢核 |
+| `LINETYPE_TIMEOUT` | 600 | 普通线型页硬上限（秒） | 过低会丢密页线型 |
+| `LINETYPE_DENSE_TIMEOUT` | 3600 | >=40k vector paths 密页上限 | 过高会让异常密页长时间占队列 |
+
+当前生产前台是 **2 页并发 × 每页 budget 4**；低优先级
+`fence-linetype-refresh.service` 是 **1 页并发 × 每页 budget 2**。两者共享
+`HEAVY_SIDECAR_SLOTS=2`，refresh 发现前台上传 / 重跑时不会再提交新页。
 
 真正的瓶颈通常**不是** Gemini 而是渲染：`core.pdfio.FITZ_LOCK` 是进程级 RLock，
 所有 `fitz` 调用点都必须持它（MuPDF 在同一进程里不是线程安全的，就算各自开
@@ -364,22 +401,15 @@ Sonnet 5 在**结构化列表里的文字**上和 Gemini 3.1 Pro 框得几乎一
 但**平面图里游离的 callout** 会偏 5~8% 页宽（IoU 0.00）。文字本身找得到，位置不准。
 这是工况上的能力差异，不是 adapter 的 bug —— 两种坐标模式都试过了。
 
-## 8. 后续接箭头模块怎么接
+## 8. 箭头与线型模块（步骤5 / 6）
 
-接缝已经留好：`steps/arrows.py`。
+生产已启用 `ARROWS=1` 和 `LINETYPES=1`。`job.py` 在 placements 之后先按页运行
+`steps/arrows.py`，写 `data/<slug>/arrows.json`；线型层随后按页启动
+`tools/linetype_sidecar/run.py`，聚类、绑定后原子写入
+`data/<slug>/linetypes/<page>.json`。两步都是本地计算，不调用模型。
 
-```python
-ENABLED = os.environ.get("ARROWS", "0") not in ("0", "", "false", "no", "off")
-ARROWS_VERSION = 0
-
-def arrows_signature(items, revision) -> str
-def has_current_arrows(entry, sig) -> bool
-def find_page_arrows(pdf_path, page_index, items, *, dbg=None) -> dict
-```
-
-接入只要两步：实现 `find_page_arrows`，然后把 `ENABLED` 置 True（或设 `ARROWS=1`）。
-`job.py` 会自己多跑一个 arrows 阶段写 `data/<slug>/arrows.json`，
-`webapp.py` 的 `/api/page` 原样带上 `record["arrows"]`，前端画层已留好位置。
+线型边车的进程协议是**一进程一页**：stdin 一个 JSON，stdout 一个 JSON；父层用
+`LINETYPE_PAGE_WORKERS` 并发多个页面，并在每页完成后独立校验先决条件与落盘。
 
 **必须遵守的三条契约**（违反就是静默错位，不会报错）：
 
@@ -391,27 +421,25 @@ def find_page_arrows(pdf_path, page_index, items, *, dbg=None) -> dict
    0-1000 闭区间，和文字框 / symbol 框完全同帧。模型只在它看到的那张图里作答，
    **回映射到页面帧是调用方的责任**（裁了图就得自己映回去，见
    `steps/debug.py: px_box_to_page`）。
-3. **返回值只含真的找到箭头的锚**，键是 int 下标。
+3. **返回值只含真的找到箭头的锚**，键是 union index；线型层只会处理这些结果里的
+   有效末端，并先剔除该 callout 自身的引线 / 箭头笔画。
 
-费用不用管：只要你走 `core.gemini.gen_json`（唯一出口），`RECORDER` 自动把调用数 /
-秒数 / token / USD 计进作业统计，不必改任何计量代码。
+箭头和线型的缓存都 fail-closed：签名不当期或计算失败时不发布旧几何；线型失败页会
+保留显式错误并在后续运行或低优先级 refresh 中重试。
 
 ## 9. 已知边界
 
-- **纯扫描件**（没有文字层）。这类页矢量+判词那条免费通道什么都看不到，所以
-  `steps/text/page.py:vlm_needed` 把「本页无文字层」单列成一条付费触发：
-  **默认一定读图**，Pro 扫一遍 + Flash 再扫一遍取并集（`vlm.json` + `vlm_flash.json`），
-  代价是这类 PDF 的步骤1 费用大约翻倍（一页两次调用）。
-  用 `SCAN_NO_TEXT_PAGES=0` 可以关掉，那就退回「只扫矢量命中页」的省钱口径 ——
-  扫描件项目会**静默出空结果**，所以关掉时作业卡片会挂一条 warning 提醒。
-  注意生产 5051 在这一点上是**坏的**：它没有这条触发，缺历史 VLM 记录的扫描件
-  会 0 次读图、结果空页、作业照样报成功（靠单独的 textscan CLI / `POST /api/rescan`
-  人工兜；fence_lite 两者都没有，所以直接在判据里修好了）。
-  另外零遗漏保证在这类页上**不成立** —— 没有矢量文字可兜底，模型漏了就是漏了。
+- **整页视觉仍不是数学上的零漏检**。默认每页都由 Pro 和 Flash 独立读图后取并集
+  （`vlm.json` + `vlm_flash.json`）；主模型失败时 Flash 成功的结果仍会发布。
+  但纯扫描件和纯 path 字样没有可供确定性文字通道兜底，两个模型都漏时仍会漏。
+  `SCAN_ALL_PAGES=0` 保留选择性模式；在该模式下 `SCAN_NO_TEXT_PAGES=0` 还可连扫描页都关掉，
+  这会明确产生 warning，且可能出现空结果。
 - **plan 过滤是 fail-closed**。步骤4 只在 `view_type == "plan"` 的组框内保留放置。
   一页如果没有 plan 组（分类成了 section/detail，或步骤2 压根没给 view 组），
   结果就是**一个放置都不留**，不是「全页都留」。宁可少给，不要给错。
-- **`line` 暂不匹配**。线型样例只标出样例本身，不做全页传播（整线追踪机制已整套砍掉）。
+- **线型按 callout 末端绑定**。本地线型边车先聚类整页矢量线，再用 callout 箭头的
+  末端选择它实际指到的线型；网页只发布当前引擎签名的结果，旧签名会显示为更新中，
+  并由 `fence-linetype-refresh.timer` 低优先级重算，绝不会拿旧几何继续高亮。
 - **空页会被隐藏**。`results.json` 的 `pages` 只包含有 fence 文字的页，页码是稀疏的
   1-based 字符串键；`page_count` 才是 PDF 的真实页数。
 - **`sig_of` 只签 `(text, box_2d)`**。`label` / `tbl` 这类元数据变化**故意**不作废

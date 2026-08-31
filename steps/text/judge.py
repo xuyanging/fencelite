@@ -16,8 +16,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from core.config import resolve_model
-from core.gemini import gen_json
+from core.config import resolve_model, submit_with_context
+from core.gemini import gen_json, should_retry_model_error
 from core.parsing import parse_json_value
 from steps.text.target import TARGET_DEFAULT, build_judge_prompt
 from steps.versions import TEXT_JUDGE_VERSION
@@ -119,18 +119,28 @@ def judge_strings(norm_strings, model=None, chunk=JUDGE_CHUNK, on_progress=None,
                 return cv, getattr(resp, "usage_metadata", None)
             except Exception as e:                          # noqa: BLE001
                 last_err = e
-                if attempt == 2:
+                if not should_retry_model_error(e, attempt, 3):
                     raise RuntimeError(
                         f"judge chunk {ci // chunk} failed: {last_err}") from e
                 time.sleep(15 * (attempt + 1))
 
     lock = threading.Lock()
     done = [0]
+    failures = []
     workers = max(1, min(JUDGE_WORKERS, len(batches)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(run_chunk, ci, batch) for ci, batch in batches]
+        futs = [submit_with_context(ex, run_chunk, ci, batch)
+                for ci, batch in batches]
         for f in as_completed(futs):
-            cv, um = f.result()                 # re-raises a failed chunk
+            try:
+                cv, um = f.result()
+            except Exception as exc:                         # noqa: BLE001
+                # Do not abandon the other paid chunks.  They may already have
+                # succeeded; consuming and checkpointing every future is what
+                # makes a partial provider outage resumable instead of losing
+                # valid verdicts and paying for them again.
+                failures.append(exc)
+                continue
             with lock:
                 verdicts.update(cv)
                 if um:
@@ -143,6 +153,11 @@ def judge_strings(norm_strings, model=None, chunk=JUDGE_CHUNK, on_progress=None,
                 done[0] += len(cv)
                 if on_progress:
                     on_progress(min(done[0], len(strings)), len(strings))
+    if failures:
+        first = failures[0]
+        raise RuntimeError(
+            f"{len(failures)} of {len(batches)} judge chunks failed; "
+            f"first error: {first}") from first
     return verdicts, usage_tot
 
 

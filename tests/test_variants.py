@@ -8,7 +8,7 @@
   2. **删除必须级联**：既然 variant 在界面上没有自己的行，删掉原项目时必须
      连它一起删；漏了就变成看不见、又占着盘、还被 /api/overview 列出来的孤儿。
 
-job.start_job 换成不启线程的记录器，绝不触发真实管线。
+job.restart_job / start_variant 换成不启线程的记录器，绝不触发真实管线。
 """
 import json
 import os
@@ -41,6 +41,10 @@ class VariantTests(unittest.TestCase):
     MODEL = "claude-sonnet-5"
 
     def setUp(self):
+        self._saved_jobs = dict(job.JOBS)
+        self._saved_starting = set(job._STARTING)
+        job.JOBS.clear()
+        job._STARTING.clear()
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.projects = root / "projects"
@@ -70,17 +74,40 @@ class VariantTests(unittest.TestCase):
                 encoding="utf-8")
 
         self.started = []
-        self._real_start = job.start_job
-        job.start_job = lambda slug, target=None, model=None: (
+        self._real_restart = job.restart_job
+        self._real_start_variant = job.start_variant
+
+        def restart(slug, target=None, model=None, *, reset=True):
+            if job.job_running(slug):
+                raise job.JobStartError("this project is already in progress")
+            cleared = job.reset_project_cache(slug) if reset else []
             self.started.append((slug, target, model))
-            or {"slug": slug, "stage": "queued", "model": model})
+            return ({"slug": slug, "stage": "queued", "model": model},
+                    cleared)
+
+        job.restart_job = restart
+
+        def start_variant(base_slug, model, target=None):
+            slug = job.create_variant(base_slug, model)
+            cleared = job.reset_project_cache(slug)
+            self.started.append((slug, target, model))
+            return (slug,
+                    {"slug": slug, "stage": "queued", "model": model},
+                    cleared)
+
+        job.start_variant = start_variant
         self._real_running = job.job_running
         job.job_running = lambda slug: False
         webapp.app.config["TESTING"] = True
         self.client = webapp.app.test_client()
 
     def tearDown(self):
-        job.start_job = self._real_start
+        job.restart_job = self._real_restart
+        job.start_variant = self._real_start_variant
+        job.JOBS.clear()
+        job.JOBS.update(self._saved_jobs)
+        job._STARTING.clear()
+        job._STARTING.update(self._saved_starting)
         job.job_running = self._real_running
         for (mod, name), value in self._saved.items():
             setattr(mod, name, value)
@@ -170,6 +197,19 @@ class VariantTests(unittest.TestCase):
         job.delete_project(v)
         self.assertTrue((self.projects / self.SLUG / "input.pdf").exists())
         self.assertTrue((self.data / self.SLUG / "results.json").exists())
+
+    def test_active_variant_blocks_parent_cascade(self):
+        v = job.create_variant(self.SLUG, self.MODEL)
+        job._claim_job_start(v)
+        try:
+            with self.assertRaises(job.JobStartError):
+                job.delete_project(self.SLUG)
+            response = self.client.delete(f"/api/project/{self.SLUG}")
+            self.assertEqual(response.status_code, 409)
+        finally:
+            job._release_job_start(v)
+        self.assertTrue((self.projects / self.SLUG / "input.pdf").exists())
+        self.assertTrue((self.projects / v / "input.pdf").exists())
 
     # ── /api/variant ──────────────────────────────────────────────────────
     def test_endpoint_starts_the_run_with_the_model_pinned(self):

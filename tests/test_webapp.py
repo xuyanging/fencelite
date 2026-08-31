@@ -15,7 +15,10 @@ import sys
 import tempfile
 import types
 import unittest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -199,6 +202,194 @@ class WebappCase(unittest.TestCase):
 
 
 class UploadGuardTests(WebappCase):
+    def test_valid_upload_uses_streaming_project_writer(self):
+        with mock.patch.object(
+                job_module, "create_project_stream",
+                return_value="streamed") as create, \
+                mock.patch.object(
+                    job_module, "start_job",
+                    return_value={"slug": "streamed", "done": False}):
+            r = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(b"%PDF-1.4 streamed"), "large.pdf")},
+                content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["slug"], "streamed")
+        create.assert_called_once()
+        self.assertEqual(create.call_args.args[1], "large.pdf")
+
+    def test_job_start_failure_removes_orphaned_upload(self):
+        variant = "orphan__legacy_model"
+        (self.dirs["PROJECTS_DIR"] / variant).mkdir()
+        (self.dirs["PROJECTS_DIR"] / variant / "input.pdf").write_bytes(
+            b"%PDF-1.4 historical variant")
+        (self.dirs["DATA_DIR"] / variant).mkdir()
+        (self.dirs["DATA_DIR"] / variant / "keep.json").write_text("{}")
+        with mock.patch.object(
+                job_module.threading.Thread, "start",
+                side_effect=RuntimeError("thread unavailable")):
+            r = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(b"%PDF-1.4 streamed"), "orphan.pdf")},
+                content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 500)
+        self.assertIn("thread unavailable", r.get_json()["error"])
+        self.assertFalse((self.dirs["PROJECTS_DIR"] / "orphan").exists())
+        self.assertFalse((self.dirs["DATA_DIR"] / "orphan").exists())
+        self.assertFalse((self.dirs["JOBS_DIR"] / "orphan.json").exists())
+        self.assertNotIn("orphan", job_module.JOBS)
+        self.assertTrue((self.dirs["PROJECTS_DIR"] / variant / "input.pdf").exists())
+        self.assertTrue((self.dirs["DATA_DIR"] / variant / "keep.json").exists())
+
+    def test_unknown_start_error_does_not_delete_possible_live_project(self):
+        with mock.patch.object(
+                job_module, "start_job",
+                side_effect=RuntimeError("after start uncertainty")):
+            r = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(b"%PDF-1.4 streamed"), "possible_live.pdf")},
+                content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 500)
+        self.assertTrue(
+            (self.dirs["PROJECTS_DIR"] / "possible_live" / "input.pdf").exists())
+
+    def test_upload_token_replays_same_job_without_duplicate_project(self):
+        token = "batchtoken0123456789abcdef"
+        status = {"slug": "idempotent", "stage": "queued", "done": False}
+        with mock.patch.object(job_module, "start_job",
+                               return_value=status) as start:
+            first = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(b"%PDF-1.4 first"), "idempotent.pdf"),
+                "upload_token": token,
+            }, content_type="multipart/form-data")
+            second = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(b"%PDF-1.4 first"), "idempotent.pdf"),
+                "upload_token": token,
+            }, content_type="multipart/form-data")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.get_json()["slug"], first.get_json()["slug"])
+        self.assertTrue(second.get_json()["deduplicated"])
+        start.assert_called_once()
+        self.assertEqual(
+            sorted(p.name for p in self.dirs["PROJECTS_DIR"].iterdir()),
+            ["idempotent"])
+
+    def test_bad_upload_token_rejected_before_project_creation(self):
+        r = self.client.post("/api/upload", data={
+            "pdf": (io.BytesIO(b"%PDF-1.4 streamed"), "bad_token.pdf"),
+            "upload_token": "../bad",
+        }, content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse((self.dirs["PROJECTS_DIR"] / "bad_token").exists())
+
+    def test_upload_token_never_attaches_to_reused_slug(self):
+        token = "reusedslug0123456789abcdef"
+        with mock.patch.object(
+                job_module, "start_job",
+                side_effect=lambda slug, target="": {
+                    "slug": slug, "stage": "queued", "done": False,
+                }) as start:
+            first = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(b"%PDF-1.4 original"), "reused.pdf"),
+                "upload_token": token,
+            }, content_type="multipart/form-data")
+            # Simulate deletion/reuse or replacement of the path after the
+            # original response was lost.  The old token must not claim this
+            # now-different PDF merely because its slug is the same.
+            (self.dirs["PROJECTS_DIR"] / "reused" / "input.pdf").write_bytes(
+                b"%PDF-1.4 different project bytes")
+            second = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(b"%PDF-1.4 original"), "reused.pdf"),
+                "upload_token": token,
+            }, content_type="multipart/form-data")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.get_json()["slug"], "reused_2")
+        self.assertFalse(second.get_json().get("deduplicated", False))
+        self.assertEqual(start.call_count, 2)
+
+    def test_upload_token_rejects_different_detection_target(self):
+        token = "targetbound0123456789abcdef"
+        status = {"slug": "target_bound", "stage": "queued", "done": False}
+        with mock.patch.object(job_module, "start_job",
+                               return_value=status) as start:
+            first = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(b"%PDF-1.4 same"), "target_bound.pdf"),
+                "target": "doors", "upload_token": token,
+            }, content_type="multipart/form-data")
+            second = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(b"%PDF-1.4 same"), "target_bound.pdf"),
+                "target": "trees", "upload_token": token,
+            }, content_type="multipart/form-data")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 409)
+        self.assertIn("different", second.get_json()["error"])
+        start.assert_called_once()
+
+    def test_created_upload_marker_recovers_worker_without_new_project(self):
+        token = "recovercreated0123456789abcdef"
+        payload = b"%PDF-1.4 recover"
+        with mock.patch.object(
+                job_module, "start_job",
+                side_effect=lambda slug, target="": {
+                    "slug": slug, "stage": "queued", "done": False,
+                }) as start:
+            first = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(payload), "recover.pdf"),
+                "upload_token": token,
+            }, content_type="multipart/form-data")
+            marker_path = webapp._upload_token_path(token)
+            marker = store.load_json(marker_path, {})
+            marker["state"] = "created"
+            marker.pop("job", None)
+            webapp._save_upload_token(marker_path, marker)
+            job_module.JOBS.pop("recover", None)
+            try:
+                (self.dirs["JOBS_DIR"] / "recover.json").unlink()
+            except FileNotFoundError:
+                pass
+            second = self.client.post("/api/upload", data={
+                "pdf": (io.BytesIO(payload), "recover.pdf"),
+                "upload_token": token,
+            }, content_type="multipart/form-data")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.get_json()["deduplicated"])
+        self.assertTrue(second.get_json()["recovered"])
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(
+            sorted(p.name for p in self.dirs["PROJECTS_DIR"].iterdir()),
+            ["recover"])
+
+    def test_concurrent_same_token_starts_exactly_one_job(self):
+        token = "concurrent0123456789abcdef"
+        payload = b"%PDF-1.4 concurrent"
+        entered = threading.Event()
+        release = threading.Event()
+
+        def start(slug, target=""):
+            entered.set()
+            release.wait(timeout=2)
+            return {"slug": slug, "stage": "queued", "done": False}
+
+        def post_once(_index):
+            with webapp.app.test_client() as client:
+                return client.post("/api/upload", data={
+                    "pdf": (io.BytesIO(payload), "concurrent.pdf"),
+                    "upload_token": token,
+                }, content_type="multipart/form-data")
+
+        with mock.patch.object(job_module, "start_job", side_effect=start) as call:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(post_once, 1)
+                self.assertTrue(entered.wait(timeout=2))
+                second = pool.submit(post_once, 2)
+                release.set()
+                responses = [first.result(timeout=3), second.result(timeout=3)]
+        self.assertEqual([r.status_code for r in responses], [200, 200])
+        self.assertEqual(len({r.get_json()["slug"] for r in responses}), 1)
+        self.assertEqual(sum(bool(r.get_json().get("deduplicated"))
+                             for r in responses), 1)
+        call.assert_called_once()
+
     def test_non_pdf_bytes_rejected(self):
         r = self.client.post("/api/upload", data={
             "pdf": (io.BytesIO(b"hello, not a pdf"), "sheet.pdf")},
@@ -237,6 +428,13 @@ class UploadGuardTests(WebappCase):
         self.assertEqual(
             self.client.delete("/api/project/a b").status_code, 400)
         self.assertEqual(self.client.get("/api/job/a b").status_code, 400)
+
+    def test_unknown_job_and_cancel_return_404(self):
+        with mock.patch.object(job_module, "get_job", return_value=None):
+            self.assertEqual(self.client.get("/api/job/missing").status_code,
+                             404)
+            self.assertEqual(
+                self.client.post("/api/cancel/missing").status_code, 404)
 
 
 class PresetAndOverviewTests(WebappCase):
@@ -430,6 +628,73 @@ class PageTests(WebappCase):
         self.assertEqual(body["record"]["vlm_items"], [])
         self.assertEqual(body["page_count"], 1)
 
+    def test_job_starting_during_render_does_not_publish_old_results(self):
+        """A reset=false rerun may retain old results while render is in flight."""
+        self.make_pdf()
+        rec = self.sample_rec()
+        self.write_results(rec)
+        running = mock.Mock(side_effect=[False, True])
+        with mock.patch.object(job_module, "job_running", running):
+            body = self.client.get(f"/api/page/{SLUG}/1").get_json()
+        self.assertEqual(running.call_count, 2)
+        self.assertTrue(body["processing"])
+        self.assertEqual(body["items"], [])
+        self.assertEqual(body["record"]["vlm_items"], [])
+
+
+class LineTypeRefreshStatusTests(WebappCase):
+    def _attach(self, entry, refresh="running"):
+        record = {}
+        items = [{"text": "PROPOSED FENCE",
+                  "box_2d": [100, 100, 120, 180]}]
+        with mock.patch.object(webapp.linetypes, "ENABLED", True), \
+                mock.patch.object(webapp.arrows, "arrows_signature",
+                               return_value="arrow-current"), \
+                mock.patch.object(webapp.arrows, "has_current_arrows",
+                                  return_value=True), \
+                mock.patch.object(webapp.linetypes, "anchors_of",
+                                  return_value=[{"key": "0", "ti": 0,
+                                                 "tip": [200, 300]}]), \
+                mock.patch.object(webapp.linetypes, "linetypes_signature",
+                                  return_value="lt-current"), \
+                mock.patch.object(webapp.linetypes, "load_page",
+                                  return_value=entry), \
+                mock.patch.object(
+                    webapp.linetype_refresh_state, "page_refresh_status",
+                    return_value=refresh):
+            webapp._attach_linetypes(
+                record, SLUG, 1, items, "pdf-current",
+                plan_regions=[[0, 0, 1000, 1000]])
+        return record["linetypes_status"]
+
+    def test_stale_cache_is_reported_as_automatic_update(self):
+        status = self._attach({"sig": "lt-old", "bindings": []})
+        self.assertEqual(status["state"], "updating")
+        self.assertEqual(status["refresh"], "running")
+        self.assertEqual(status["targets"], 1)
+
+    def test_current_failure_is_not_mislabeled_as_old_cache(self):
+        status = self._attach({"sig": "lt-current", "error": "timeout"})
+        self.assertEqual(status["state"], "failed")
+        self.assertIn("timeout", status["detail"])
+
+    def test_timeout_from_smaller_budget_keeps_polling_for_retry(self):
+        entry = {"sig": "lt-current", "error": (
+            "RuntimeError: linetype sidecar timeout after 600s (sheet 24)")}
+        with mock.patch.object(
+                job_module, "_linetype_failure_budget_increased",
+                return_value=True):
+            status = self._attach(entry, refresh=None)
+        self.assertEqual(status["state"], "updating")
+        self.assertEqual(status["refresh"], "queued")
+        self.assertIn("automatic", status["detail"].lower())
+
+    def test_current_incomplete_cache_is_reported_as_automatic_update(self):
+        status = self._attach({"sig": "lt-current", "page": {}})
+        self.assertEqual(status["state"], "updating")
+        self.assertEqual(status["refresh"], "running")
+        self.assertEqual(status["targets"], 1)
+
 
 class ImageTests(WebappCase):
     def test_base_image_is_cached_jpeg(self):
@@ -503,7 +768,10 @@ class ReferenceDataTests(WebappCase):
 
 class IndexTests(WebappCase):
     def test_index_renders_single_page_ui(self):
-        html = self.client.get("/").get_data(as_text=True)
+        response = self.client.get("/")
+        html = response.get_data(as_text=True)
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        self.assertIn("cache:'no-store'", html)
         self.assertIn("fence_lite", html)
         # "Only sheets with results" 曾是这里的标记，随统计框/状态栏一起删掉了。
         # 换成仍然在页面上的同一块 UI（画廊的命中页计数）。

@@ -3,7 +3,7 @@
 这条路径的产品承诺是「结果不受任何旧缓存影响」，所以测的重点只有两件事：
   1. reset 真的把 data/<slug>/ 下的东西全清了，且**没碰** projects/<slug>/input.pdf；
   2. 路由把 reset 与 target 正确传下去，跑着的项目不给重跑。
-job.start_job 被替换成不启线程的记录器，绝不触发真实管线。
+job.restart_job 被替换成不启线程的记录器，绝不触发真实管线。
 """
 import json
 import os
@@ -66,19 +66,25 @@ class RerunTests(unittest.TestCase):
         (self.slug_data / "base_P1_deadbeef.jpg").write_bytes(b"\xff\xd8jpeg")
 
         self.started = []
-        self._real_start = job.start_job
-        # 签名要跟 job.start_job 一致：/api/rerun 现在会把变体的模型钉回去
+        self._real_restart = job.restart_job
+        # 签名要跟 job.restart_job 一致：/api/rerun 会把清缓存与启动放在
+        # 同一个 slug reservation 内，并把变体的模型钉回去。
         # （见 tests/test_variants.py 的 test_rerun_of_a_variant_keeps_its_model）。
-        job.start_job = lambda slug, target=None, model=None: (
-            self.started.append((slug, target)) or {"slug": slug,
-                                                    "stage": "queued"})
+        def restart(slug, target=None, model=None, *, reset=True):
+            if job.job_running(slug):
+                raise job.JobStartError("this project is already in progress")
+            cleared = job.reset_project_cache(slug) if reset else []
+            self.started.append((slug, target))
+            return {"slug": slug, "stage": "queued"}, cleared
+
+        job.restart_job = restart
         self._real_running = job.job_running
         job.job_running = lambda slug: False
         webapp.app.config["TESTING"] = True
         self.client = webapp.app.test_client()
 
     def tearDown(self):
-        job.start_job = self._real_start
+        job.restart_job = self._real_restart
         job.job_running = self._real_running
         for (mod, name), value in self._saved.items():
             setattr(mod, name, value)

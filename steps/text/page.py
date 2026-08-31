@@ -7,8 +7,9 @@
                零模型调用、零落盘：谁调用谁负责把付费 raw 存进 vlm.json、
                把结果写进 results.json。
   vlm_needed   这一页要不要花钱读图。当期身份的 primary 记录不存在，且满足
-               三条触发中的任一条：本页没有文字层（扫描页，矢量通道天生看不见
-               任何东西）／本页有矢量命中实例／本页已经被记过一次。
+               四条触发中的任一条：准确率模式强制全页扫描／本页没有文字层
+               （扫描页，矢量通道天生看不见任何东西）／本页有矢量命中实例／
+               本页已经被记过一次。
                「已经被记过」那一半是关键 —— 旧身份 / 报错 / 结构损坏的记录
                必须显式变成重扫工作，不能悄悄当成缓存命中。
 """
@@ -59,10 +60,15 @@ def fuse_page(pdf, page_index, vec_page, verdicts, vlm_items, *,
 
 
 def vlm_needed(page, instances, vlm_store, expected_identity, *,
-               has_text=True):
+               has_text=True, scan_all=False):
     """True when this 1-based page still owes one paid primary scan.
 
-    Three independent triggers:
+    Four independent triggers:
+      * ``scan_all`` is True — accuracy-first mode.  A page can contain an
+        ordinary extractable title block while the relevant CAD lettering is
+        made only from stroked paths.  In that mixed-page case ``has_text`` is
+        true but the vector text channel is blind, so every page must be read
+        visually.
       * ``has_text`` is False — the page carries no vector text layer at all
         (scanned raster sheet), so the free vector+judge path can never see
         anything and reading the image is the ONLY way to honour "find the
@@ -72,12 +78,12 @@ def vlm_needed(page, instances, vlm_store, expected_identity, *,
       * the page is already known to ``vlm.json`` but its stored record is
         stale / errored / structurally invalid — that is explicit rework, never
         a silent cache hit.
-    A page that has a text layer but no matching text is deliberately NOT
-    scanned: the deterministic vector floor already covered it, and that
-    skip is where most of the money is saved.
+    With ``scan_all=False``, a page that has a text layer but no matching text
+    is deliberately not scanned.  That selective mode is retained as an
+    explicit cost-saving option; it is not safe for mixed CAD pages.
     """
     key = str(page)
     store = vlm_store or {}
     if is_current_primary_record(store.get(key), expected_identity):
         return False
-    return (not has_text) or bool(instances) or key in store
+    return bool(scan_all) or (not has_text) or bool(instances) or key in store

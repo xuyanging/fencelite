@@ -1,7 +1,7 @@
 """gunicorn 入口：`gunicorn -w 1 --threads 4 wsgi:app`.
 
 webapp.py 的 ``__main__`` 块（Flask 自带服务器）在 gunicorn 下不会执行，
-所以「把上次被强杀的作业标成 interrupted」这件事得在这里做一次。
+所以「让上次被强杀的作业从逐页 checkpoint 续跑」得在这里做一次。
 故意不放进 webapp.py 的模块级：那样 import webapp 的单元测试会去动真实的
 _jobs/ 目录。
 

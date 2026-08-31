@@ -16,87 +16,206 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from steps.store import DATA_DIR, load_json
 from core.config import MODEL_NAME
+from steps.store import DATA_DIR, load_json, pdf_path
+from steps.text import (TARGET_DEFAULT, build_vlm_prompt,
+                        is_current_primary_record,
+                        is_current_secondary_record, is_default_target,
+                        select_instances, vlm_identity)
 from steps.versions import (FUSED_VERSION, PLACEMENT_VERSION, SYMBOL_PROMPT_V,
                             SYMBOL_VERSION, TEXT_JUDGE_VERSION, VIEW_VERSION)
 
-SLUG = sys.argv[1] if len(sys.argv) > 1 else "combined_bid_set_ten_mile_storage_phase_1"
-d = DATA_DIR / SLUG
-
-res = load_json(d / "results.json", {}) or {}
-sym = load_json(d / "symbols.json", {}) or {}
-vt = load_json(d / "view_types.json", {}) or {}
-arw = load_json(d / "arrows.json", {}) or {}
-vlm = load_json(d / "vlm.json", {}) or {}
-judge = load_json(d / "textjudge.json", {}) or {}
-
-pages = int(res.get("page_count") or 0)
-print(f"{SLUG}: {pages} pages")
-print()
+import job as _job                                            # noqa: E402
 
 
 def counts(store, key, path=None):
     def get(e):
+        if not isinstance(e, dict):
+            return None
         if path:
-            e = (e or {}).get(path) or {}
-        return (e or {}).get(key)
+            e = e.get(path) or {}
+            if not isinstance(e, dict):
+                return None
+        return e.get(key)
     return dict(collections.Counter(get(e) for e in store.values()))
 
 
-print(f"  results.fused_v   = {res.get('fused_v')}   (current {FUSED_VERSION})")
-print(f"  textjudge.v       = {judge.get('v')}   (current {TEXT_JUDGE_VERSION})")
-# vlm.json 的页数**不**该等于总页数：有文字层但没有目标文字的页是故意不扫的
-# （steps/text/page.py 的 vlm_needed），那正是省钱的地方。所以只看它是否
-# 与「有结果的页」一致，不看它是否等于总页数。
-with_text = sum(1 for r in (res.get("pages") or {}).values()
-                if (r or {}).get("vlm_items"))
-print(f"  vlm.json pages    = {len(vlm)}   有 vlm_items 的页 = {with_text}"
-      f"   <- 有文字层且无目标文字的页故意不扫，不是缺页")
-print(f"  symbols pages     = {len(sym)} / {pages}")
-print(f"    .pv  = {counts(sym,'pv')}   (current {SYMBOL_PROMPT_V})  <- 付费")
-print(f"    .v   = {counts(sym,'v')}   (current {SYMBOL_VERSION})   <- 免费重过滤")
-print(f"    .plc_v = {counts(sym,'plc_v',path='result')}   (current {PLACEMENT_VERSION})  <- 免费")
-print(f"  view_types pages  = {len(vt)}")
-print(f"    .v   = {counts(vt,'v')}   (current {VIEW_VERSION})   <- 付费")
-print(f"  arrows pages      = {len(arw)}  sig tails {sorted({str(e.get('sig'))[-4:] for e in arw.values()})}"
-      f"   <- 免费（本地边车）")
-print()
+def _models_of(store):
+    models = set()
+    for record in (store or {}).values():
+        if not isinstance(record, dict):
+            continue
+        identity = record.get("vlm_identity") or {}
+        if not isinstance(identity, dict):
+            identity = {}
+        model = identity.get("model") or record.get("model")
+        if model:
+            models.add(model)
+    return models
 
-paid = []
-if res.get("fused_v") != FUSED_VERSION:
-    paid.append("fused 语义变了 -> 重新融合（免费，但会连带重算）")
-if judge.get("v") != TEXT_JUDGE_VERSION:
-    paid.append("判词版本变了 -> 重判所有字符串（付费）")
-if len(vlm) < with_text:
-    paid.append(f"vlm.json ({len(vlm)}) 少于有结果的页 ({with_text}) -> 缺的页要付费扫描")
-if set(counts(sym, "pv")) - {SYMBOL_PROMPT_V}:
-    paid.append("symbols 提示词版本不当期 -> 每页重新付费推理")
-if set(counts(vt, "v")) - {VIEW_VERSION}:
-    paid.append("视图分类版本不当期 -> 每页重新付费分类")
 
-# 模型这一维和版本戳一样会作废缓存，而且更隐蔽：symbols / vlm / 判词都按
-# resolve_model(None) 校验，重跑时若没把模型钉回去，整份缓存都读作过期，
-# 会用默认模型重新付费**并覆盖掉**原来那份结果。对比运行尤其致命。
-import job as _job                                            # noqa: E402
-pinned = _job.variant_model(SLUG)
-effective = pinned or MODEL_NAME
-stored = {m for m in counts(sym, "model") if m} \
-    | {m for m in {((e or {}).get("vlm_identity") or {}).get("model")
-                   for e in vlm.values()} if m}
-if judge.get("model"):
-    stored.add(judge["model"])
-print(f"  缓存里的模型        = {sorted(stored) or ['-']}")
-print(f"  重跑会用的模型      = {effective}"
-      + (f"   (变体 slug 钉定)" if pinned else "   (进程默认)"))
-if stored - {effective}:
-    paid.append(f"缓存模型 {sorted(stored)} != 重跑模型 {effective}"
-                f" -> 会用 {effective} 重新付费并覆盖原结果")
+def _page_list(pages):
+    values = list(pages)
+    if not values:
+        return "-"
+    shown = ",".join(f"P{page}" for page in values[:12])
+    return shown + (f",…(+{len(values) - 12})" if len(values) > 12 else "")
 
-if paid:
-    print("会产生付费调用：")
-    for p in paid:
-        print("  !", p)
-else:
-    print("不会产生付费调用：所有付费步的版本戳都当期，rerun 只会重算 arrows"
-          "（本地边车 + 纯几何）与免费的重过滤/放置。")
+
+def _vision_status(slug, res, judge, vec, vlm, flash, effective):
+    """Mirror the production page/identity gates without issuing model calls."""
+    source = pdf_path(slug)
+    result_pages = int(res.get("page_count") or 0)
+    actual_pages = _job.page_count_of(slug) if source.is_file() else 0
+    page_count = actual_pages or result_pages
+    all_pages = list(range(1, page_count + 1))
+    target = res.get("target") or TARGET_DEFAULT
+    prompt = build_vlm_prompt(target)
+    try:
+        primary_identity = vlm_identity(source, effective, prompt)
+        flash_identity = vlm_identity(source, _job.FLASH_MODEL, prompt)
+        identity_error = None
+    except OSError as exc:
+        primary_identity = flash_identity = None
+        identity_error = f"{type(exc).__name__}: {exc}"
+
+    if _job.SCAN_ALL_PAGES:
+        primary_pages = secondary_pages = all_pages
+    else:
+        vpages = (vec or {}).get("pages") or {}
+        flagged = {text for text, verdict in
+                   ((judge or {}).get("verdicts") or {}).items() if verdict}
+        default_target = is_default_target(target)
+
+        def has_text(page):
+            if not _job.SCAN_NO_TEXT_PAGES:
+                return True
+            return bool((vpages.get(str(page)) or {}).get("has_text"))
+
+        primary_pages = []
+        secondary_pages = []
+        for page in all_pages:
+            page_vec = vpages.get(str(page)) or {}
+            instances = select_instances(
+                page_vec.get("lines") or [], flagged,
+                use_kw_floor=default_target)
+            if (not has_text(page)) or instances or str(page) in vlm:
+                primary_pages.append(page)
+            if (_job.SCAN_NO_TEXT_PAGES
+                    and not page_vec.get("has_text")):
+                secondary_pages.append(page)
+
+    if identity_error:
+        primary_due = list(primary_pages)
+        flash_due = list(secondary_pages)
+    else:
+        primary_due = [
+            page for page in primary_pages
+            if not is_current_primary_record(
+                vlm.get(str(page)), primary_identity)
+        ]
+        flash_due = [
+            page for page in secondary_pages
+            if not is_current_secondary_record(
+                flash.get(str(page)), flash_identity)
+        ]
+    return {
+        "page_count": page_count,
+        "mode": "all-pages" if _job.SCAN_ALL_PAGES else "selective",
+        "primary_required": primary_pages,
+        "primary_due": primary_due,
+        "flash_required": secondary_pages,
+        "flash_due": flash_due,
+        "identity_error": identity_error,
+    }
+
+
+def main(slug):
+    d = DATA_DIR / slug
+    res = load_json(d / "results.json", {}) or {}
+    sym = load_json(d / "symbols.json", {}) or {}
+    vt = load_json(d / "view_types.json", {}) or {}
+    arw = load_json(d / "arrows.json", {}) or {}
+    vlm = load_json(d / "vlm.json", {}) or {}
+    flash = load_json(d / "vlm_flash.json", {}) or {}
+    judge = load_json(d / "textjudge.json", {}) or {}
+    vec = load_json(d / "vec.json", {}) or {}
+
+    pinned = _job.variant_model(slug)
+    effective = pinned or MODEL_NAME
+    vision = _vision_status(slug, res, judge, vec, vlm, flash, effective)
+    pages = vision["page_count"]
+    print(f"{slug}: {pages} pages")
+    print()
+    print(f"  results.fused_v   = {res.get('fused_v')}   (current {FUSED_VERSION})")
+    print(f"  textjudge.v       = {judge.get('v')}   (current {TEXT_JUDGE_VERSION})")
+    print(f"  vision mode       = {vision['mode']}")
+    print(f"  vlm.json current  = "
+          f"{len(vision['primary_required']) - len(vision['primary_due'])} / "
+          f"{len(vision['primary_required'])} required"
+          f"   due={_page_list(vision['primary_due'])}")
+    print(f"  vlm_flash current = "
+          f"{len(vision['flash_required']) - len(vision['flash_due'])} / "
+          f"{len(vision['flash_required'])} required"
+          f"   due={_page_list(vision['flash_due'])}")
+    print(f"  symbols pages     = {len(sym)} / {pages}")
+    print(f"    .pv  = {counts(sym,'pv')}   (current {SYMBOL_PROMPT_V})  <- 付费")
+    print(f"    .v   = {counts(sym,'v')}   (current {SYMBOL_VERSION})   <- 免费重过滤")
+    print(f"    .plc_v = {counts(sym,'plc_v',path='result')}   (current {PLACEMENT_VERSION})  <- 免费")
+    print(f"  view_types pages  = {len(vt)}")
+    print(f"    .v   = {counts(vt,'v')}   (current {VIEW_VERSION})   <- 付费")
+    print(f"  arrows pages      = {len(arw)}  sig tails "
+          f"{sorted({str(e.get('sig'))[-4:] for e in arw.values()})}"
+          f"   <- 免费（本地边车）")
+    print()
+
+    paid = []
+    if res.get("fused_v") != FUSED_VERSION:
+        paid.append("fused 语义变了 -> 融合本身免费，但新 items/sig 可能使"
+                    " symbols/views 失效，未回放前无法保证零付费")
+    if judge.get("v") != TEXT_JUDGE_VERSION:
+        paid.append("判词版本变了 -> 重判所有字符串（付费）")
+    if vision["identity_error"]:
+        paid.append("无法按当前 input.pdf 计算 VLM identity -> 不能证明图像缓存可复用: "
+                    + vision["identity_error"])
+    else:
+        if vision["primary_due"]:
+            paid.append(
+                f"vlm.json 有 {len(vision['primary_due'])} 个必扫页缺失、失败或 identity/role 不当期 "
+                f"({_page_list(vision['primary_due'])}) -> 主模型要付费扫描")
+        if vision["flash_due"]:
+            paid.append(
+                f"vlm_flash.json 有 {len(vision['flash_due'])} 个必扫页缺失、失败或 identity/role 不当期 "
+                f"({_page_list(vision['flash_due'])}) -> Flash 要付费扫描")
+    if set(counts(sym, "pv")) - {SYMBOL_PROMPT_V}:
+        paid.append("symbols 提示词版本不当期 -> 每页重新付费推理")
+    if set(counts(vt, "v")) - {VIEW_VERSION}:
+        paid.append("视图分类版本不当期 -> 每页重新付费分类")
+
+    # VLM/Flash 复用已由必扫页的完整 identity 决定；超出当前
+    # PDF 页范围的孤儿记录不应因模型不同被二次判成付费。
+    symbol_models = {model for model in counts(sym, "model") if model}
+    print(f"  symbols 缓存模型  = {sorted(symbol_models) or ['-']}")
+    print(f"  主 VLM 缓存模型   = {sorted(_models_of(vlm)) or ['-']}")
+    print(f"  Flash 缓存里的模型  = {sorted(_models_of(flash)) or ['-']}"
+          f"   (expected {_job.FLASH_MODEL})")
+    print(f"  重跑主模型          = {effective}"
+          + (f"   (变体 slug 钉定)" if pinned else "   (进程默认)"))
+    if symbol_models - {effective}:
+        paid.append(f"symbols 缓存模型 {sorted(symbol_models)} != 重跑模型 {effective}"
+                    f" -> 会用 {effective} 重新付费并覆盖原结果")
+
+    if paid:
+        print("会产生付费调用：")
+        for reason in paid:
+            print("  !", reason)
+    else:
+        print("不会产生付费调用：所有付费步的版本戳和逐页 identity 都当期，"
+              "rerun 只会重算 arrows/linetypes（本地边车 + 纯几何）"
+              "与免费的重过滤/放置。")
+
+
+if __name__ == "__main__":
+    selected = (sys.argv[1] if len(sys.argv) > 1
+                else "combined_bid_set_ten_mile_storage_phase_1")
+    main(selected)

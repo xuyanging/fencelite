@@ -1,21 +1,23 @@
 """上传作业编排 + 时间/费用统计 —— 全项目唯一的付费入口.
 
-网页层只做「校验 + 建 slug + 起后台线程」，真正的四步链在这里按固定依赖顺序
-跑完：
+网页层只做「校验 + 建 slug + 起后台线程」，生产默认的六阶段链在这里按固定
+依赖顺序跑完：
 
     text        0.00 → 0.55   矢量文字层(进程池) → 判词(线程池)
                               → 整页 VLM(线程池) → 本地融合
     symbols     0.55 → 0.80   每页一次 group+symbol 付费推理(线程池)
     views       0.80 → 0.92   只给「有 shape 样例 且 有合法 view 组」的页
                               做投影分类(线程池)
-    placements  0.92 → 1.00   本地 shape 模板匹配 + plan 过滤(零费用)
+    placements  0.92 → 0.96   本地 shape 模板匹配 + plan 过滤(零费用)
+    arrows      0.96 → 0.98   本地 Node 边车恢复引线与箭头末端
+    linetypes   0.98 → 1.00   本地 Python 边车聚类线型并绑定末端
 
 阶段之间严格串行（后一步吃前一步的产物），阶段内部按页并发。自定义检测目标
-（target 非默认）只跑 text 一步（0→1.0）—— 后三步是 fence 专属语义。
+（target 非默认）只跑 text 一步（0→1.0）—— 后五步是 fence 专属语义。
 
 为什么这些机制不能省：
-  * ``_PROC_LOCK``：全进程同时只跑一个作业。RECORDER 是进程级计费会话，
-    steps/store.py 又是单写者契约，两个作业并跑会互相污染统计与缓存。
+  * ``_PROC_SLOTS``：按机器容量限制同时运行的 PDF；每个作业拥有独立的
+    RECORDER 会话和模型上下文，同一 slug 仍由稳定文件锁保持单写者。
   * ``RECORDER.on_update``：每笔付费调用一完成就把累计 cost/wall 落盘，
     进程崩了也不会丢已经花掉的钱。
   * 增量 checkpoint：vec 每批落盘、判词每 chunk 落盘、VLM raw 每页落盘、
@@ -58,15 +60,20 @@ import shutil
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 import fitz
 
+from core.concurrency import (SlotPool, SlotWaitCancelled,
+                              stable_named_lock)
 from core.config import (MODEL_NAME, PRICING, PROJECTS_DIR, compute_cost,
-                         resolve_model, set_model_override)
-from core.gemini import RECORDER
+                         resolve_model, set_model_override,
+                         submit_with_context)
+from core.gemini import (RECORDER, is_timeout_error,
+                         should_retry_model_error)
 from core.pdfio import FITZ_LOCK
 from steps import arrows, linetypes
 from steps.debug import DebugSink
@@ -101,14 +108,28 @@ def _linetype_page_workers():
 
 LINETYPE_PAGE_WORKERS = int(os.environ.get("LINETYPE_PAGE_WORKERS", "")
                             or _linetype_page_workers())
+# 普通页 10 分钟硬上限；密页保留 60 分钟。Bristol P24 约 49k paths，
+# 但聚类复杂度明显高于普通页，30 分钟仍会稳定截断有效答案。阈值放到
+# 40k 后它和更密的图纸都走长预算；轻页仍维持有界的 10 分钟。
+LINETYPE_TIMEOUT = max(1, int(os.environ.get("LINETYPE_TIMEOUT", "600")))
+LINETYPE_DENSE_TIMEOUT = max(
+    LINETYPE_TIMEOUT,
+    int(os.environ.get("LINETYPE_DENSE_TIMEOUT", "3600")))
+LINETYPE_DENSE_PATHS = max(
+    1, int(os.environ.get("LINETYPE_DENSE_PATHS", "40000")))
 VEC_WORKERS = int(os.environ["VEC_WORKERS"])
 
 VEC_SCHEMA = 3   # 3 = native typographic lines (v2's homegrown clustering
                  # chained whole elevation sheets into one mega box)
-FLASH_MODEL = "gemini-3.5-flash"   # 无文字层扫描页的第二模型（并集保险）
+FLASH_MODEL = "gemini-3.5-flash"   # 整页视觉的第二模型（并集保险）
+# 准确率优先：默认每页都用主模型 + Flash 读图。CAD 常把标题栏做成
+# 可提取文字，却把真正的 fence 标注画成纯描边 path；“页上有任意文字”
+# 绝不能再当成跳过视觉识别的依据。只有明确接受这类假阴性时才设 0。
+SCAN_ALL_PAGES = os.environ.get("SCAN_ALL_PAGES", "1") not in (
+    "0", "", "false", "no", "off")
 # 没有文字层的页（扫描件）默认必须读图：矢量+判词那条免费通道在这类页上什么也
-# 看不到，不读图就会「一页都没找到」却还报成功。关掉它 = 回到只扫「矢量命中页」
-# 的省钱口径，扫描件项目会静默出空结果，请只在明确知道后果时设 0。
+# 看不到，不读图就会「一页都没找到」却还报成功。这个开关只在
+# SCAN_ALL_PAGES=0 的选择性模式下生效。
 SCAN_NO_TEXT_PAGES = os.environ.get("SCAN_NO_TEXT_PAGES", "1") not in (
     "0", "", "false", "no", "off")
 
@@ -116,26 +137,174 @@ RETRIES = 2      # 共 3 次尝试；退避系数各阶段不同，见各处 tim
 
 _IO_LOCK = threading.Lock()      # symbols.json / view_types.json 读-改-写串行
 _VLM_LOCK = threading.Lock()     # vlm.json / vlm_flash.json 读-改-写串行
-
-
+# 线型回填脚本与 Web 作业是不同进程，_IO_LOCK 拦不住它们；同页由下方
+# stable_named_lock 在进程内与跨进程统一串行。
 class Cancelled(Exception):
     """Raised to unwind a run the user asked to cancel."""
+
+
+class JobStartError(RuntimeError):
+    """A background worker could not safely be claimed or started.
+
+    For a newly-created unique upload, this is raised only before
+    ``Thread.start`` succeeds, so its caller may clean that upload up. Existing
+    project reruns use ``restart_job`` and translate a competing claim to 409.
+    """
 
 
 # ---------------------------------------------------------------- job state --
 JOBS = {}                       # slug -> status dict
 _JOBS_LOCK = threading.Lock()
-_PROC_LOCK = threading.Lock()   # one processing run at a time
-# slug whose RECORDER session is live, plus the cumulative cost/time carried
-# over from earlier (crashed) sessions of this same job.  Live totals =
-# base + current RECORDER session, so cost accumulates correctly across resumes.
-_RUNNING = {"slug": None, "base": None, "base_wall": 0.0}
+# Snapshot + atomic replace must be one ordered operation.  Heartbeats,
+# progress callbacks and RECORDER.on_update run on different threads; locking
+# only the in-memory dict lets an older snapshot finish its replace after a
+# newer one and resurrect ``done=False`` on disk after the process is already
+# complete.  Keep this lock separate from _JOBS_LOCK so slow fsync never blocks
+# read-only /api/job snapshots.
+_JOB_PERSIST_LOCK = threading.Lock()
+# Two PDFs may overlap on this 8-core / 15-GB host.  The expensive local
+# sidecars still share their old single-job capacity, and vector extraction has
+# its own CPU gate below; this fills network/CPU idle gaps without multiplying
+# the worst-case memory footprint.
+MAX_PARALLEL_JOBS = max(1, int(os.environ.get("MAX_PARALLEL_JOBS", "")
+                               or _hw.clamp(
+                                   min(_CPU // 4, int(_RAM // 7)), 1, 3)))
+HEAVY_SIDECAR_SLOTS = max(1, int(os.environ.get("HEAVY_SIDECAR_SLOTS", "")
+                                  or max(ARROWS_WORKERS,
+                                         LINETYPE_PAGE_WORKERS)))
+_SLOT_POOLS = {}
+_SLOT_POOLS_LOCK = threading.Lock()
 
-_CANCEL = {}                    # slug -> threading.Event (cancel requested)
+
+def _slot_pool(name, capacity):
+    # JOBS_DIR is patched to a temporary root in tests; keying the registry by
+    # its current value prevents a test run from touching production lock files.
+    directory = JOBS_DIR / ".capacity-slots"
+    key = (str(directory.absolute()), str(name), int(capacity))
+    with _SLOT_POOLS_LOCK:
+        return _SLOT_POOLS.setdefault(
+            key, SlotPool(directory, name, capacity))
+
+# Per-running-slug baseline and processing clock.  A single dict was safe only
+# while jobs were serialized; a map keeps live cost/wall snapshots isolated.
+_RUNNING = {}
+_RUNNING_LOCK = threading.Lock()
+
+# A reservation spans cache reset, queueing and the complete worker lifetime.
+# It makes the route's "is it running? -> reset -> start" transaction atomic
+# within the single gunicorn process, so two simultaneous reruns cannot wipe
+# each other's paid checkpoints before one is rejected.
+_STARTING = set()
+_STARTING_LOCK = threading.Lock()
+
+_CANCEL = {}                    # slug -> shared threading.Event
+_CANCEL_USERS = {}              # direct/internal duplicate-run hardening
+_CANCEL_LOCK = threading.Lock()
 
 _ZERO_LLM = {"calls": 0, "model_seconds": 0.0, "peak_concurrency": 0,
              "input_tokens": 0, "output_tokens": 0, "thoughts_tokens": 0,
              "cost_usd": 0.0, "by_model": {}}
+
+
+@contextmanager
+def _interprocess_proc_lock(*, all_slots=False, cancelled=None):
+    """Take one project slot, or drain all slots for restart recovery."""
+    pool = _slot_pool("project", MAX_PARALLEL_JOBS)
+    guard = (pool.all_slots() if all_slots
+             else pool.slot(cancelled=cancelled))
+    with guard:
+        yield
+
+
+def _job_run_lock_path(slug):
+    if not is_valid_slug(slug):
+        raise ValueError(f"invalid project slug: {slug!r}")
+    return JOBS_DIR / ".job-run-locks" / f"{slug}.lock"
+
+
+def _linetype_page_lock_path(slug, page):
+    """Stable lock inode for one project sheet, outside deletable data dirs."""
+    if not is_valid_slug(slug):
+        raise ValueError(f"invalid project slug: {slug!r}")
+    page = int(page)
+    if page < 1:
+        raise ValueError(f"page must be 1-based, got {page!r}")
+    return JOBS_DIR / ".linetype-page-locks" / f"{slug}.{page}.lock"
+
+
+@contextmanager
+def _linetype_page_lock(slug, page, cancelled=None):
+    """Serialize one sheet across web workers and external backfills.
+
+    The lock lives under ``_jobs`` rather than ``data/<slug>``: deleting a
+    project's result directory while a worker still owns an open lock file
+    must not let another process recreate a different inode and enter the same
+    sheet concurrently.  POSIX ``flock`` is advisory and crash-safe; platforms
+    without it still retain the in-process mutex used by tests/development.
+    """
+    try:
+        with stable_named_lock(_linetype_page_lock_path(slug, page),
+                               cancelled=cancelled):
+            yield
+    except SlotWaitCancelled as exc:
+        raise Cancelled() from exc
+
+
+def _claim_job_start(slug, *, resume=False):
+    """Reserve one slug before any status/cache mutation.
+
+    Automatic recovery is idempotent and may quietly observe an existing
+    owner. Explicit upload/rerun starts instead fail without touching that
+    owner's status, cancellation event or cache.
+    """
+    return _claim_job_starts([slug], resume=resume)
+
+
+def _claim_job_starts(slugs, *, resume=False):
+    """Atomically reserve one or more project identities."""
+    slugs = tuple(dict.fromkeys(slugs))
+    with _STARTING_LOCK:
+        busy = [slug for slug in slugs if slug in _STARTING]
+        if busy:
+            if resume:
+                return False
+            names = ", ".join(repr(slug) for slug in busy)
+            raise JobStartError(
+                f"project {names} is already queued or running")
+        _STARTING.update(slugs)
+    return True
+
+
+def _release_job_start(slug):
+    with _STARTING_LOCK:
+        _STARTING.discard(slug)
+
+
+def _release_job_starts(slugs):
+    with _STARTING_LOCK:
+        _STARTING.difference_update(slugs)
+
+
+def _register_cancel_event(slug):
+    """Share cancellation across any internal duplicate callers safely."""
+    with _CANCEL_LOCK:
+        event = _CANCEL.get(slug)
+        if event is None:
+            event = threading.Event()
+            _CANCEL[slug] = event
+        _CANCEL_USERS[slug] = _CANCEL_USERS.get(slug, 0) + 1
+        return event
+
+
+def _unregister_cancel_event(slug, event):
+    with _CANCEL_LOCK:
+        users = max(0, _CANCEL_USERS.get(slug, 1) - 1)
+        if users:
+            _CANCEL_USERS[slug] = users
+        else:
+            _CANCEL_USERS.pop(slug, None)
+            if _CANCEL.get(slug) is event:
+                _CANCEL.pop(slug, None)
 
 
 def _merge_llm(a, b):
@@ -168,26 +337,32 @@ def _merge_llm(a, b):
     return out
 
 
-def _effective_llm():
+def _running_state(slug):
+    with _RUNNING_LOCK:
+        return dict(_RUNNING.get(slug) or {})
+
+
+def _effective_llm(slug):
     """Cumulative cost/time for the running job = carried baseline + this
     session's RECORDER total."""
-    return _merge_llm(_RUNNING.get("base"), RECORDER.summary())
+    state = _running_state(slug)
+    return _merge_llm(state.get("base"), RECORDER.summary(slug))
 
 
-def _flush_running():
+def _flush_running(slug):
     """Persist the running job's cumulative cost/time after each completed
     model call (RECORDER.on_update hook).  Keeps the on-disk total exact to the
     last completed call, so a crash+resume never loses already-counted spend.
     No-op when no processing run is active."""
-    slug = _RUNNING.get("slug")
-    if not slug:
+    state = _running_state(slug)
+    if not state:
         return
-    upd = {"llm": _effective_llm()}
-    with _JOBS_LOCK:
-        started = (JOBS.get(slug) or {}).get("started")
-    if started:
+    upd = {"llm": _effective_llm(slug)}
+    processing_started = state.get("processing_started")
+    if processing_started:
         upd["wall_seconds"] = round(
-            _RUNNING.get("base_wall", 0.0) + (time.time() - started), 1)
+            state.get("base_wall", 0.0)
+            + (time.time() - processing_started), 1)
     _set(slug, **upd)
 
 
@@ -203,16 +378,26 @@ def _persist_job(slug):
     """Mirror a job's status to disk so a server restart can show it.
     Best-effort: persistence must never break processing."""
     try:
-        with _JOBS_LOCK:
-            job = dict(JOBS.get(slug) or {})
-        if job:
-            JOBS_DIR.mkdir(parents=True, exist_ok=True)
-            save_json(_job_file(slug), job)
+        # The snapshot is intentionally taken AFTER acquiring the persistence
+        # lock.  Taking it first and serializing only save_json still permits
+        # an old waiter to replace a newer file last.
+        with _JOB_PERSIST_LOCK:
+            with _JOBS_LOCK:
+                job = dict(JOBS.get(slug) or {})
+            if job:
+                JOBS_DIR.mkdir(parents=True, exist_ok=True)
+                save_json(_job_file(slug), job)
     except Exception:                                          # noqa: BLE001
         pass
 
 
 def _set(slug, **kw):
+    # ``updated_at`` is a real liveness signal for the browser.  A paid model
+    # call or a dense local line-type page can legitimately take minutes; the
+    # old UI looked frozen because the last visible percentage did not move.
+    # Keep this server-authored timestamp out of callers so every state change
+    # (including heartbeat-only changes) follows the same persistence path.
+    kw["updated_at"] = time.time()
     with _JOBS_LOCK:
         job = JOBS.setdefault(slug, {"slug": slug})
         job.update(kw)
@@ -224,13 +409,15 @@ def _warn(slug, messages):
 
     The reference implementation threw every batch's return code away, so a
     partially failed run still showed up as a clean success in the gallery.
-    Collecting them here is the fix: the job stays ok=True (whatever succeeded
-    is published) but carries an explicit list the web layer can display."""
+    Collecting them here is the fix: whatever succeeded remains published, but
+    ``_finish`` marks the job outcome as ``partial`` and the web layer keeps an
+    actionable retry card instead of hiding it as a clean success."""
     if not messages:
         return
     with _JOBS_LOCK:
         job = JOBS.setdefault(slug, {"slug": slug})
         job["warnings"] = list(job.get("warnings") or []) + list(messages)
+        job["updated_at"] = time.time()
     _persist_job(slug)
 
 
@@ -239,11 +426,13 @@ def get_job(slug):
     while this slug's run is in flight (so the UI sees it grow in real time)."""
     with _JOBS_LOCK:
         job = dict(JOBS.get(slug) or {})
-    if job and _RUNNING["slug"] == slug and not job.get("done"):
-        job["llm"] = _effective_llm()
-        if job.get("started"):
+    state = _running_state(slug)
+    if job and state and not job.get("done"):
+        job["llm"] = _effective_llm(slug)
+        if state.get("processing_started"):
             job["wall_seconds"] = round(
-                _RUNNING.get("base_wall", 0.0) + (time.time() - job["started"]), 1)
+                state.get("base_wall", 0.0)
+                + (time.time() - state["processing_started"]), 1)
     return job or None
 
 
@@ -267,7 +456,8 @@ def job_running(slug):
 def request_cancel(slug):
     """Ask a running job to stop.  Cooperative: stages stop scheduling new
     pages and the run unwinds at the next stage boundary."""
-    ev = _CANCEL.get(slug)
+    with _CANCEL_LOCK:
+        ev = _CANCEL.get(slug)
     if ev is not None:
         ev.set()
     _set(slug, cancel_requested=True, detail="Cancelling…")
@@ -275,24 +465,62 @@ def request_cancel(slug):
 
 
 def _wall_now(slug):
-    with _JOBS_LOCK:
-        started = (JOBS.get(slug) or {}).get("started")
-    if not started:
+    state = _running_state(slug)
+    processing_started = state.get("processing_started")
+    if not processing_started:
         return None
-    return round(_RUNNING.get("base_wall", 0.0) + (time.time() - started), 1)
+    return round(state.get("base_wall", 0.0)
+                 + (time.time() - processing_started), 1)
 
 
 def _finish(slug, ok, summary, error=None):
-    total = _merge_llm(_RUNNING.get("base"), summary)
-    _set(slug, done=True, ok=ok, error=error, stage="done" if ok else "error",
-         llm=total, finished=time.time())
+    total = _merge_llm(_running_state(slug).get("base"), summary)
+    with _JOBS_LOCK:
+        warnings = list((JOBS.get(slug) or {}).get("warnings") or [])
+    # ``ok`` remains the backwards-compatible "pipeline did not crash" bit.
+    # ``outcome`` tells the UI whether every requested source actually
+    # completed.  This lets useful partial results remain viewable without
+    # presenting unresolved sheets as a clean success.
+    outcome = ("failed" if not ok else
+               ("partial" if warnings else "success"))
+    _set(slug, done=True, ok=ok, outcome=outcome, error=error,
+         stage="done" if ok else "error", stage_unit=None,
+         results_available=results_path(slug).exists(),
+         repairing=None, llm=total, finished=time.time())
     wall = _wall_now(slug)
     if wall is not None:
         _set(slug, wall_seconds=wall)
 
 
+@contextmanager
+def _job_heartbeat(slug):
+    """Persist liveness while one long page is inside a model/sidecar call.
+
+    Progress is deliberately left untouched: a heartbeat proves the worker is
+    alive but must never pretend a sheet has completed.  The browser can now
+    distinguish a legitimate ten-minute dense page from a dead connection.
+    """
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(10):
+            with _JOBS_LOCK:
+                status = JOBS.get(slug) or {}
+                if status.get("done"):
+                    return
+            _set(slug, heartbeat_at=time.time())
+
+    thread = threading.Thread(target=beat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=1)
+
+
 def _snapshot(slug):
-    _set(slug, llm=_effective_llm())
+    _set(slug, llm=_effective_llm(slug))
 
 
 def _persist_llm(slug, summary):
@@ -303,7 +531,8 @@ def _persist_llm(slug, summary):
     res = load_json(path, None)
     if not isinstance(res, dict):
         return
-    res["llm_summary"] = _merge_llm(_RUNNING.get("base"), summary)
+    res["llm_summary"] = _merge_llm(
+        _running_state(slug).get("base"), summary)
     wall = _wall_now(slug)
     if wall is not None:
         res["wall_seconds"] = wall
@@ -340,10 +569,26 @@ def _carry_baseline(slug):
     if isinstance(card, dict):
         spent = card.get("llm")
         if isinstance(spent, dict):
-            booked = float((llm or {}).get("cost_usd") or 0.0)
-            if float(spent.get("cost_usd") or 0.0) > booked:
+            # Calls/tokens/time are monotonic too. Cost alone is insufficient:
+            # a completed zero-usage response or four-decimal rounding can
+            # advance the durable card without changing cost_usd.
+            def progress_key(summary):
+                summary = summary or {}
+                tokens = sum(int(summary.get(key) or 0) for key in (
+                    "input_tokens", "output_tokens", "thoughts_tokens"))
+                return (int(summary.get("calls") or 0), tokens,
+                        float(summary.get("model_seconds") or 0.0),
+                        float(summary.get("cost_usd") or 0.0))
+
+            if progress_key(spent) > progress_key(llm):
                 llm = spent
-        wall = max(wall, float(card.get("wall_seconds") or 0.0))
+        # Pre-parallel cards measured wall time from upload, so a PDF which
+        # waited half an hour contributed that whole queue delay on recovery.
+        # New cards carry processing_started and measure only occupied-slot
+        # time. Ignore an unfinished legacy card's incompatible wall number;
+        # completed results remain historical data and are left untouched.
+        if card.get("processing_started") or card.get("done"):
+            wall = max(wall, float(card.get("wall_seconds") or 0.0))
     return llm, wall
 
 
@@ -356,20 +601,54 @@ def _slugify(filename):
     return base[:60]
 
 
+def _claim_project_dir(filename):
+    """Atomically reserve a unique project directory for one upload."""
+    base = _slugify(filename)
+    n = 1
+    while True:
+        slug = base if n == 1 else f"{base}_{n}"
+        n += 1
+        if (DATA_DIR / slug).exists():
+            continue
+        directory = PROJECTS_DIR / slug
+        try:
+            # exist_ok=False is the cross-thread/process slug lock.  The old
+            # exists()+mkdir(exist_ok=True) sequence let simultaneous uploads
+            # of the same filename overwrite each other's input.pdf.
+            directory.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        if (DATA_DIR / slug).exists():
+            # A legacy data-only project appeared between the check and mkdir.
+            # This directory is ours and still empty, so releasing it is safe.
+            directory.rmdir()
+            continue
+        return slug, directory
+
+
 def create_project(pdf_bytes, filename):
     """Write projects/<slug>/input.pdf under a fresh unique slug; return slug.
     A re-upload of the same file name gets a ``_2``/``_3`` suffix so multiple
     runs (e.g. different targets) coexist in the gallery."""
-    base = _slugify(filename)
-    slug = base
-    n = 2
-    while (PROJECTS_DIR / slug).exists() or (DATA_DIR / slug).exists():
-        slug = f"{base}_{n}"
-        n += 1
-    d = PROJECTS_DIR / slug
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "input.pdf").write_bytes(pdf_bytes)
-    return slug
+    slug, directory = _claim_project_dir(filename)
+    try:
+        (directory / "input.pdf").write_bytes(pdf_bytes)
+        return slug
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+def create_project_stream(stream, filename):
+    """Stream an upload to disk without holding the entire PDF in RAM."""
+    slug, directory = _claim_project_dir(filename)
+    try:
+        with (directory / "input.pdf").open("xb") as output:
+            shutil.copyfileobj(stream, output, length=1024 * 1024)
+        return slug
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
 
 
 # A comparison run lives in its own slug, "<base>__<model-id>", so the two
@@ -411,6 +690,36 @@ def run_model(slug, res=None):
     return MODEL_NAME
 
 
+def _variant_identity(base_slug, model):
+    """Validate a requested comparison and return its stable slug."""
+    if not is_valid_slug(base_slug):
+        raise ValueError("invalid slug")
+    if variant_base(base_slug):
+        raise ValueError("cannot fork a variant of a variant")
+    if model not in PRICING:
+        raise ValueError(f"unknown model: {model}")
+    slug = f"{base_slug}{VARIANT_SEP}{model}"
+    if not is_valid_slug(slug):
+        raise ValueError(f"variant slug is not a valid path segment: {slug}")
+    return slug
+
+
+def _create_variant_unclaimed(base_slug, model, slug):
+    """Create/reuse the sibling while base+variant reservations are held."""
+    src = PROJECTS_DIR / base_slug / "input.pdf"
+    if not src.exists():
+        raise FileNotFoundError("base project has no input.pdf")
+    directory = PROJECTS_DIR / slug
+    directory.mkdir(parents=True, exist_ok=True)
+    dst = directory / "input.pdf"
+    if not dst.exists():
+        try:
+            os.link(src, dst)      # same inode: no extra disk, same revision
+        except OSError:
+            shutil.copy2(src, dst)
+    return slug
+
+
 def create_variant(base_slug, model):
     """Fork a comparison run: same PDF, different model, separate cache dir.
 
@@ -422,27 +731,34 @@ def create_variant(base_slug, model):
     Idempotent: forking an existing variant returns the same slug, so the
     caller can re-run it without wiping and recreating.
     """
-    if not is_valid_slug(base_slug):
-        raise ValueError("invalid slug")
-    if variant_base(base_slug):
-        raise ValueError("cannot fork a variant of a variant")
-    if model not in PRICING:
-        raise ValueError(f"unknown model: {model}")
-    src = PROJECTS_DIR / base_slug / "input.pdf"
-    if not src.exists():
-        raise FileNotFoundError("base project has no input.pdf")
-    slug = f"{base_slug}{VARIANT_SEP}{model}"
-    if not is_valid_slug(slug):
-        raise ValueError(f"variant slug is not a valid path segment: {slug}")
-    d = PROJECTS_DIR / slug
-    d.mkdir(parents=True, exist_ok=True)
-    dst = d / "input.pdf"
-    if not dst.exists():
-        try:
-            os.link(src, dst)      # same inode: no extra disk, same pdf_revision
-        except OSError:
-            shutil.copy2(src, dst)
-    return slug
+    slug = _variant_identity(base_slug, model)
+    _claim_job_starts([base_slug, slug])
+    try:
+        if job_running(base_slug) or job_running(slug):
+            raise JobStartError("base project or comparison is in progress")
+        return _create_variant_unclaimed(base_slug, model, slug)
+    finally:
+        _release_job_starts([base_slug, slug])
+
+
+def start_variant(base_slug, model, target=None):
+    """Atomically create/reset/start a comparison without a delete race."""
+    slug = _variant_identity(base_slug, model)
+    _claim_job_starts([base_slug, slug])
+    worker_started = False
+    try:
+        if job_running(base_slug) or job_running(slug):
+            raise JobStartError("base project or comparison is in progress")
+        _create_variant_unclaimed(base_slug, model, slug)
+        cleared = reset_project_cache(slug)
+        status = _start_job_claimed(slug, target=target, model=model)
+        worker_started = True
+        return slug, status, cleared
+    finally:
+        _release_job_start(base_slug)
+        if not worker_started:
+            # _start_job_claimed may already have released this on failure.
+            _release_job_start(slug)
 
 
 def variants_of(slug):
@@ -465,32 +781,56 @@ def variants_of(slug):
     return sorted(found)
 
 
-def delete_project(slug, cascade=True):
-    """Remove every artifact for a slug (source PDF + all caches/results).
-
-    ``cascade`` also removes this project's comparison runs, which is what the
-    single-row gallery needs; pass False to delete exactly one slug.
-    """
-    if not is_valid_slug(slug):
-        raise ValueError("invalid slug")
+def _delete_project_unclaimed(slug):
+    """Delete exactly one slug while its caller owns the reservation."""
     removed = False
-    if cascade:
-        for v in variants_of(slug):
-            removed = delete_project(v, cascade=False) or removed
     for root in (PROJECTS_DIR / slug, DATA_DIR / slug):
         if root.exists():
             shutil.rmtree(root, ignore_errors=True)
             removed = True
-    try:
-        f = _job_file(slug)
-        if f.exists():
-            f.unlink()
-            removed = True
-    except OSError:
-        pass
-    with _JOBS_LOCK:
-        JOBS.pop(slug, None)
+    # Serialize deletion with any heartbeat/progress writer. Otherwise an
+    # already-started _persist_job can recreate the status file immediately.
+    with _JOB_PERSIST_LOCK:
+        try:
+            status_file = _job_file(slug)
+            if status_file.exists():
+                status_file.unlink()
+                removed = True
+        except OSError:
+            pass
+        with _JOBS_LOCK:
+            JOBS.pop(slug, None)
     return removed
+
+
+def delete_project(slug, cascade=True):
+    """Remove a stopped project and, by default, all comparison siblings.
+
+    ``cascade`` also removes this project's comparison runs, which is what the
+    single-row gallery needs; pass False to delete exactly one slug. A queued
+    or running owner is rejected before any file disappears.
+    """
+    if not is_valid_slug(slug):
+        raise ValueError("invalid slug")
+    claimed = [slug]
+    _claim_job_start(slug)
+    try:
+        # Base reservation prevents a concurrent create_variant from appearing
+        # between this inventory and the cascade.
+        variants = variants_of(slug) if cascade else []
+        if variants:
+            _claim_job_starts(variants)
+            claimed.extend(variants)
+        busy = [name for name in claimed if job_running(name)]
+        if busy:
+            raise JobStartError(
+                f"project {', '.join(busy)} is still in progress")
+        removed = False
+        for name in variants:
+            removed = _delete_project_unclaimed(name) or removed
+        return _delete_project_unclaimed(slug) or removed
+    finally:
+        _release_job_starts(claimed)
 
 
 def reset_project_cache(slug):
@@ -648,8 +988,33 @@ def _judge_project(slug, vpages, judge_prompt=None, use_kw_floor=True):
     return flagged, err
 
 
+def _vlm_attempt_prompt(base_prompt, attempt):
+    """Return the semantic prompt, with cache-busting repair metadata on retry.
+
+    Gemini is deterministic at temperature zero and may also cache identical
+    request bytes.  Re-sending a malformed response verbatim three times is
+    therefore not a retry in practice (final_plans P17 returned ``[]\n[]`` on
+    every attempt).  The suffix does not change the detection target; it only
+    asks for the same answer in exactly one valid JSON document.  Durable VLM
+    identity is still computed from ``base_prompt`` below, never this nonce.
+    """
+    if attempt <= 0:
+        return base_prompt
+    number = attempt + 1
+    return (
+        base_prompt
+        + f"\n\nRETRY JSON VALIDATION ATTEMPT {number} "
+        + f"(nonce=text-scan-retry-{number}-{time.time_ns()}). "
+        + "The previous response failed strict validation. Return the same "
+        + "requested detection result as exactly ONE complete JSON array. "
+        + "Do not emit two top-level values, markdown, commentary, or a "
+        + "truncated prefix."
+    )
+
+
 def _run_vlm(slug, pdf, page, store, store_path, model=None, role=None,
-             prompt=None):
+             prompt=None, max_attempts=None, timeout_retries=1,
+             attempt_offset=0):
     """One page's paid image scan → a stamped record in ``store`` (on disk).
 
     Retries then stores an explicit error record: a failed page must stay
@@ -661,18 +1026,21 @@ def _run_vlm(slug, pdf, page, store, store_path, model=None, role=None,
     identity = vlm_identity(pdf, model, prompt)
     items = None
     last_err = None
-    for attempt in range(RETRIES + 1):
+    attempts = max(1, int(max_attempts or (RETRIES + 1)))
+    for attempt in range(attempts):
         try:
             # 540s: dense casino/spec sheets kept blowing the 300s default
-            items, elapsed, usage = scan_page(pdf, page - 1,
-                                              model=identity["model"],
-                                              timeout_ms=540_000,
-                                              prompt=prompt)
+            items, elapsed, usage = scan_page(
+                pdf, page - 1, model=identity["model"], timeout_ms=540_000,
+                prompt=_vlm_attempt_prompt(prompt, attempt_offset + attempt))
             break
         except Exception as e:                              # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
-            if attempt < RETRIES:
+            if should_retry_model_error(
+                    e, attempt, attempts, timeout_retries=timeout_retries):
                 time.sleep(20 * (attempt + 1))
+            else:
+                break
     with _VLM_LOCK:
         if items is None:
             store[str(page)] = make_vlm_record(
@@ -723,10 +1091,14 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
     _t = time.perf_counter()
     _p(2)
     # vector extraction creeps the bar 2→8% (parallel across processes)
-    vec = _vec_scan_project(
-        slug, pdf,
-        on_progress=lambda d, t: _p(2 + 6 * d / max(t, 1)),
-        should_cancel=should_cancel)
+    try:
+        with _slot_pool("vector", 1).slot(cancelled=should_cancel):
+            vec = _vec_scan_project(
+                slug, pdf,
+                on_progress=lambda d, t: _p(2 + 6 * d / max(t, 1)),
+                should_cancel=should_cancel)
+    except SlotWaitCancelled as exc:
+        raise Cancelled() from exc
     if should_cancel and should_cancel():
         return warnings
     vpages = vec["pages"]
@@ -760,7 +1132,23 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
 
     need = [p for p in range(1, vec["page_count"] + 1)
             if vlm_needed(p, inst_by_page[p], vlm, primary_identity,
-                          has_text=_has_text(p))]
+                          has_text=_has_text(p), scan_all=SCAN_ALL_PAGES)]
+
+    # 第二模型是独立的视觉保险，不以主模型成功为前提。否则主模型
+    # 某页超时时，明明 Flash 可以读到，整页仍会被静默丢掉。
+    def _secondary_enabled(page):
+        if SCAN_ALL_PAGES:
+            return True
+        return (SCAN_NO_TEXT_PAGES
+                and not vpages.get(str(page), {}).get("has_text"))
+
+    flash_path = slug_dir(slug) / "vlm_flash.json"
+    flash = load_json(flash_path, {})
+    secondary_pages = [p for p in range(1, vec["page_count"] + 1)
+                       if _secondary_enabled(p)]
+    fneed = [p for p in secondary_pages
+             if not is_current_secondary_record(flash.get(str(p)),
+                                                flash_identity)]
 
     n_hit_pages = sum(1 for v in inst_by_page.values() if v)
     n_new = sum(1 for p in need if str(p) not in vlm)
@@ -768,63 +1156,128 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
                        if not vpages.get(str(p), {}).get("has_text"))
     print(f"  pages={vec['page_count']}  fence-text pages={n_hit_pages}  "
           f"image-only pages={n_image_only}  "
-          f"VLM top-up needed={len(need)} (new pages={n_new})", flush=True)
-    if n_image_only and not SCAN_NO_TEXT_PAGES:
+          f"vision={'all-pages' if SCAN_ALL_PAGES else 'selective'}  "
+          f"VLM top-up needed={len(need)}+{len(fneed)} "
+          f"(primary new pages={n_new})", flush=True)
+    if (n_image_only and not SCAN_ALL_PAGES
+            and not SCAN_NO_TEXT_PAGES):
         # 静默出空结果是最坏的失败方式，至少让它出现在作业卡片上。
         warnings.append(
             f"{n_image_only} sheets have no text layer and SCAN_NO_TEXT_PAGES=0 - "
             "these sheets were never read as images, so their results are certainly empty")
 
+    # Pro + Flash 的首轮共用 22%..90%。一个 Pro 超时不能先原地
+    # 再等 540s 才启动 Flash：先让两个独立模型各扫一轮，再对真正
+    # timeout 的那一侧补最多一次。补跑占 90%..95%。
+    paid_total = len(need) + len(fneed)
+
+    def _paid_progress(done):
+        if paid_total:
+            _p(22 + 68 * done / paid_total)
+
     if need and not (should_cancel and should_cancel()):
         with ThreadPoolExecutor(max_workers=TEXT_WORKERS) as ex:
-            futs = [ex.submit(_run_vlm, slug, pdf, p, vlm, vlm_path,
-                              prompt=vlm_prompt)
+            futs = [submit_with_context(
+                        ex, _run_vlm, slug, pdf, p, vlm, vlm_path,
+                        prompt=vlm_prompt, timeout_retries=0,
+                        attempt_offset=(1 if
+                            (vlm.get(str(p)) or {}).get("error") else 0))
                     for p in need]
             for i, f in enumerate(as_completed(futs), 1):
                 page, n, err = f.result()
                 msg = f"ERROR {err}" if err and n is None else f"{n} items"
                 print(f"  [vlm {i}/{len(need)}] P{page}: {msg}", flush=True)
-                if err and n is None:
-                    warnings.append(f"P{page} text VLM failed: {err}")
-                _p(22 + 68 * i / len(need))     # VLM top-ups span 22%..90%
+                _paid_progress(i)
                 if should_cancel and should_cancel():
                     for fu in futs:
                         fu.cancel()
                     break
-    _p(95)
     _sub["vlm"] = time.perf_counter() - _t
     _t = time.perf_counter()
 
-    # scan pages (no text layer → no vector floor): a SECOND model looks at
-    # the page and the finds are unioned — pure-model insurance per user
-    flash_path = slug_dir(slug) / "vlm_flash.json"
-    flash = load_json(flash_path, {})
-    fneed = []
-    for p in range(1, vec["page_count"] + 1):
-        if vpages.get(str(p), {}).get("has_text"):
-            continue
-        if not is_current_primary_record(vlm.get(str(p)), primary_identity):
-            continue
-        if not is_current_secondary_record(flash.get(str(p)), flash_identity):
-            fneed.append(p)
+    # 第二模型看同一页，结果取并集。准确率模式扫全页；选择性模式
+    # 仅对无文字层扫描页做这层保险。
     if fneed and not (should_cancel and should_cancel()):
         print(f"  [flash-union] scan pages to double-check: {len(fneed)}",
               flush=True)
         with ThreadPoolExecutor(max_workers=TEXT_WORKERS) as ex:
-            futs = [ex.submit(_run_vlm, slug, pdf, p, flash, flash_path,
-                              FLASH_MODEL, SECONDARY_UNION_ROLE,
-                              prompt=vlm_prompt)
+            futs = [submit_with_context(
+                        ex, _run_vlm, slug, pdf, p, flash, flash_path,
+                        FLASH_MODEL, SECONDARY_UNION_ROLE,
+                        prompt=vlm_prompt, timeout_retries=0,
+                        attempt_offset=(1 if
+                            (flash.get(str(p)) or {}).get("error") else 0))
                     for p in fneed]
             for i, f in enumerate(as_completed(futs), 1):
                 page, n, err = f.result()
                 msg = f"ERROR {err}" if err and n is None else f"{n} items"
                 print(f"  [flash {i}/{len(fneed)}] P{page}: {msg}", flush=True)
-                if err and n is None:
-                    warnings.append(f"P{page} second model (Flash) union failed: {err}")
+                _paid_progress(len(need) + i)
                 if should_cancel and should_cancel():
                     for fu in futs:
                         fu.cancel()
                     break
+    # Deferred accuracy repair: both models get their first complete retry
+    # policy before we top up ONLY the sources which are still invalid.  The
+    # previous implementation selected timeouts alone and resent the exact
+    # same base request bytes; malformed/truncated provider replies therefore
+    # survived as a red warning.  Every residual source now gets one final
+    # cache-busting request while durable identity stays on ``vlm_prompt``.
+    retry_jobs = []
+    for page in need:
+        if not is_current_primary_record(vlm.get(str(page)),
+                                         primary_identity):
+            retry_jobs.append((page, vlm, vlm_path, None, None, "primary"))
+    for page in fneed:
+        if not is_current_secondary_record(flash.get(str(page)),
+                                           flash_identity):
+            retry_jobs.append((page, flash, flash_path, FLASH_MODEL,
+                               SECONDARY_UNION_ROLE, "flash"))
+    if retry_jobs and not (should_cancel and should_cancel()):
+        print(f"  [vision-repair] incomplete image scans: {len(retry_jobs)}",
+              flush=True)
+        _set(slug, repairing={"stage": "text", "total": len(retry_jobs)},
+             detail=(f"Automatically repairing {len(retry_jobs)} failed "
+                     "image scan(s); completed sheets are being reused…"))
+        with ThreadPoolExecutor(max_workers=TEXT_WORKERS) as ex:
+            futs = [submit_with_context(
+                ex, _run_vlm, slug, pdf, page, target_store, target_path,
+                retry_model, retry_role, prompt=vlm_prompt, max_attempts=1,
+                timeout_retries=0, attempt_offset=RETRIES + 1)
+                for (page, target_store, target_path, retry_model, retry_role,
+                     _label) in retry_jobs]
+            labels = {future: retry_jobs[index][5]
+                      for index, future in enumerate(futs)}
+            for index, future in enumerate(as_completed(futs), 1):
+                page, count, error = future.result()
+                label = labels[future]
+                message = (f"ERROR {error}" if error and count is None
+                           else f"{count} items")
+                print(f"  [vision-repair {index}/{len(futs)}] "
+                      f"{label} P{page}: {message}", flush=True)
+                _p(90 + 5 * index / len(futs))
+                if should_cancel and should_cancel():
+                    for pending in futs:
+                        pending.cancel()
+                    break
+        _set(slug, repairing=None,
+             detail="Automatic image-scan repair finished; validating results…")
+    _p(95)
+
+    # Report only final residuals.  A first-pass error repaired above never
+    # reaches the user, and each unresolved source appears exactly once.
+    for page in need:
+        record = vlm.get(str(page)) or {}
+        if not is_current_primary_record(record, primary_identity):
+            warnings.append(
+                f"P{page} primary image scan incomplete after automatic repair: "
+                f"{record.get('error') or 'stale VLM cache identity'}")
+    for page in fneed:
+        record = flash.get(str(page)) or {}
+        if not is_current_secondary_record(record, flash_identity):
+            warnings.append(
+                f"P{page} second image scan incomplete after automatic repair: "
+                f"{record.get('error') or 'stale VLM cache identity'}")
     _sub["flash"] = time.perf_counter() - _t
     _t = time.perf_counter()
 
@@ -842,23 +1295,28 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
         stored = vlm.get(str(p))
         rec = stored if is_current_primary_record(stored, primary_identity) \
             else None
-        if rec is None and not inst:
-            continue                     # never VLM'd, no fence text → skip
+        flash_stored = flash.get(str(p)) if _secondary_enabled(p) else None
+        flash_rec = (flash_stored
+                     if is_current_secondary_record(flash_stored,
+                                                    flash_identity)
+                     else None)
+        if rec is None and flash_rec is None and not inst:
+            continue                   # neither model nor vector has evidence
         vitems = (rec or {}).get("items", [])
         flash_error = None
-        if not v.get("has_text"):
-            fr = flash.get(str(p))
-            if is_current_secondary_record(fr, flash_identity):
-                vitems = union_vlm(vitems, fr.get("items"))
-            elif isinstance(fr, dict):
-                flash_error = fr.get("error") or "stale VLM cache identity"
+        if flash_rec is not None:
+            vitems = union_vlm(vitems, flash_rec.get("items"))
+        elif isinstance(flash_stored, dict):
+            flash_error = (flash_stored.get("error")
+                           or "stale VLM cache identity")
         dbg = DebugSink()
         # 单页组装（选实例 → 剥符号码 → 融合 → 调试视图）只有 steps.text.page
         # 这一份实现，将来的单页重扫共用它，绝不会出现第二条会漂移的合并循环。
         fused_rec = fuse_page(pdf, p - 1, v, flagged, vitems,
                               use_kw_floor=is_default, dbg=dbg)
         if not (fused_rec["vlm_items"] or fused_rec["vec_added"]
-                or fused_rec["vec_covered"] or rec is not None):
+                or fused_rec["vec_covered"] or rec is not None
+                or flash_rec is not None):
             continue
         fused_rec["vlm_error"] = (
             None if rec is not None
@@ -889,13 +1347,6 @@ def _stage_text(slug, target, on_progress=None, should_cancel=None):
     print(f"  [timing:text] {[(k, round(v, 1)) for k, v in _sub.items()]}",
           flush=True)
 
-    # 复核：每一页需要补跑的 VLM 是否真的当期了（失败页不会静默消失）
-    residual = [p for p in need
-                if not is_current_primary_record(vlm.get(str(p)),
-                                                 primary_identity)]
-    if residual:
-        warnings.append(f"text VLM still has {len(residual)} stale sheets: "
-                        f"{residual[:12]}")
     return warnings
 
 
@@ -951,8 +1402,10 @@ def _symbol_one(slug, page, items, sig):
             break
         except Exception as exc:                            # noqa: BLE001
             err = f"{type(exc).__name__}: {exc}"
-            if attempt < RETRIES:
+            if should_retry_model_error(exc, attempt, RETRIES + 1):
                 time.sleep(15 * (attempt + 1))
+            else:
+                break
     if entry is None:
         return page, None, err, False, {}, 0, []
 
@@ -1008,7 +1461,8 @@ def _stage_symbols(slug, on_progress=None, should_cancel=None):
     sweep_calls = 0          # 补扫里失败的块数（成功的块数见每页日志）
     done = 0
     with ThreadPoolExecutor(max_workers=max(1, SYMBOLS_WORKERS)) as ex:
-        futures = {ex.submit(_symbol_one, slug, *job): job[0] for job in jobs}
+        futures = {submit_with_context(ex, _symbol_one, slug, *job): job[0]
+                   for job in jobs}
         for future in as_completed(futures):
             submitted_page = futures[future]
             done += 1
@@ -1111,8 +1565,10 @@ def _view_one(slug, page, pdf, groups, revision):
             break
         except Exception as exc:                            # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"
-            if attempt < RETRIES:
+            if should_retry_model_error(exc, attempt, RETRIES + 1):
                 time.sleep(10 * (attempt + 1))
+            else:
+                break
     if entry is None:
         return page, None, error
     with _IO_LOCK:
@@ -1131,7 +1587,8 @@ def _stage_views(slug, on_progress=None, should_cancel=None):
     if on_progress:
         on_progress(0, len(jobs))
     with ThreadPoolExecutor(max_workers=max(1, VIEW_WORKERS)) as pool:
-        futures = {pool.submit(_view_one, slug, *job): job[0] for job in jobs}
+        futures = {submit_with_context(pool, _view_one, slug, *job): job[0]
+                   for job in jobs}
         for number, future in enumerate(as_completed(futures), 1):
             submitted_page = futures[future]
             if on_progress:
@@ -1340,8 +1797,29 @@ def _placement_anchors(result):
     return anchors
 
 
-def _arrow_one(slug, page, items, sig, regions, extra_anchors):
+def _raise_if_cancelled(should_cancel):
+    if should_cancel and should_cancel():
+        raise Cancelled()
+
+
+def _retry_pause(seconds, should_cancel=None):
+    """Retry backoff which remains responsive to a queued-job cancellation."""
+    if should_cancel is None:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        _raise_if_cancelled(should_cancel)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
+
+
+def _arrow_one(slug, page, items, sig, regions, extra_anchors,
+               should_cancel=None):
     """一页的箭头检测，结果原子写回 arrows.json。"""
+    _raise_if_cancelled(should_cancel)
     cache_path = slug_dir(slug) / "arrows.json"
     geometry = arrows.page_geometry_status(pdf_path(slug), page - 1)
     if geometry.get("state") == "image-only":
@@ -1361,14 +1839,24 @@ def _arrow_one(slug, page, items, sig, regions, extra_anchors):
     error = None
     for attempt in range(RETRIES + 1):
         try:
-            found, anchor_diagnostics = arrows.find_page_arrows(
-                pdf_path(slug), page - 1, items, plan_regions=regions,
-                extra_anchors=extra_anchors, return_diagnostics=True)
+            with _slot_pool(
+                    "heavy-sidecar", HEAVY_SIDECAR_SLOTS).slot(
+                        cancelled=should_cancel):
+                _raise_if_cancelled(should_cancel)
+                found, anchor_diagnostics = arrows.find_page_arrows(
+                    pdf_path(slug), page - 1, items, plan_regions=regions,
+                    extra_anchors=extra_anchors, return_diagnostics=True)
             break
+        except SlotWaitCancelled as exc:
+            raise Cancelled() from exc
+        except Cancelled:
+            raise
         except Exception as exc:                            # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"
-            if attempt < RETRIES:
-                time.sleep(5 * (attempt + 1))
+            if attempt < RETRIES and not is_timeout_error(exc):
+                _retry_pause(5 * (attempt + 1), should_cancel)
+            else:
+                break
     if found is None:
         # 失败必须落盘。没有条目和「算过但没找到」在界面上是两回事，而且不写
         # 的话下一轮排活看不出这页试过又失败了。故意不写 items —— 缺 items 的
@@ -1376,7 +1864,7 @@ def _arrow_one(slug, page, items, sig, regions, extra_anchors):
         with _IO_LOCK:
             cache = load_json(cache_path, {})
             cache[str(page)] = {"sig": sig, "v": arrows.ARROWS_VERSION,
-                                "error": error}
+                                "error": error, "geometry": geometry}
             save_json(cache_path, cache)
         return page, None, error
     with _IO_LOCK:
@@ -1385,7 +1873,10 @@ def _arrow_one(slug, page, items, sig, regions, extra_anchors):
         cache[str(page)] = {"sig": sig, "v": arrows.ARROWS_VERSION,
                             "items": {str(k): v for k, v in found.items()},
                             "anchors": {str(k): v for k, v
-                                        in anchor_diagnostics.items()}}
+                                        in anchor_diagnostics.items()},
+                            # 线型阶段用这个已经免费算出的 path 数
+                            # 选 10 / 30 分钟的自适应截止，避免再打开 PDF。
+                            "geometry": geometry}
         save_json(cache_path, cache)
     return page, len(found), None
 
@@ -1401,7 +1892,10 @@ def _stage_arrows(slug, on_progress=None, should_cancel=None):
         on_progress(0, len(jobs))
     total = 0
     with ThreadPoolExecutor(max_workers=max(1, ARROWS_WORKERS)) as pool:
-        futures = {pool.submit(_arrow_one, slug, *job): job[0] for job in jobs}
+        futures = {
+            pool.submit(_arrow_one, slug, *page_job, should_cancel): page_job[0]
+            for page_job in jobs
+        }
         for number, future in enumerate(as_completed(futures), 1):
             submitted_page = futures[future]
             if on_progress:
@@ -1466,38 +1960,138 @@ def _linetype_jobs(slug):
     return jobs, warnings
 
 
-def _linetype_one(slug, page, items, arrow_entry, sig):
+def _linetype_timeout_for(slug, page, arrow_entry):
+    """Choose a bounded deadline without penalising genuinely huge sheets."""
+    geometry = (arrow_entry or {}).get("geometry")
+    if not isinstance(geometry, dict):
+        # Old arrow caches predate the geometry field.  One cheap MuPDF pass
+        # upgrades the decision in memory; if even that fails, favour recall
+        # and use the dense deadline rather than timing out a valid huge page.
+        try:
+            geometry = arrows.page_geometry_status(pdf_path(slug), page - 1)
+        except Exception:                                      # noqa: BLE001
+            return LINETYPE_DENSE_TIMEOUT
+    try:
+        paths = int(geometry.get("vector_paths") or 0)
+    except (TypeError, ValueError):
+        return LINETYPE_DENSE_TIMEOUT
+    return (LINETYPE_DENSE_TIMEOUT
+            if paths >= LINETYPE_DENSE_PATHS else LINETYPE_TIMEOUT)
+
+
+_LINETYPE_TIMEOUT_BUDGET_RE = re.compile(
+    r"\blinetype\s+sidecar\s+timeout\s+after\s+([0-9]+(?:\.[0-9]+)?)s\b",
+    re.I)
+
+
+def _linetype_failed_timeout_budget(error):
+    """Deadline embedded in a persisted sidecar timeout marker, if any."""
+    match = _LINETYPE_TIMEOUT_BUDGET_RE.search(str(error or ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _linetype_failure_budget_increased(slug, page, arrow_entry, error):
+    """Whether a timeout failure is eligible under a larger current budget."""
+    previous = _linetype_failed_timeout_budget(error)
+    return (previous is not None
+            and previous < _linetype_timeout_for(slug, page, arrow_entry))
+
+
+def _linetype_retryable(error):
+    """Only retry failures which might change in a fresh sidecar process.
+
+    A timeout has already consumed its complete deadline.  Named sidecar
+    errors (PAGE_IR_ERROR, CLUSTER_ERROR, etc.) are deterministic for the same
+    PDF bytes and engine version.  Retrying either three times was the direct
+    cause of web uploads sitting at 99% for hours.
+    """
+    if is_timeout_error(error):
+        return False
+    message = str(error)
+    if re.search(r"linetype sidecar [A-Z][A-Z0-9_]+:", message):
+        return False
+    return "SourceAlignmentError" not in message
+
+
+def _linetype_job_still_current(slug, page, sig):
+    """Return whether this captured sheet/signature is still schedulable.
+
+    Reusing ``_linetype_jobs`` keeps this check on exactly the same prerequisite
+    contract as normal scheduling: current results, current arrows (including
+    placement anchors and PDF revision), at least one terminal, and no already
+    current successful line-type cache.  A failed cache remains eligible because
+    it intentionally has no ``bindings`` key, so this lookup does not turn a
+    retryable failure into a permanent cache hit.
+    """
+    jobs, _warnings = _linetype_jobs(slug)
+    return any(candidate[0] == int(page) and candidate[3] == sig
+               for candidate in jobs)
+
+
+def _linetype_one(slug, page, items, arrow_entry, sig, should_cancel=None):
     """一页的线型聚类 + 绑定，结果原子写回 linetypes.json。
 
     page 是 1-based（与 results.json 的页键、引擎 API 一致）。
     """
-    entry = None
-    error = None
-    for attempt in range(RETRIES + 1):
-        try:
-            entry = linetypes.compute_page_linetypes(
-                pdf_path(slug), page, items, arrow_entry, sig=sig)
-            break
-        except Exception as exc:                            # noqa: BLE001
-            error = f"{type(exc).__name__}: {exc}"
-            if attempt < RETRIES:
-                time.sleep(5 * (attempt + 1))
-    # 一页一个文件，所以不需要 _IO_LOCK：没有读-改-写，也没有跨页共享的文件。
-    # 失败同样必须落盘，且形状要被当期判据拒绝：不写 bindings，于是
-    # has_current_linetypes 判假、下次自动重试。写成空 bindings 就是用
-    # 「这页没有线型」冒充「这页没算过」。
-    linetypes.save_page(slug, page, entry if entry is not None else {
-        "sig": sig, "v": linetypes.LINETYPE_VERSION, "error": error})
-    if entry is None:
-        return page, None, error
-    return page, len(entry.get("used_all") or ()), None
+    with _linetype_page_lock(slug, page, cancelled=should_cancel):
+        _raise_if_cancelled(should_cancel)
+        # 等锁时另一个进程可能已经算完这页，也可能新的
+        # results/arrows 已经把捕获的 sig 作废。两种情况都安静丢弃，
+        # 不把「已被取代」误报成页面失败。
+        if not _linetype_job_still_current(slug, page, sig):
+            return page, 0, None
+
+        entry = None
+        error = None
+        timeout = _linetype_timeout_for(slug, page, arrow_entry)
+        for attempt in range(RETRIES + 1):
+            try:
+                with _slot_pool(
+                        "heavy-sidecar", HEAVY_SIDECAR_SLOTS).slot(
+                            cancelled=should_cancel):
+                    _raise_if_cancelled(should_cancel)
+                    entry = linetypes.compute_page_linetypes(
+                        pdf_path(slug), page, items, arrow_entry, sig=sig,
+                        timeout=timeout)
+                break
+            except SlotWaitCancelled as exc:
+                raise Cancelled() from exc
+            except Cancelled:
+                raise
+            except Exception as exc:                        # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"
+                if attempt < RETRIES and _linetype_retryable(exc):
+                    _retry_pause(5 * (attempt + 1), should_cancel)
+                else:
+                    break
+
+        # 聚类可能跑几分钟。落盘前立即重读先决条件：如果这期间
+        # PDF/results/arrows/placements/engine 任一变了，这份结果就不再属于
+        # 当前页面。无论成功还是失败记录都不允许覆盖新一代缓存。
+        if not _linetype_job_still_current(slug, page, sig):
+            return page, 0, None
+
+        # 一页一个文件，同页由 advisory lock 保护，不需要跨页
+        # _IO_LOCK。失败同样必须落盘，且形状要被当期判据拒绝：
+        # 不写 bindings，has_current_linetypes 判假，下次自动重试。
+        linetypes.save_page(slug, page, entry if entry is not None else {
+            "sig": sig, "v": linetypes.LINETYPE_VERSION, "error": error})
+        if entry is None:
+            return page, None, error
+        return page, len(entry.get("used_all") or ()), None
 
 
 def _stage_linetypes(slug, on_progress=None, should_cancel=None):
     """箭头末端框里那一种线，在全页高亮出来（本地矢量 + 独立 venv 边车）。
 
-    单线程：边车自己会按 cpu_budget 开进程池吃满核，外面再并发只会互相抢核，
-    而且一页峰值内存不小（实测 3595 op 的页 80 s）。
+    页级并发由 ``LINETYPE_PAGE_WORKERS`` 控制（生产前台为 2）；每个线程等待一个
+    单页边车，边车内部再按 ``LINETYPE_CPU_BUDGET`` 使用 worker 预算（生产前台 4，
+    低优先级 refresh 2）。每页独立缓存，并受跨进程页锁与共享 heavy slot 保护。
     """
     jobs, warnings = _linetype_jobs(slug)
     print(f"linetype jobs: {len(jobs)}  page_workers={LINETYPE_PAGE_WORKERS}",
@@ -1511,113 +2105,255 @@ def _stage_linetypes(slug, on_progress=None, should_cancel=None):
     # 有大段单线程阶段（PageIR 抽取、序列化、进程启停），并行跑多页正好把这些
     # 空档填上。一页一个缓存文件，所以并发写盘不会互相等。
     with ThreadPoolExecutor(max_workers=max(1, LINETYPE_PAGE_WORKERS)) as pool:
-        futures = {pool.submit(_linetype_one, slug, *job): job[0]
-                   for job in jobs}
-        for future in as_completed(futures):
-            submitted = futures[future]
-            if should_cancel and should_cancel():
-                for pending in futures:
-                    pending.cancel()
-                break
-            try:
-                page, count, error = future.result()
-            except Exception as exc:                        # noqa: BLE001
-                page, count = submitted, None
-                error = f"{type(exc).__name__}: {exc}"
-            done += 1
-            if on_progress:
-                on_progress(done, len(jobs))
-            if error:
-                warnings.append(f"P{page} line-type clustering failed: {error}")
-                print(f"[{done}/{len(jobs)}] {slug} P{page}: ERROR {error}",
-                      flush=True)
-            else:
-                total += count or 0
-                print(f"[{done}/{len(jobs)}] {slug} P{page}: {count} line types",
-                      flush=True)
+        futures = {
+            pool.submit(
+                _linetype_one, slug, *page_job, should_cancel): page_job[0]
+            for page_job in jobs
+        }
+        heartbeat_stop = threading.Event()
+
+        def heartbeat():
+            # A valid dense page can spend minutes inside the local engine.
+            # Keep the job card visibly alive even when no page has completed
+            # since the previous browser poll; this is not fake completion
+            # progress, just an explicit bounded-work heartbeat.
+            while not heartbeat_stop.wait(10):
+                if should_cancel and should_cancel():
+                    return
+                remaining = sum(not future.done() for future in futures)
+                if not remaining:
+                    return
+                _set(
+                    slug,
+                    detail=(f"Line-type engine active: {done}/{len(jobs)} "
+                            f"sheets finished, {remaining} remaining "
+                            f"(per-sheet limit {LINETYPE_TIMEOUT}s; dense "
+                            f"{LINETYPE_DENSE_TIMEOUT}s)"))
+
+        heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+        heartbeat_thread.start()
+        try:
+            for future in as_completed(futures):
+                submitted = futures[future]
+                if should_cancel and should_cancel():
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                try:
+                    page, count, error = future.result()
+                except Exception as exc:                    # noqa: BLE001
+                    page, count = submitted, None
+                    error = f"{type(exc).__name__}: {exc}"
+                done += 1
+                if on_progress:
+                    on_progress(done, len(jobs))
+                if error:
+                    warnings.append(
+                        f"P{page} line-type clustering failed: {error}")
+                    print(f"[{done}/{len(jobs)}] {slug} P{page}: ERROR {error}",
+                          flush=True)
+                else:
+                    total += count or 0
+                    print(f"[{done}/{len(jobs)}] {slug} P{page}: "
+                          f"{count} line types", flush=True)
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
     print(f"linetypes total: {total}", flush=True)
     return warnings
 
 
 # ------------------------------------------------------------- run pipeline --
-def start_job(slug, target=None, model=None):
+def _start_job_claimed(slug, target=None, model=None, _resume=False):
+    """Start a worker after the caller has reserved ``slug``."""
+    target = (target or "").strip()
+    model = model if (model and model in PRICING) else None
+    is_default = is_default_target(target)
+    mode = "fence" if is_default else "custom"
+    try:
+        base_llm, base_wall = _carry_baseline(slug)
+        _set(slug, mode=mode, target=(target or TARGET_DEFAULT),
+             stage="queued", detail="Queued…", progress=0.0,
+             stage_done=0, stage_total=0, stage_unit=None, pages_total=0,
+             done=False, ok=None, error=None, cancelled=False,
+             outcome=None, results_available=False, repairing=None,
+             cancel_requested=False, warnings=[], heartbeat_at=time.time(),
+             started=time.time(), finished=None,
+             llm=(base_llm or None), wall_seconds=(base_wall or None),
+             model=(model or MODEL_NAME),
+             created=datetime.now().isoformat(timespec="seconds"))
+        # Take the response snapshot before start(). Once start() returns,
+        # ownership of the reservation belongs to _run_reserved.
+        status = get_job(slug)
+        thread = threading.Thread(
+            target=_run_reserved,
+            args=(slug, (target or None), base_llm, base_wall, model, _resume),
+            daemon=True)
+        thread.start()
+    except Exception as exc:                                  # noqa: BLE001
+        _release_job_start(slug)
+        try:
+            _set(slug, done=True, ok=False, outcome="failed", stage="error",
+                 stage_unit=None, detail="Background worker did not start",
+                 error=f"{type(exc).__name__}: {exc}", finished=time.time())
+        except Exception:                                     # noqa: BLE001
+            pass
+        raise JobStartError(f"{type(exc).__name__}: {exc}") from exc
+    return status
+
+
+def start_job(slug, target=None, model=None, _resume=False):
     """Kick off background processing for ONE detection target.
 
     ``target`` is the user-editable "what to detect" text (see
     steps/text/target.py).  Blank / equal-to-default → fence mode (the full
-    four-stage chain); anything else → custom mode, which runs the text step
-    only, because the symbol / view / placement steps are fence-specific.
+    six-stage text → symbols → views → placements → arrows → linetypes chain
+    in production); anything else → custom mode, which runs the text step only,
+    because the other five stages are fence-specific.
 
     ``model`` pins every paid call in this run to one model id (see
     core.config.set_model_override).  None keeps the process default, so
     existing callers are unaffected.
     """
-    target = (target or "").strip()
-    model = model if (model and model in PRICING) else None
-    is_default = is_default_target(target)
-    mode = "fence" if is_default else "custom"
-    total = page_count_of(slug)
-    base_llm, base_wall = _carry_baseline(slug)
-    _set(slug, mode=mode, target=(target or TARGET_DEFAULT),
-         stage="queued", detail="Queued…", progress=0.0,
-         stage_done=0, stage_total=0, pages_total=total,
-         done=False, ok=None, error=None, cancelled=False,
-         cancel_requested=False, warnings=[],
-         started=time.time(), finished=None,
-         llm=(base_llm or None), wall_seconds=(base_wall or None),
-         model=(model or MODEL_NAME),
-         created=datetime.now().isoformat(timespec="seconds"))
-    t = threading.Thread(target=_run,
-                         args=(slug, (target or None), base_llm, base_wall,
-                               model),
-                         daemon=True)
-    t.start()
-    return get_job(slug)
+    if not _claim_job_start(slug, resume=_resume):
+        return get_job(slug)
+    return _start_job_claimed(slug, target=target, model=model,
+                              _resume=_resume)
 
 
-def _run(slug, target, base_llm=None, base_wall=0.0, model=None):
-    cancel_ev = threading.Event()
-    _CANCEL[slug] = cancel_ev
-    should_cancel = cancel_ev.is_set
-    if not _PROC_LOCK.acquire(timeout=0.0):
-        # Another run is active; wait for it (jobs are cheap to queue).
-        _set(slug, stage="queued",
-             detail="Waiting for the previous task to finish…")
-        _PROC_LOCK.acquire()
+def restart_job(slug, target=None, model=None, *, reset=True):
+    """Atomically reserve, optionally clear caches, and rerun one project."""
+    _claim_job_start(slug)
     try:
-        _RUNNING.update({"slug": slug, "base": (base_llm or dict(_ZERO_LLM)),
-                         "base_wall": float(base_wall or 0.0)})
-        # Pin the model for this run. Same scoping rules as RECORDER below:
-        # set inside _PROC_LOCK, cleared in the finally, and safe only because
-        # runs are serialized and the service is pinned to gunicorn -w 1.
+        if job_running(slug):
+            raise JobStartError("this project is already in progress")
+        cleared = reset_project_cache(slug) if reset else []
+        status = _start_job_claimed(slug, target=target, model=model)
+        return status, cleared
+    except Exception:
+        # Harmless if _start_job_claimed already released after a start error.
+        _release_job_start(slug)
+        raise
+
+
+def _run_reserved(slug, target, base_llm=None, base_wall=0.0, model=None,
+                  _resume=False):
+    try:
+        _run(slug, target, base_llm, base_wall, model, _resume)
+    finally:
+        _release_job_start(slug)
+
+
+def _run(slug, target, base_llm=None, base_wall=0.0, model=None,
+         _resume=False):
+    cancel_ev = _register_cancel_event(slug)
+    # request_cancel() can win the tiny race between Thread.start() and this
+    # registration.  Honour the persisted/in-memory bit as well as the Event.
+    with _JOBS_LOCK:
+        if (JOBS.get(slug) or {}).get("cancel_requested"):
+            cancel_ev.set()
+    try:
+        # Do not persist a queued detail for an automatic resume before its
+        # post-lock done recheck.  During graceful replacement the old worker
+        # may already have published the authoritative terminal card.
+        if not _resume:
+            _set(slug, stage="queued",
+                 detail=(f"Waiting for a processing slot "
+                         f"({MAX_PARALLEL_JOBS} PDFs can run together)…"))
+        # Same-slug first, then shared capacity: a duplicate resume never holds
+        # one of the scarce project slots while waiting for the live owner.
+        with stable_named_lock(_job_run_lock_path(slug),
+                               cancelled=cancel_ev.is_set):
+            with _interprocess_proc_lock(cancelled=cancel_ev.is_set):
+                # A replacement worker may have queued this resume while the
+                # old worker was finishing. Re-read only automatic resumes once
+                # both locks are ours; explicit reruns still run.
+                if _resume:
+                    persisted = load_json(_job_file(slug), None)
+                    if isinstance(persisted, dict) and persisted.get("done"):
+                        with _JOBS_LOCK:
+                            JOBS[slug] = persisted
+                        return
+                with _JOBS_LOCK:
+                    if (JOBS.get(slug) or {}).get("cancel_requested"):
+                        cancel_ev.set()
+                _run_owned(slug, target, cancel_ev.is_set,
+                           base_llm=base_llm, base_wall=base_wall, model=model)
+    except SlotWaitCancelled:
+        total = _merge_llm(base_llm, None)
+        _set(slug, done=True, ok=False, cancelled=True, stage="cancelled",
+             outcome="failed", results_available=results_path(slug).exists(),
+             stage_unit=None, detail="Cancelled while queued", llm=total,
+             wall_seconds=(float(base_wall) if base_wall else None),
+             finished=time.time())
+    except Exception as exc:                                  # noqa: BLE001
+        # Lock-directory/flock failures happen before _run_owned's pipeline
+        # exception boundary. Never leave such a worker looking queued forever.
+        traceback.print_exc()
+        total = _merge_llm(base_llm, None)
+        _set(slug, done=True, ok=False, cancelled=False, stage="error",
+             outcome="failed", results_available=results_path(slug).exists(),
+             stage_unit=None, detail="Processing could not start", llm=total,
+             error=f"{type(exc).__name__}: {exc}",
+             wall_seconds=(float(base_wall) if base_wall else None),
+             finished=time.time())
+    finally:
+        _unregister_cancel_event(slug, cancel_ev)
+
+
+def _run_owned(slug, target, should_cancel, base_llm=None, base_wall=0.0,
+               model=None):
+    """Run one job while its slug lock and one project slot are held."""
+    processing_started = time.time()
+    with _RUNNING_LOCK:
+        _RUNNING[slug] = {
+            "base": (base_llm or dict(_ZERO_LLM)),
+            "base_wall": float(base_wall or 0.0),
+            "processing_started": processing_started,
+        }
+    with _JOBS_LOCK:
+        queued_at = (JOBS.get(slug) or {}).get("started")
+    _set(slug, processing_started=processing_started,
+         queue_seconds=(round(processing_started - queued_at, 1)
+                        if queued_at else 0.0),
+         detail="Processing started…")
+    try:
+        # Both values are ContextVars; paid worker submissions propagate them.
         set_model_override(model)
-        RECORDER.start()
+        RECORDER.start(slug)
         # cumulative cost is flushed to disk on every completed call via
         # RECORDER.on_update (_flush_running), so a crash keeps the exact spend
         if should_cancel():
             raise Cancelled()
-        _run_pipeline(slug, target, should_cancel)
-        summary = RECORDER.stop()
+        # MuPDF open/page-count can wait behind a render's FITZ_LOCK and should
+        # never delay the HTTP upload response.  It belongs to the background
+        # run; the queued card legitimately starts with pages_total=0.
+        with _job_heartbeat(slug):
+            _set(slug, pages_total=page_count_of(slug))
+            _run_pipeline(slug, target, should_cancel)
+        summary = RECORDER.stop(slug)
         _persist_llm(slug, summary)
         _finish(slug, ok=True, summary=summary)
     except Cancelled:
-        summary = RECORDER.stop()
+        summary = RECORDER.stop(slug)
         _persist_llm(slug, summary)     # keep whatever spend already happened
+        total = _merge_llm(_running_state(slug).get("base"), summary)
         _set(slug, done=True, ok=False, cancelled=True, stage="cancelled",
-             detail="Cancelled", llm=summary, finished=time.time())
+             outcome="failed", results_available=results_path(slug).exists(),
+             stage_unit=None, detail="Cancelled", llm=total,
+             finished=time.time())
         wall = _wall_now(slug)
         if wall is not None:
             _set(slug, wall_seconds=wall)
     except Exception as e:                                     # noqa: BLE001
-        summary = RECORDER.stop()
+        summary = RECORDER.stop(slug)
         traceback.print_exc()
         _finish(slug, ok=False, summary=summary,
                 error=f"{type(e).__name__}: {e}")
     finally:
-        _RUNNING.update({"slug": None, "base": None, "base_wall": 0.0})
+        with _RUNNING_LOCK:
+            _RUNNING.pop(slug, None)
         set_model_override(None)
-        _CANCEL.pop(slug, None)
-        _PROC_LOCK.release()
 
 
 def _stage_progress(slug, lo, hi):
@@ -1660,6 +2396,7 @@ def _run_pipeline(slug, target, should_cancel=None):
     is_default = is_default_target(target)
     text_hi = 0.55 if is_default else 1.0
     _set(slug, stage="text", progress=0.0, stage_done=0, stage_total=0,
+         stage_unit="percent",
          detail="Vector text layer judge + image VLM detection (same target), fusing…")
     _warn(slug, timed("text(vec+judge+vlm)", lambda: _stage_text(
         slug, target,
@@ -1670,19 +2407,19 @@ def _run_pipeline(slug, target, should_cancel=None):
         # custom target: the fence-specific symbol/view/placement steps do not
         # apply to an arbitrary detection target.
         _set(slug, stage="done", detail="Text step done", progress=1.0,
-             stage_done=0, stage_total=0)
+             stage_done=0, stage_total=0, stage_unit=None)
         done_msg()
         return
 
     _set(slug, stage="symbols", detail="Legend symbol detection (VLM)…",
-         progress=0.55, stage_done=0, stage_total=0)
+         progress=0.55, stage_done=0, stage_total=0, stage_unit="sheets")
     _warn(slug, timed("symbols", lambda: _stage_symbols(
         slug, on_progress=_stage_progress(slug, 0.55, 0.80), should_cancel=sc)))
     guard()
     _snapshot(slug)
 
     _set(slug, stage="views", detail="View classification (VLM)…",
-         progress=0.80, stage_done=0, stage_total=0)
+         progress=0.80, stage_done=0, stage_total=0, stage_unit="sheets")
     _warn(slug, timed("views", lambda: _stage_views(
         slug, on_progress=_stage_progress(slug, 0.80, 0.92), should_cancel=sc)))
     guard()
@@ -1692,7 +2429,7 @@ def _run_pipeline(slug, target, should_cancel=None):
     plc_hi = 0.96 if arrows.ENABLED else 1.0
     _set(slug, stage="placements",
          detail="Shape placement matching (local, no model)…",
-         progress=0.92, stage_done=0, stage_total=0)
+         progress=0.92, stage_done=0, stage_total=0, stage_unit="sheets")
     _warn(slug, timed("placements", lambda: _stage_placements(
         slug, on_progress=_stage_progress(slug, 0.92, plc_hi),
         should_cancel=sc)))
@@ -1703,7 +2440,8 @@ def _run_pipeline(slug, target, should_cancel=None):
         # 才有它的位置；开着时把尾段再一分为二。
         arw_hi = 0.98 if linetypes.ENABLED else 1.0
         _set(slug, stage="arrows", detail="Arrow / leader detection…",
-             progress=plc_hi, stage_done=0, stage_total=0)
+             progress=plc_hi, stage_done=0, stage_total=0,
+             stage_unit="sheets")
         _warn(slug, timed("arrows", lambda: _stage_arrows(
             slug, on_progress=_stage_progress(slug, plc_hi, arw_hi),
             should_cancel=sc)))
@@ -1713,7 +2451,8 @@ def _run_pipeline(slug, target, should_cancel=None):
         if linetypes.ENABLED:
             _set(slug, stage="linetypes",
                  detail="Line-type clustering (local sidecar, no model)…",
-                 progress=arw_hi, stage_done=0, stage_total=0)
+                 progress=arw_hi, stage_done=0, stage_total=0,
+                 stage_unit="sheets")
             _warn(slug, timed("linetypes", lambda: _stage_linetypes(
                 slug, on_progress=_stage_progress(slug, arw_hi, 1.0),
                 should_cancel=sc)))
@@ -1721,18 +2460,36 @@ def _run_pipeline(slug, target, should_cancel=None):
             _snapshot(slug)
 
     _set(slug, stage="done", detail="Done", progress=1.0,
-         stage_done=0, stage_total=0)
+         stage_done=0, stage_total=0, stage_unit=None)
     done_msg()
 
 
 def resume_interrupted():
-    """Called once at server startup.  Reload persisted job status for the
-    gallery, and mark any run that was still in flight as INTERRUPTED — we do
-    NOT auto-relaunch it.  Auto-resuming a big PDF on restart caused a surprise
-    spend; making it explicit avoids that.  The user can just re-run it."""
-    interrupted = []
+    """Reload persisted cards and resume work interrupted by a server restart.
+
+    Every paid/raw stage checkpoints by page and validates cache identity, so
+    continuing the same upload neither reuses another PDF's result nor repeats
+    completed calls.  A user-requested cancellation remains cancelled; only an
+    unfinished, non-cancelled job with its input PDF still present is resumed.
+    """
     if not JOBS_DIR.exists():
         return
+    # During a graceful worker replacement, the old worker can still be
+    # checkpointing its final page while the new worker imports wsgi.py.  Wait
+    # for that run before deciding what is genuinely unfinished; otherwise the
+    # new worker can overwrite a just-finished card with done=false.
+    with _interprocess_proc_lock(all_slots=True):
+        resumable = _restore_interrupted_cards()
+    for slug, target, model in resumable:
+        start_job(slug, target=target, model=model, _resume=True)
+    if resumable:
+        print(f"[resume] relaunched {len(resumable)} unfinished job(s): "
+              f"{[slug for slug, _target, _model in resumable]}", flush=True)
+
+
+def _restore_interrupted_cards():
+    """Restore cards and return resumable jobs while the process lock is held."""
+    resumable = []
     for f in sorted(JOBS_DIR.glob("*.json")):
         job = load_json(f, None)
         if not isinstance(job, dict):
@@ -1744,10 +2501,22 @@ def resume_interrupted():
             JOBS[slug] = job                 # restore for the gallery/cards
         if job.get("done"):
             continue                          # already finished — leave as-is
-        _set(slug, done=True, ok=False, cancelled=True, stage="interrupted",
-             detail="Server restarted — task interrupted "
-                    "(not auto-resumed; run it again if you still want it)")
-        interrupted.append(slug)
-    if interrupted:
-        print(f"[resume] marked {len(interrupted)} interrupted (not relaunched): "
-              f"{interrupted}", flush=True)
+        if job.get("cancel_requested"):
+            _set(slug, done=True, ok=False, cancelled=True,
+                 outcome="failed", stage="cancelled", stage_unit=None,
+                 results_available=results_path(slug).exists(),
+                 detail="Cancelled")
+            continue
+        if not pdf_path(slug).exists():
+            _set(slug, done=True, ok=False, cancelled=False, stage="error",
+                 outcome="failed", stage_unit=None,
+                 results_available=results_path(slug).exists(),
+                 error="input.pdf is missing; cannot resume after restart",
+                 detail="Resume failed: input PDF is missing")
+            continue
+        resumable.append((slug, job.get("target"), job.get("model")))
+        _set(slug, done=False, ok=None, outcome=None,
+             results_available=False, cancelled=False, stage="queued",
+             stage_unit=None, repairing=None,
+             detail="Server restarted — resuming from saved page checkpoints…")
+    return resumable

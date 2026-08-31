@@ -30,6 +30,27 @@ from steps.text.target import TARGET_DEFAULT, build_vlm_prompt
 PROMPT = build_vlm_prompt(TARGET_DEFAULT)
 
 
+class VLMResponseError(RuntimeError):
+    """The provider answered, but its JSON contract was not safely usable."""
+
+    retry_as_malformed = True
+
+
+def _same_json_value(left, right):
+    """Strict JSON-value equality (unlike Python, ``true`` is not ``1``)."""
+    if type(left) is not type(right):                          # noqa: E721
+        return False
+    if isinstance(left, list):
+        return (len(left) == len(right)
+                and all(_same_json_value(a, b)
+                        for a, b in zip(left, right)))
+    if isinstance(left, dict):
+        return (left.keys() == right.keys()
+                and all(_same_json_value(left[key], right[key])
+                        for key in left))
+    return left == right
+
+
 def _parse_scan_response(text):
     """Parse one *complete* scan response.
 
@@ -38,27 +59,59 @@ def _parse_scan_response(text):
     array would therefore turn a transport failure into a durable false
     negative.  Accept the two documented payload shapes (and complete
     markdown fences for provider compatibility), but reject every incomplete
-    or trailing-garbage response so the caller retries it.
+    or trailing-garbage response so the caller retries it.  Gemini's SDK can
+    occasionally expose the same complete JSON document twice (for example
+    ``[]\n[]`` from two text parts).  That case is losslessly idempotent, so
+    accept it as one document; multiple *different* documents remain an
+    ambiguous protocol failure and are rejected.
     """
     raw = (text or "").strip()
     if not raw:
-        raise RuntimeError("empty Gemini response")
+        raise VLMResponseError("empty Gemini response")
     if raw.startswith("```"):
         if not raw.endswith("```") or len(raw) < 6:
-            raise RuntimeError("incomplete fenced Gemini response")
+            raise VLMResponseError("incomplete fenced Gemini response")
         raw = re.sub(r"^```(?:json)?\s*", "", raw, count=1,
                      flags=re.IGNORECASE)
         raw = raw[:-3].strip()
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"incomplete/unparseable Gemini response: {raw[:200]!r}"
-        ) from exc
+        # ``GenerateContentResponse.text`` concatenates all non-thinking text
+        # parts.  Three deterministic retries of final_plans P17 therefore
+        # produced ``[]\n[]``: two individually complete, identical payloads
+        # which strict json.loads correctly rejects as "extra data".  Decode
+        # every top-level value and collapse only an exact repetition.  If a
+        # later value is truncated, any non-whitespace garbage remains, or the
+        # values differ, fail closed exactly as before.
+        decoder = json.JSONDecoder()
+        values = []
+        offset = 0
+        try:
+            while offset < len(raw):
+                # JSON permits exactly these four whitespace characters.
+                # Accepting every Unicode ``isspace`` character here would
+                # make the duplicate-document fallback looser than json.loads.
+                while offset < len(raw) and raw[offset] in " \t\r\n":
+                    offset += 1
+                if offset >= len(raw):
+                    break
+                value, offset = decoder.raw_decode(raw, offset)
+                values.append(value)
+        except json.JSONDecodeError:
+            values = []
+        if len(values) >= 2 and all(
+                _same_json_value(value, values[0])
+                for value in values[1:]):
+            parsed = values[0]
+        else:
+            raise VLMResponseError(
+                f"incomplete/unparseable Gemini response: {raw[:200]!r}"
+            ) from exc
     if isinstance(parsed, dict):
         parsed = parsed.get("items")
     if not isinstance(parsed, list):
-        raise RuntimeError(
+        raise VLMResponseError(
             f"Gemini response must be an array or items object: {raw[:200]!r}"
         )
     return parsed
@@ -117,11 +170,12 @@ def scan_page(pdf_path, page_index, model=None, timeout_ms=300_000,
                       "label": str(it.get("label", "other")).strip() or "other"})
     # 全丢 = 响应整体不可信，不能当成「这页没有围栏文字」。
     if parsed and not items:
-        raise RuntimeError(
+        raise VLMResponseError(
             f"Gemini scan: all {len(parsed)} rows unusable ({'; '.join(dropped[:5])})")
     if dropped:
         # 丢了行必须能被看见 —— 静默丢比报错更糟。走 stderr，作业日志里能查到。
-        print(f"  [vlm] dropped opped  {len(dropped)}  malformed rowsormed rows: {'; '.join(dropped[:5])}",
+        print(f"  [vlm] dropped {len(dropped)} malformed rows: "
+              f"{'; '.join(dropped[:5])}",
               flush=True)
     return items, elapsed, usage_from_response(resp)
 

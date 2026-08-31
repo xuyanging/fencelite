@@ -443,6 +443,15 @@ class TestSweepPage(unittest.TestCase):
         self.assertEqual(len(calls), SWEEP_ATTEMPTS)
         self.assertIn("504 deadline", out["errors"][0]["error"])
 
+    def test_provider_timeout_gets_one_retry_not_three(self):
+        calls = _install_fake_gen_json(
+            self, [TimeoutError("provider timed out")])
+        _install_fake_render(self)
+        out = sweep_page("x.pdf", 0, self.ITEMS, self.GROUPS, [])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(out["calls"], 2)
+        self.assertIn("provider timed out", out["errors"][0]["error"])
+
     def test_recovers_on_the_second_attempt(self):
         calls = _install_fake_gen_json(self, [
             "truncated {",

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 从零把 fence_lite 装到一台 Ubuntu 机器上。幂等，可重复跑。
 #
-# 这个脚本是 2026-08-28 在 my-aws-ubuntu（2 vCPU / 1.9GB / Ubuntu 22.04）上
-# 实际走通一遍之后固化下来的，不是照着文档想出来的。
+# 当前 systemd profile 按生产机 8 vCPU / 15 GiB / Ubuntu 22.04 固化。
+# 换机器规格时先调整 deploy/fence-parallel-jobs.conf，不能直接套用并发值。
 #
 #   bash deploy/setup_ubuntu.sh
 #
@@ -10,7 +10,7 @@
 # 要迁移已算好的缓存，见本文件末尾的说明 —— 不能直接 rsync 完就完事。
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-/home/ubuntu/fence_lite2}"
+APP_DIR="${APP_DIR:-/home/ubuntu/fence_lite}"
 NODE_VERSION="${NODE_VERSION:-v24.14.1}"
 NODE_HOME="${NODE_HOME:-$HOME/.local/opt}"
 
@@ -64,17 +64,29 @@ if [ ! -f "$APP_DIR/.env" ]; then
 缺 .env。建一个（权限 600），至少要有：
     GEMINI_API_KEY=...
     ANTHROPIC_API_KEY=...      # 只在切 Claude provider 时需要
-注意 core/config.py 的 _load_env_file 会**无条件覆盖** os.environ ——
-.env 里的值会盖掉 systemd 里设的同名变量，别在里面放占位值。
+core/config.py 只从 .env 补充当前进程里缺少的变量；systemd Environment
+和 EnvironmentFile 已经提供的同名值优先，别在任一处放占位密钥。
 MSG
   exit 1
 fi
 chmod 600 "$APP_DIR/.env"
 
 say "6/6 systemd"
-sudo cp "$APP_DIR/deploy/fence_lite.service" /etc/systemd/system/fence_lite2.service
+sudo cp "$APP_DIR/deploy/fence_lite.service" /etc/systemd/system/fence_lite.service
+sudo install -d /etc/systemd/system/fence_lite.service.d
+sudo cp "$APP_DIR/deploy/fence-lite-web-threads.conf" \
+  /etc/systemd/system/fence_lite.service.d/web-threads.conf
+sudo cp "$APP_DIR/deploy/fence-parallel-jobs.conf" \
+  /etc/systemd/system/fence_lite.service.d/parallel-jobs.conf
+sudo cp "$APP_DIR/deploy/fence-upload-limit.conf" \
+  /etc/systemd/system/fence_lite.service.d/upload-limit.conf
+sudo cp "$APP_DIR/deploy/fence-linetype-refresh.service" \
+  /etc/systemd/system/fence-linetype-refresh.service
+sudo cp "$APP_DIR/deploy/fence-linetype-refresh.timer" \
+  /etc/systemd/system/fence-linetype-refresh.timer
 sudo systemctl daemon-reload
-sudo systemctl enable --now fence_lite2
+sudo systemctl enable --now fence_lite
+sudo systemctl enable --now fence-linetype-refresh.timer
 
 say "自检"
 ./venv/bin/python - <<'PY'
@@ -90,20 +102,20 @@ print("  → 出现 'missing' 就说明 site-packages 布局没找对，"
 d = sidecar.engine_digest()
 print("engine_digest :", d)
 print("缓存签名分量  : e" + hashlib.sha1(str(d).encode()).hexdigest()[:12])
-print("  → 必须与开发机逐字相同（开发机 2026-08-28 是 e0c450fa5e05f）")
+print("  → 必须与本次发布验证记录的 digest 相同；不要跨 digest 复用线型缓存")
 print("箭头边车 node :", arrows._NODE, arrows.sidecar_available())
 PY
 
 cat <<'MSG'
 
 装完了。冒烟验证：
-    systemctl is-active fence_lite2
+    systemctl is-active fence_lite
     curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5051/
     curl -s -F "pdf=@某份.pdf" http://127.0.0.1:5051/api/upload
     # 跑完一页后确认两个接缝阶段真的落盘了：
     ls data/<slug>/arrows.json data/<slug>/linetypes/
     # 停服后不应有孤儿边车：
-    sudo systemctl stop fence_lite2 && pgrep -af 'linetype_sidecar|arrow_sidecar'
+    sudo systemctl stop fence_lite && pgrep -af 'linetype_sidecar|arrow_sidecar'
 
 迁移已算好的缓存（可选，别直接 rsync 完就完事）：
   pdf_revision = 字节数 + mtime_ns，是全部签名的根。tar/docker COPY/对象存储

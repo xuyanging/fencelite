@@ -41,9 +41,10 @@ def _venv_python(venv_dir):
 _PYTHON = Path(os.environ.get("LINETYPE_PYTHON", "")
                or _venv_python(_SIDECAR_DIR / "venv"))
 
-# 单页超时。实测 gladstone P2（3595 个绘图 op）要 ~80 s；密页（rapid_city P27
-# 实测 165,913 op）会长得多，所以给足余量，超时按失败处理、下次重试。
-TIMEOUT = int(os.environ.get("LINETYPE_TIMEOUT", "1800"))
+# 直接调用边车时的普通页上限。Web 编排层会用 path 数分档：普通页
+# 600s，>=40k path 的超密页 3600s。这里默认 600s，防止脱离 web 的
+# 调用者重新引入无界等待。
+TIMEOUT = int(os.environ.get("LINETYPE_TIMEOUT", "600"))
 # 每页给引擎的 worker 数。**跟机器走**，并且**不进缓存签名**（见 engine_digest）。
 #
 # budget 不变性已经证明：tools/linetype_sidecar/verify_budget_invariance.py 在

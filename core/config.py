@@ -1,5 +1,7 @@
 """Global configuration: env-driven settings, model pricing, directories."""
 import os
+from contextvars import ContextVar, copy_context
+from functools import partial
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.parent
@@ -82,22 +84,21 @@ def provider_of(model: str) -> str:
 # ── Job-scoped model override ───────────────────────────────────────────────
 # The pipeline picks its model through resolve_model(), and almost every step
 # passes model=None, so a single override switches the whole run. This mirrors
-# the CallRecorder pattern in core/gemini.py: a global session toggled by the
-# orchestrator around one job. Safe for the same reason — the service is pinned
-# to gunicorn -w 1 and job.py serializes runs behind _PROC_LOCK, so two runs
-# never overlap. An explicit per-call model argument still wins.
-_MODEL_OVERRIDE = None
+# the CallRecorder pattern in core/gemini.py. Multiple PDFs may overlap, so
+# this value is job-local and explicitly propagated into paid worker pools.
+# An explicit per-call model argument still wins.
+_MODEL_OVERRIDE = ContextVar("fence_lite_model_override", default=None)
 
 
 def set_model_override(model):
     """Pin the model for the current job. Pass None to clear."""
-    global _MODEL_OVERRIDE
-    _MODEL_OVERRIDE = model if (model and model in PRICING) else None
-    return _MODEL_OVERRIDE
+    value = model if (model and model in PRICING) else None
+    _MODEL_OVERRIDE.set(value)
+    return value
 
 
 def get_model_override():
-    return _MODEL_OVERRIDE
+    return _MODEL_OVERRIDE.get()
 
 
 def resolve_model(name: str) -> str:
@@ -105,9 +106,22 @@ def resolve_model(name: str) -> str:
     to the process default."""
     if name and name in PRICING:
         return name
-    if _MODEL_OVERRIDE:
-        return _MODEL_OVERRIDE
+    override = _MODEL_OVERRIDE.get()
+    if override:
+        return override
     return MODEL_NAME
+
+
+def submit_with_context(executor, fn, /, *args, **kwargs):
+    """Submit work while preserving job-scoped ContextVars in that thread.
+
+    ThreadPoolExecutor workers start with an empty context. Every paid
+    pipeline pool uses this helper so the model override and per-job recorder
+    session remain attached to the PDF which scheduled the call.
+    """
+    context = copy_context()
+    call = partial(fn, *args, **kwargs)
+    return executor.submit(context.run, call)
 
 
 def compute_cost(model: str, usage: dict):

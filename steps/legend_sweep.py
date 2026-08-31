@@ -45,9 +45,10 @@ import time
 from google.genai import types as _genai_types
 from PIL import Image
 
-from core.config import (HIRES_DPI, MAX_HIRES_PX, get_model_override,
-                         resolve_model)
-from core.gemini import _encode_image_for_gemini, gen_json, usage_from_response
+from core.config import (HIRES_DPI, MAX_HIRES_PX, MODEL_NAME,
+                         get_model_override, resolve_model)
+from core.gemini import (_encode_image_for_gemini, gen_json,
+                         should_retry_model_error, usage_from_response)
 from core.parsing import _coerce_box, parse_json_value
 from core.pdfio import render_pdf_page
 from steps.prompts import SYMBOL_GROUP_KINDS
@@ -83,7 +84,7 @@ def _env_float(name, default, minimum=0.0):
 
 # 模型：走 resolve_model 是为了拒绝价目表之外的 id —— 未知 id 会让 RECORDER
 # 算不出 USD（compute_cost 返回 None），费用统计静默变成 0。
-SWEEP_MODEL = resolve_model(os.environ.get("FL_SWEEP_MODEL"))
+SWEEP_MODEL = resolve_model(os.environ.get("FL_SWEEP_MODEL") or MODEL_NAME)
 SWEEP_DPI = _env_int("FL_SWEEP_DPI", HIRES_DPI)            # 裁剪块的渲染 DPI
 SWEEP_MAX_PX = _env_int("FL_SWEEP_MAX_PX", 4000)           # 裁剪块长边上限
 SWEEP_PAGE_MAX_PX = _env_int("FL_SWEEP_PAGE_MAX_PX",       # 整页渲染长边上限
@@ -508,6 +509,9 @@ def _ask_block(crop_image, rows, model, timeout_ms):
         except Exception as exc:                               # noqa: BLE001
             elapsed += time.perf_counter() - started
             last_error = f"{type(exc).__name__}: {exc}"
+            if not should_retry_model_error(
+                    exc, attempt, SWEEP_ATTEMPTS):
+                break
             if attempt + 1 < SWEEP_ATTEMPTS:
                 time.sleep(SWEEP_BACKOFF_S * (attempt + 1))
     return {"rows": None, "elapsed": elapsed, "usage": usage, "calls": calls,

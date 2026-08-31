@@ -3,18 +3,21 @@
 fence_takeoff_web addition: ``gen_json`` is the single chokepoint every paid
 Gemini call in the whole pipeline passes through (verified: exactly one
 ``generate_content`` site in the codebase).  We therefore record each call's
-wall-time + token usage + USD cost into a thread-safe global ``RECORDER`` so
-the web layer can report a processing job's total model time and spend.  The
-recorder is a pure observer — it never changes call behaviour.
+wall-time + token usage + USD cost into a thread-safe, job-partitioned
+``RECORDER`` so the web layer can report each concurrently processing PDF's
+model time and spend. The recorder is a pure observer.
 """
 import io
+import os
 import threading
 import time
+from contextvars import ContextVar
 
 from google import genai
 from google.genai import types
 from PIL import Image
 
+from core.concurrency import SlotPool, shared_capacity_directory
 from core.config import (API_KEY, GEMINI_INLINE_BYTES_LIMIT, compute_cost,
                          provider_of)
 
@@ -29,110 +32,201 @@ _USAGE_FIELDS = (
 )
 
 
-class CallRecorder:
-    """Accumulates (model, elapsed, usage, cost) for every gen_json call.
+_RECORDER_SESSION = ContextVar("fence_lite_recorder_session", default=None)
 
-    Recording is a global session toggled by the web orchestrator around one
-    processing job (jobs are serialized, so no interleaving).  Every counter is
-    guarded by a lock because the batch stages fan calls out across many worker
-    threads.  ``elapsed`` is summed across concurrent calls, so ``model_seconds``
-    is total model busy-time (not wall-clock); the orchestrator reports both.
+
+def _empty_recording(on=False):
+    return {
+        "on": bool(on), "calls": 0, "model_seconds": 0.0,
+        "input_tokens": 0, "output_tokens": 0, "thoughts_tokens": 0,
+        "cost_usd": 0.0, "by_model": {}, "active": 0,
+        "peak_concurrency": 0,
+    }
+
+
+def _recording_summary(state):
+    state = state or _empty_recording()
+    return {
+        "calls": state["calls"],
+        "model_seconds": round(state["model_seconds"], 2),
+        "peak_concurrency": state["peak_concurrency"],
+        "input_tokens": state["input_tokens"],
+        "output_tokens": state["output_tokens"],
+        "thoughts_tokens": state["thoughts_tokens"],
+        "cost_usd": round(state["cost_usd"], 4),
+        "by_model": {
+            key: {**value, "seconds": round(value["seconds"], 2),
+                  "cost_usd": round(value["cost_usd"], 4)}
+            for key, value in state["by_model"].items()
+        },
+    }
+
+
+class CallRecorder:
+    """Keep an independent cost ledger for every concurrently running PDF.
+
+    A ContextVar identifies the current job.  The orchestrator propagates that
+    context into every paid ThreadPool callback, allowing calls from multiple
+    PDFs to overlap without combining their usage or peak-concurrency totals.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._on = False
-        # optional callback fired (outside the lock) after each counted call,
-        # so the web layer can persist cumulative cost on every completion
+        self._sessions = {}
+        self._sequence = 0
+        # Callback(session_key), fired outside the recorder lock after a paid
+        # call is accounted, so job.py can durably flush the correct PDF.
         self.on_update = None
-        self.reset()
 
-    def reset(self):
+    def _key(self, session=None):
+        return session if session is not None else _RECORDER_SESSION.get()
+
+    def start(self, session=None):
         with self._lock:
-            self.calls = 0
-            self.model_seconds = 0.0
-            self.input_tokens = 0
-            self.output_tokens = 0
-            self.thoughts_tokens = 0
-            self.cost_usd = 0.0
-            self.by_model = {}
-            self.active = 0            # model calls in flight right now
-            self.peak_concurrency = 0  # max simultaneous calls this session
+            if session is None:
+                self._sequence += 1
+                session = ("legacy", threading.get_ident(), self._sequence)
+            self._sessions[session] = _empty_recording(on=True)
+        _RECORDER_SESSION.set(session)
+        return session
+
+    def stop(self, session=None):
+        key = self._key(session)
+        with self._lock:
+            state = self._sessions.pop(key, None) if key is not None else None
+            if state is not None:
+                state["on"] = False
+            out = _recording_summary(state)
+        if _RECORDER_SESSION.get() == key:
+            _RECORDER_SESSION.set(None)
+        return out
 
     def enter(self):
-        """Mark a call in flight; tracks peak simultaneity = real parallelism."""
+        key = self._key()
+        if key is None:
+            return
         with self._lock:
-            self.active += 1
-            if self._on and self.active > self.peak_concurrency:
-                self.peak_concurrency = self.active
+            state = self._sessions.get(key)
+            if not state or not state["on"]:
+                return
+            state["active"] += 1
+            state["peak_concurrency"] = max(
+                state["peak_concurrency"], state["active"])
 
     def leave(self):
+        key = self._key()
+        if key is None:
+            return
         with self._lock:
-            if self.active > 0:
-                self.active -= 1
-
-    def start(self):
-        self.reset()
-        with self._lock:
-            self._on = True
-
-    def stop(self):
-        with self._lock:
-            self._on = False
-        return self.summary()
+            state = self._sessions.get(key)
+            if state and state["active"] > 0:
+                state["active"] -= 1
 
     def add(self, model, elapsed, usage):
-        if not self._on:
+        key = self._key()
+        if key is None:
             return
-        self._add_locked(model, elapsed, usage)
-        cb = self.on_update
-        if cb:
-            try:
-                cb()
-            except Exception:                                  # noqa: BLE001
-                pass  # persistence must never break a paid call
-
-    def _add_locked(self, model, elapsed, usage):
         cost = compute_cost(model, usage) or {}
         in_tok = int((usage or {}).get("input_tokens") or 0)
         out_tok = int((usage or {}).get("output_tokens") or 0)
         th_tok = int((usage or {}).get("thoughts_tokens") or 0)
         usd = float(cost.get("total_usd") or 0.0)
         with self._lock:
-            self.calls += 1
-            self.model_seconds += float(elapsed or 0.0)
-            self.input_tokens += in_tok
-            self.output_tokens += out_tok
-            self.thoughts_tokens += th_tok
-            self.cost_usd += usd
-            m = self.by_model.setdefault(
+            state = self._sessions.get(key)
+            if not state or not state["on"]:
+                return
+            state["calls"] += 1
+            state["model_seconds"] += float(elapsed or 0.0)
+            state["input_tokens"] += in_tok
+            state["output_tokens"] += out_tok
+            state["thoughts_tokens"] += th_tok
+            state["cost_usd"] += usd
+            by_model = state["by_model"].setdefault(
                 model, {"calls": 0, "seconds": 0.0, "cost_usd": 0.0,
                         "input_tokens": 0, "output_tokens": 0,
                         "thoughts_tokens": 0})
-            m["calls"] += 1
-            m["seconds"] += float(elapsed or 0.0)
-            m["cost_usd"] += usd
-            m["input_tokens"] += in_tok
-            m["output_tokens"] += out_tok
-            m["thoughts_tokens"] += th_tok
+            by_model["calls"] += 1
+            by_model["seconds"] += float(elapsed or 0.0)
+            by_model["cost_usd"] += usd
+            by_model["input_tokens"] += in_tok
+            by_model["output_tokens"] += out_tok
+            by_model["thoughts_tokens"] += th_tok
+        cb = self.on_update
+        if cb:
+            try:
+                cb(key)
+            except Exception:                                  # noqa: BLE001
+                pass  # persistence must never break a paid call
 
-    def summary(self):
+    def summary(self, session=None):
+        key = self._key(session)
         with self._lock:
-            return {
-                "calls": self.calls,
-                "model_seconds": round(self.model_seconds, 2),
-                "peak_concurrency": self.peak_concurrency,
-                "input_tokens": self.input_tokens,
-                "output_tokens": self.output_tokens,
-                "thoughts_tokens": self.thoughts_tokens,
-                "cost_usd": round(self.cost_usd, 4),
-                "by_model": {k: {**v, "seconds": round(v["seconds"], 2),
-                                 "cost_usd": round(v["cost_usd"], 4)}
-                             for k, v in self.by_model.items()},
-            }
+            return _recording_summary(self._sessions.get(key))
 
 
 RECORDER = CallRecorder()
+
+# Two project pipelines can each fan out six or eight Gemini calls.  Bound the
+# combined provider pressure while still allowing more overlap than the old
+# single-project scheduler.  Queue wait stays outside _record(), so it is not
+# mislabeled as provider/model time.
+GEMINI_MAX_CONCURRENCY = max(
+    1, int(os.environ.get("GEMINI_MAX_CONCURRENCY", "8")))
+_GEMINI_SLOTS = SlotPool(
+    shared_capacity_directory(), "provider-gemini", GEMINI_MAX_CONCURRENCY)
+
+
+def is_timeout_error(error) -> bool:
+    """Return whether an exception chain represents a hard deadline.
+
+    Retrying malformed model output can help.  A remote provider deadline gets
+    one bounded accuracy retry, while a deterministic local-engine deadline is
+    not repeated; identifying the two prevents the old three-full-deadline
+    progress stall.  Keep this test provider-agnostic (Google, Anthropic and
+    ``subprocess`` use different exception classes) and walk the chained
+    cause/context as SDKs often wrap their transport timeout.
+    """
+    seen = set()
+    current = error
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        name = type(current).__name__.lower()
+        message = str(current).lower()
+        # A malformed model payload can legitimately contain the word
+        # "timeout" in its own text.  It is still a completed provider call,
+        # not a transport deadline; keep it on the malformed-response retry
+        # path.  The string prefix covers error records reloaded from JSON,
+        # where the original exception type is no longer available.
+        if (getattr(current, "retry_as_malformed", False)
+                or message.startswith("vlmresponseerror:")):
+            return False
+        if ("timeout" in name or "timeout" in message
+                or "deadline exceeded" in message
+                or "deadline_exceeded" in message
+                or "deadlineexceeded" in message):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def should_retry_model_error(error, attempt, total_attempts,
+                             timeout_retries=1) -> bool:
+    """Bound retries without treating a provider timeout as deterministic.
+
+    ``attempt`` is zero-based and describes the call which just failed.
+    Malformed/transient responses may use every configured attempt.  A remote
+    model timeout gets only ``timeout_retries`` additional calls (one by
+    default): this preserves recall after a one-off transport/provider stall
+    while keeping every page's wall time finite.  Local deterministic engine
+    timeouts intentionally do not use this helper.
+    """
+    if attempt + 1 >= max(1, int(total_attempts)):
+        return False
+    if getattr(error, "retry_as_malformed", False):
+        return True
+    if is_timeout_error(error):
+        return attempt < max(0, int(timeout_retries))
+    return True
 
 
 def gen_json(model, contents, timeout_ms=None, thinking_budget=None,
@@ -164,18 +258,21 @@ def gen_json(model, contents, timeout_ms=None, thinking_budget=None,
                 thinking_budget=thinking_budget,
                 response_json_schema=response_json_schema,
             ))
-    return _record(model, lambda: client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-            response_json_schema=response_json_schema,
-            http_options=types.HttpOptions(timeout=timeout_ms) if timeout_ms else None,
-            thinking_config=(types.ThinkingConfig(thinking_budget=thinking_budget)
-                             if thinking_budget else None),
-        ),
-    ))
+    with _GEMINI_SLOTS.slot():
+        return _record(model, lambda: client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_json_schema=response_json_schema,
+                http_options=(types.HttpOptions(timeout=timeout_ms)
+                              if timeout_ms else None),
+                thinking_config=(
+                    types.ThinkingConfig(thinking_budget=thinking_budget)
+                    if thinking_budget else None),
+            ),
+        ))
 
 
 def _record(model, send):
@@ -228,4 +325,3 @@ def _encode_image_for_gemini(image: Image.Image):
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=92, optimize=True)
     return buf.getvalue(), "image/jpeg"
-

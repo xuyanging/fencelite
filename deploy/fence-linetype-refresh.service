@@ -1,0 +1,35 @@
+[Unit]
+Description=fence_lite low-priority stale line-type refresh
+After=network-online.target fence_lite.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/fence_lite
+EnvironmentFile=/home/ubuntu/fence_lite/.env
+Environment=PYTHONUTF8=1
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=ARROWS=1
+Environment=LINETYPES=1
+Environment=ARROWS_NODE=/home/ubuntu/.local/opt/node/bin/node
+Environment=LINETYPE_PYTHON=/home/ubuntu/fence_lite/tools/linetype_sidecar/venv/bin/python
+Environment=LINETYPE_TIMEOUT=600
+Environment=LINETYPE_DENSE_TIMEOUT=3600
+Environment=LINETYPE_DENSE_PATHS=40000
+Environment=LINETYPE_CPU_BUDGET=2
+Environment=HEAVY_SIDECAR_SLOTS=2
+Environment=LINETYPE_REFRESH_WORKERS=1
+ExecStart=/home/ubuntu/fence_lite/venv/bin/python -B /home/ubuntu/fence_lite/tools/refresh_stale_linetypes.py --once
+
+# The refresh is local CPU work and must never crowd out a live upload.
+Nice=12
+CPUWeight=10
+CPUQuota=400%
+IOSchedulingClass=idle
+MemoryHigh=8G
+MemoryMax=10G
+TasksMax=256
+TimeoutStartSec=infinity

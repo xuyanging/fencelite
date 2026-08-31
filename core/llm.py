@@ -30,6 +30,8 @@ import threading
 
 from PIL import Image
 
+from core.concurrency import SlotPool, shared_capacity_directory
+
 # ── Anthropic request limits ────────────────────────────────────────────────
 # Per-image cap is 10 MB *base64*, and base64 inflates by 4/3 — bound the raw
 # bytes at 5 MB. (Gemini's limit in core/config.py is 90 MB, far above this,
@@ -67,7 +69,8 @@ _JPEG_LADDER = (92, 85, 78, 70, 60)
 # limit, not a model property — raise ANTHROPIC_MAX_CONCURRENCY once the limit
 # is lifted and the two providers' wall-times become comparable again.
 MAX_CONCURRENCY = max(1, int(os.environ.get("ANTHROPIC_MAX_CONCURRENCY", "1")))
-_slots = threading.BoundedSemaphore(MAX_CONCURRENCY)
+_slots = SlotPool(
+    shared_capacity_directory(), "provider-anthropic", MAX_CONCURRENCY)
 
 
 def slot():
@@ -77,7 +80,7 @@ def slot():
     the recorder's timer, so a thread waiting for the connection is not counted
     as an in-flight call nor billed as model time.
     """
-    return _slots
+    return _slots.slot()
 
 # Reasoning depth. Sonnet 5 / Opus 5 default to "high"; drop to "medium" if the
 # gunicorn --timeout 600 becomes the binding constraint on big pages.
@@ -326,11 +329,13 @@ def get_client():
                         "ANTHROPIC_API_KEY is required to run a Claude model. "
                         "Add it to fence_lite/.env and restart the service."
                     )
-                # max_retries above the SDK default of 2: a burst of
-                # concurrent-connection 429s should be ridden out rather than
-                # failing a page, and the semaphore below keeps the burst small.
+                # Retry policy belongs to the page orchestration layer, which
+                # checkpoints attempts and caps provider timeouts at two total
+                # calls.  Hidden SDK retries here would multiply a nominal
+                # 180/300/540-second deadline and make the web card appear
+                # hung for an unobservable number of attempts.
                 _client = anthropic.Anthropic(api_key=key, timeout=600.0,
-                                              max_retries=6)
+                                              max_retries=0)
     return _client
 
 

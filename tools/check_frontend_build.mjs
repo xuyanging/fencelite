@@ -72,7 +72,12 @@ const makeNode = (tag) => {
     get innerHTML() { return this._html || ""; },
     set innerHTML(v) { this._html = v; this.children = []; },
     get value() { return this._value || ""; },
-    set value(v) { this._value = v; },
+    set value(v) {
+      this._value = v;
+      // A real <input type=file> clears FileList when value is reset.  Mirror
+      // that for batch-upload execution tests using lightweight fake files.
+      if (v === "" && Array.isArray(this.files)) this.files = [];
+    },
     // 页面大量用 el.className='a b c' 而不是 classList.add，桩里必须同步，
     // 否则 classList.contains() 恒为假 —— 检查看着在跑，其实什么都没验。
     // <select>.options —— 侧栏的下拉靠它同步选中值，桩里缺了会抛 TypeError
@@ -113,6 +118,7 @@ const document = {
 };
 
 const errors = [];
+const sessionValues = new Map();
 const sandbox = {
   document,
   console,
@@ -151,6 +157,11 @@ const sandbox = {
   location: { href: BASE + "/", origin: BASE, pathname: "/", search: "" },
   history: { replaceState() {}, pushState() {} },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+  sessionStorage: {
+    getItem: (key) => sessionValues.has(String(key)) ? sessionValues.get(String(key)) : null,
+    setItem: (key, value) => sessionValues.set(String(key), String(value)),
+    removeItem: (key) => sessionValues.delete(String(key)),
+  },
   matchMedia: () => ({ matches: false, addEventListener() {}, addListener() {} }),
   IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
   ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
@@ -167,6 +178,11 @@ const sandbox = {
   innerHeight: 800,
   scrollTo() {},
   confirm: () => true,
+  // index.html gives every request an AbortController-backed deadline.  VM
+  // contexts do not inherit Node's web globals automatically, so expose the
+  // real implementations or the smoke test dies before build() is reached.
+  AbortController: globalThis.AbortController,
+  AbortSignal: globalThis.AbortSignal,
   URL,
   URLSearchParams,
 };
@@ -251,6 +267,522 @@ let failures = 0;
   } else {
     console.log("  OK   侧栏: 下拉项数正确, setSideMode 两向切换正常, "
       + "openProject/toggleProjectDrawer 可调用");
+  }
+}
+
+// ---- 主画布缩放：鼠标慢步进，触控板按小 delta 平滑缩放 ---------------------
+{
+  const problems = [];
+  try {
+    if (typeof context.wheelZoomFactor !== "function") {
+      problems.push("没有 wheelZoomFactor()");
+    } else {
+      const mouseIn = context.wheelZoomFactor({ deltaY: -100, deltaMode: 0 });
+      const mouseOut = context.wheelZoomFactor({ deltaY: 100, deltaMode: 0 });
+      const trackpadIn = context.wheelZoomFactor({ deltaY: -5, deltaMode: 0 });
+      const lineIn = context.wheelZoomFactor({ deltaY: -3, deltaMode: 1 });
+      if (!(mouseIn > 1 && mouseIn < 1.10))
+        problems.push(`鼠标放大倍率异常 (${mouseIn})`);
+      if (!(mouseOut < 1 && mouseOut > 0.90))
+        problems.push(`鼠标缩小倍率异常 (${mouseOut})`);
+      if (!(trackpadIn > 1 && trackpadIn < 1.01))
+        problems.push(`触控板小步进异常 (${trackpadIn})`);
+      if (!(lineIn > 1 && lineIn < 1.05))
+        problems.push(`行单位滚轮换算异常 (${lineIn})`);
+      if (Math.abs(mouseIn * mouseOut - 1) > 1e-9)
+        problems.push("同量正反缩放不对称");
+    }
+  } catch (error) {
+    const first = error && error.stack ? error.stack.split("\n")[0] : String(error);
+    problems.push(`抛出 -> ${first}`);
+  }
+  if (problems.length) {
+    console.log(`  FAIL 缩放: ${problems.join("; ")}`);
+    failures += 1;
+  } else {
+    console.log("  OK   缩放: 鼠标单步小于 10%，触控板按 delta 平滑缩放");
+  }
+}
+
+// ---- 多 PDF 上传：多选、逐份提交、单份失败隔离 -----------------------------
+{
+  const problems = [];
+  const source = scripts.join("\n");
+  const inputTag = (html.match(/<input\b[^>]*\bid=["']upFile["'][^>]*>/i) || [""])[0];
+  const savedPollState = vm.runInContext(
+    "({jobs:JOBS,poll:POLL,timer:POLL_TIMER,inflight:POLL_INFLIGHT,seq:POLL_SEQ})",
+    context);
+  const oldUploadPdfFile = context.uploadPdfFile;
+  const oldLoadOverview = context.loadOverview;
+  const upFile = context.document.getElementById("upFile");
+  const upRun = context.document.getElementById("upRun");
+  const upName = context.document.getElementById("upName");
+  const upErr = context.document.getElementById("upErr");
+  const modal = context.document.getElementById("modal");
+  try {
+    if (!/\bmultiple\b/i.test(inputTag)) problems.push("#upFile 没有 multiple");
+    if (!/\.pdf|application\/pdf/i.test(inputTag)) problems.push("#upFile 没有限定 PDF");
+    if (typeof context.enqueuePdfUploads !== "function")
+      problems.push("没有 enqueuePdfUploads()");
+
+    const calls = [];
+    let overviewCalls = 0;
+    context.__batchUploadMock = async (file, target) => {
+      calls.push({name:file.name,target});
+      if (file.name === "broken.pdf")
+        return {ok:false,status:400,body:{error:"not a PDF file"}};
+      return {ok:true,status:200,body:{slug:file.name.replace(/\.pdf$/i, ""),
+        job:{slug:file.name.replace(/\.pdf$/i, ""),stage:"queued",done:false}}};
+    };
+    let overviewThrows = false;
+    context.__batchOverviewMock = async () => {
+      overviewCalls += 1;
+      if (overviewThrows) throw new Error("gallery render failed");
+    };
+    vm.runInContext(
+      "uploadPdfFile = __batchUploadMock; loadOverview = __batchOverviewMock; "
+      + "JOBS = {}; POLL = {}; POLL_TIMER = null; POLL_INFLIGHT = false;",
+      context, { filename: "batch-upload-mocks" });
+
+    upFile.files = [{name:"alpha.pdf"},{name:"broken.pdf"},{name:"charlie.pdf"}];
+    upFile.onchange();
+    if (!upName.textContent.includes("3 PDFs selected")
+        || !upName.classList.contains("has"))
+      problems.push("多选后没有显示文件数");
+    if (upRun.disabled || !upRun.textContent.includes("3 PDFs"))
+      problems.push("多选后 Start 按钮状态/数量不对");
+    modal.style.display = "flex";
+    context.document.getElementById("upTarget").value = "shared target";
+    const partialRun = upRun.onclick();
+    context.document.getElementById("upCancel").onclick(); // Hide while active
+    await partialRun;
+    if (calls.map(x=>x.name).join(",") !== "alpha.pdf,broken.pdf,charlie.pdf")
+      problems.push("没有按选择顺序逐份提交，或失败后未继续");
+    if (calls.some(x=>x.target !== "shared target"))
+      problems.push("批内 PDF 没有共用 detection target");
+    const queued = vm.runInContext("Object.keys(JOBS).sort()", context);
+    if (Array.from(queued).join(",") !== "alpha,charlie")
+      problems.push("成功/失败文件进入任务队列的范围不对");
+    if (overviewCalls !== 1) problems.push(`overview 刷新 ${overviewCalls} 次，不是 1 次`);
+    if (modal.style.display !== "none"
+        || !context.document.getElementById("bUp").textContent.includes("1 upload failed"))
+      problems.push("隐藏后部分失败没有在顶栏保留可找回的摘要");
+    await context.document.getElementById("bUp").onclick();
+    if (modal.style.display !== "flex" || !upErr.textContent.includes("broken.pdf")
+        || !upErr.textContent.includes("not a PDF file")
+        || !upErr.classList.contains("bad"))
+      problems.push("部分失败摘要无法重新打开或缺少文件名/原因");
+    if ((upFile.files || []).length || !upRun.disabled)
+      problems.push("部分失败后没有清空选择，可能重复提交成功文件");
+
+    // 全成功批次即使 overview 渲染异常也必须收口，不能留下可重复提交的 FileList。
+    calls.length = 0;
+    overviewCalls = 0;
+    overviewThrows = true;
+    let releaseOverview = null;
+    context.__batchOverviewMock = async () => {
+      overviewCalls += 1;
+      await new Promise((resolve) => { releaseOverview = resolve; });
+      if (overviewThrows) throw new Error("gallery render failed");
+    };
+    vm.runInContext("loadOverview = __batchOverviewMock", context,
+      { filename: "batch-overview-deferred" });
+    vm.runInContext(
+      "JOBS = {}; POLL = {}; POLL_TIMER = null; POLL_INFLIGHT = false;",
+      context, { filename: "batch-upload-success" });
+    upFile.files = Array.from({length:30}, (_,i) => ({
+      name:`bulk_${String(i+1).padStart(2,"0")}.pdf`
+    }));
+    upFile.onchange();
+    if (!upName.textContent.includes("30 PDFs selected")
+        || !upRun.textContent.includes("30 PDFs"))
+      problems.push("30 份选择没有正确显示批次数量");
+    modal.style.display = "flex";
+    const successRun = upRun.onclick();
+    for (let i = 0; i < 200 && !releaseOverview; i += 1) await Promise.resolve();
+    if (!releaseOverview) {
+      problems.push("成功批次没有进入 overview settling 阶段");
+    } else {
+      if (!context.document.getElementById("upTarget").disabled
+          || context.document.getElementById("bUp").textContent !== "Uploading…")
+        problems.push("overview settling 时过早解除 busy，可交错启动新批次");
+      modal.style.display = "none";
+      await context.document.getElementById("bUp").onclick();
+      if (modal.style.display !== "flex")
+        problems.push("overview settling 时顶栏没有只恢复旧批次弹窗");
+      releaseOverview();
+    }
+    await successRun;
+    if (modal.style.display !== "none"
+        || !context.document.getElementById("side").classList.contains("project-open"))
+      problems.push("全成功批次没有关闭弹窗并打开任务队列");
+    if (overviewCalls !== 1 || calls.length !== 30)
+      problems.push("30 份全成功批次提交/overview 次数不对");
+    if ((upFile.files || []).length || !upRun.disabled)
+      problems.push("overview 异常后仍可重复提交成功批次");
+    if (context.uploadSelectionText([{name:"single.pdf"}]) !== "single.pdf")
+      problems.push("单文件选择文案不兼容");
+    upFile.files = [];
+    upFile.onchange();
+    if (!upRun.disabled) problems.push("空选择时 Start 按钮仍可用");
+    if (!/30\s*\*\s*60\s*\*\s*1000/.test(source))
+      problems.push("单文件上传长超时丢失");
+    if (!/fd\.append\(['"]upload_token['"],\s*token\)/.test(source))
+      problems.push("上传请求没有携带幂等 token");
+    const tokenFile = {name:"stable.pdf",size:123,lastModified:456};
+    const token1 = context.uploadTokenFor(tokenFile,"target A");
+    const token2 = context.uploadTokenFor({...tokenFile},"target A");
+    if (!token1 || token1 !== token2) problems.push("同一文件重选后 token 不稳定");
+    const tokenOtherTarget = context.uploadTokenFor(tokenFile,"target B");
+    if (tokenOtherTarget === token1) problems.push("不同 target 错误复用同一 token");
+    context.forgetUploadToken(tokenFile,"target A");
+    const token3 = context.uploadTokenFor(tokenFile,"target A");
+    if (token3 === token1) problems.push("成功后 token 没有释放，无法主动重新上传");
+
+    // 上传中可以隐藏并从顶栏重新打开；文件选择和 target 均被锁住。
+    upFile.files = [{name:"busy.pdf",size:1,lastModified:2}];
+    upFile.onchange();
+    context.setUploadBusy(true);
+    if (!context.document.getElementById("upPick").disabled
+        || !context.document.getElementById("upTarget").disabled
+        || upRun.disabled !== true
+        || context.document.getElementById("upCancel").textContent !== "Hide")
+      problems.push("上传忙碌态没有锁住选择/target 或缺少 Hide");
+    modal.style.display = "flex";
+    context.document.getElementById("upCancel").onclick();
+    if (modal.style.display !== "none") problems.push("上传中无法隐藏弹窗");
+    await context.document.getElementById("bUp").onclick();
+    if (modal.style.display !== "flex") problems.push("上传中无法从顶栏找回弹窗");
+    context.setUploadBusy(false);
+    context.clearUploadResultPending();
+
+    // 多任务顶栏优先显示真正运行的任务，不被更新但仍 queued 的 0% 卡盖住。
+    context.renderTopJobStatus([
+      {slug:"new_queued",stage:"queued",started:2,done:false,progress:0},
+      {slug:"old_running",stage:"text",started:1,done:false,progress:.4,
+       stage_done:4,stage_total:10,stage_unit:"percent"},
+    ]);
+    const topHtml = context.document.getElementById("jobStatus").innerHTML;
+    if (!topHtml.includes("2 PDFs") || !topHtml.includes("Step 1 · Find text"))
+      problems.push("批量顶栏没有优先显示正在运行的任务");
+  } catch (error) {
+    const first = error && error.stack ? error.stack.split("\n")[0] : String(error);
+    problems.push(`抛出 -> ${first}`);
+  } finally {
+    context.__oldUploadPdfFile = oldUploadPdfFile;
+    context.__oldLoadOverview = oldLoadOverview;
+    context.__savedPollState = savedPollState;
+    vm.runInContext(
+      "uploadPdfFile = __oldUploadPdfFile; loadOverview = __oldLoadOverview; "
+      + "JOBS = __savedPollState.jobs; POLL = __savedPollState.poll; "
+      + "POLL_TIMER = __savedPollState.timer; "
+      + "POLL_INFLIGHT = __savedPollState.inflight; POLL_SEQ = __savedPollState.seq;",
+      context, { filename: "restore-batch-upload" });
+    upFile.files = [];
+    upFile.value = "";
+    modal.style.display = "none";
+    context.toggleProjectDrawer(false);
+    context.renderJobs();
+  }
+  if (problems.length) {
+    console.log(`  FAIL 批量上传: ${problems.join("; ")}`);
+    failures += 1;
+  } else {
+    console.log("  OK   批量上传: 多选、逐份排队、失败隔离和防重复重试均正常");
+  }
+}
+
+// ---- 30 个任务共享一次轮询 / 一次渲染 ------------------------------------
+// 这项必须执行定时器回调，源码里出现 /api/jobs 并不能证明 startPoll 调 30 次
+// 后只挂了一个 timer，也不能证明同一 tick 完成两份时只刷新一次 overview。
+{
+  const problems = [];
+  const savedState = vm.runInContext(
+    "({jobs:JOBS,poll:POLL,timer:POLL_TIMER,inflight:POLL_INFLIGHT,seq:POLL_SEQ,cur:CUR})",
+    context);
+  const oldApi = context.api;
+  const oldRenderJobs = context.renderJobs;
+  const oldLoadOverview = context.loadOverview;
+  const oldShow = context.show;
+  const oldSetTimeout = context.setTimeout;
+  const oldClearTimeout = context.clearTimeout;
+  const scheduled = [];
+  const cleared = [];
+  const apiCalls = [];
+  const showCalls = [];
+  let timerSeq = 0;
+  let renderCalls = 0;
+  let overviewCalls = 0;
+  let mode = "finish-two";
+  const initial = Array.from({length:30}, (_,i) => ({
+    slug:`poll_${String(i+1).padStart(2,"0")}`,
+    done:false, ok:false, stage:i===0?"text":"queued", started:i+1,
+    progress:i===0?.2:0, warnings:[],
+  }));
+  const finished = initial.map((j,i) => i===0
+    ? {...j,done:true,ok:false,outcome:"partial",results_available:true,stage:"done"}
+    : i===1 ? {...j,done:true,ok:true,outcome:"success",results_available:true,stage:"done"}
+    : {...j});
+  try {
+    context.setTimeout = (fn, delay) => {
+      const item = {id:++timerSeq,fn,delay,cancelled:false};
+      scheduled.push(item);
+      return item.id;
+    };
+    context.clearTimeout = (id) => {
+      cleared.push(id);
+      const item = scheduled.find((x) => x.id === id);
+      if (item) item.cancelled = true;
+    };
+    context.__pollApiMock = async (url, opt) => {
+      apiCalls.push({url:String(url),opt:opt||{}});
+      if (String(url) !== "/api/jobs")
+        return {ok:true,status:200,body:{}};
+      if (mode === "network")
+        return {ok:false,status:0,body:{error:"Network error"}};
+      if (mode === "missing")
+        return {ok:true,status:200,body:finished.slice(3).map((j) => ({...j,done:false}))};
+      return {ok:true,status:200,body:finished};
+    };
+    context.__pollRenderMock = () => { renderCalls += 1; };
+    context.__pollOverviewMock = async () => { overviewCalls += 1; };
+    context.__pollShowMock = (...args) => { showCalls.push(args); };
+    context.__pollInitial = Object.fromEntries(initial.map((j) => [j.slug,j]));
+    vm.runInContext(
+      "api = __pollApiMock; renderJobs = __pollRenderMock; "
+      + "loadOverview = __pollOverviewMock; show = __pollShowMock; "
+      + "JOBS = __pollInitial; POLL = {}; POLL_TIMER = null; "
+      + "POLL_INFLIGHT = false; POLL_SEQ = 0; CUR = {slug:'poll_01',page:7};",
+      context, { filename: "batch-poll-mocks" });
+
+    for (const j of initial) context.startPoll(j.slug);
+    const firstTimers = scheduled.filter((x) => !x.cancelled);
+    if (firstTimers.length !== 1 || firstTimers[0].delay !== 0)
+      problems.push(`30 次 startPoll 调度了 ${firstTimers.length} 个首轮 timer`);
+    if (vm.runInContext("Object.keys(POLL).length", context) !== 30)
+      problems.push("没有同时追踪 30 个 slug");
+
+    const first = scheduled.shift();
+    if (first) await first.fn();
+    if (apiCalls.length !== 1 || apiCalls[0].url !== "/api/jobs")
+      problems.push(`首轮请求不是单个 /api/jobs（${apiCalls.map((x)=>x.url).join(",")}）`);
+    if (renderCalls !== 1)
+      problems.push(`首轮 30 状态触发了 ${renderCalls} 次 renderJobs`);
+    if (overviewCalls !== 1)
+      problems.push(`同 tick 两任务完成触发了 ${overviewCalls} 次 overview`);
+    if (showCalls.length !== 1 || showCalls[0][0] !== "poll_01" || showCalls[0][1] !== 7)
+      problems.push("完成的当前项目没有按 results_available 刷新原页");
+    if (vm.runInContext("Object.keys(POLL).length", context) !== 28)
+      problems.push("完成任务没有退出全局 watcher");
+    let next = scheduled.shift();
+    if (!next || next.delay !== 2000 || scheduled.length)
+      problems.push("成功 tick 后没有且仅有一个 2s timer");
+
+    // 网络失败保留全部 watcher，并且仍然只渲染、重试一次。
+    mode = "network";
+    apiCalls.length = 0;
+    if (next) await next.fn();
+    if (apiCalls.length !== 1 || renderCalls !== 2
+        || vm.runInContext("Object.keys(POLL).length", context) !== 28)
+      problems.push("网络失败没有用单次批量 tick 保留任务并重试");
+    if (!vm.runInContext("JOBS.poll_03.detail", context).includes("retrying"))
+      problems.push("网络失败没有显示 retrying 状态");
+    next = scheduled.shift();
+    if (!next || next.delay !== 2000 || scheduled.length)
+      problems.push("网络失败后没有且仅有一个 2s retry timer");
+
+    // 权威列表缺 slug 等价于旧单任务 endpoint 的 404：终止该 watcher，
+    // 但其他任务继续由同一个 timer 轮询。
+    mode = "missing";
+    apiCalls.length = 0;
+    if (next) await next.fn();
+    const missing = vm.runInContext("JOBS.poll_03", context);
+    if (!missing || missing.stage !== "error"
+        || !String(missing.error||"").includes("no longer exists")
+        || vm.runInContext("isPolling('poll_03')", context))
+      problems.push("批量列表缺项没有保留原 404 语义");
+    if (apiCalls.length !== 1 || renderCalls !== 3)
+      problems.push("缺项 tick 不是一次请求/一次 render");
+    next = scheduled.shift();
+    if (!next || next.delay !== 2000 || scheduled.length)
+      problems.push("缺项后其余任务没有共用一个 2s timer");
+
+    // Cancel 仍只做乐观状态并保留 watcher；实际 POST endpoint 不变。
+    mode = "action";
+    apiCalls.length = 0;
+    await context.cancelJob("poll_04");
+    if (!vm.runInContext("JOBS.poll_04.cancel_requested", context)
+        || !vm.runInContext("isPolling('poll_04')", context)
+        || !apiCalls.some((x) => x.url === "/api/cancel/poll_04"))
+      problems.push("取消操作改变了原有 POST/watcher 语义");
+
+    // 删除路径调用 stopPoll；移除最后一个 watcher 时共享 timer 也必须清掉。
+    vm.runInContext("for(const slug of Object.keys(POLL))stopPoll(slug)", context);
+    if (vm.runInContext("Object.keys(POLL).length", context)
+        || vm.runInContext("POLL_TIMER", context) !== null
+        || !cleared.includes(next&&next.id))
+      problems.push("stopPoll 没有在最后一个任务删除时清理共享 timer");
+    if (!/for\(const s of \[slug,[\s\S]*?stopPoll\(s\)/.test(scripts.join("\n")))
+      problems.push("删除项目没有接入 stopPoll");
+  } catch (error) {
+    const first = error && error.stack ? error.stack.split("\n")[0] : String(error);
+    problems.push(`抛出 -> ${first}`);
+  } finally {
+    context.api = oldApi;
+    context.renderJobs = oldRenderJobs;
+    context.loadOverview = oldLoadOverview;
+    context.show = oldShow;
+    context.setTimeout = oldSetTimeout;
+    context.clearTimeout = oldClearTimeout;
+    context.__savedBatchPollState = savedState;
+    vm.runInContext(
+      "JOBS = __savedBatchPollState.jobs; POLL = __savedBatchPollState.poll; "
+      + "POLL_TIMER = __savedBatchPollState.timer; "
+      + "POLL_INFLIGHT = __savedBatchPollState.inflight; "
+      + "POLL_SEQ = __savedBatchPollState.seq; CUR = __savedBatchPollState.cur;",
+      context, { filename: "restore-batch-poll" });
+    context.renderJobs();
+  }
+  if (problems.length) {
+    console.log(`  FAIL 批量轮询: ${problems.join("; ")}`);
+    failures += 1;
+  } else {
+    console.log("  OK   批量轮询: 30 任务共用一次请求/渲染，完成合并刷新，断线/404/取消/删除正常");
+  }
+}
+
+// ---- 上传任务卡：阶段进度 / partial / 安全重试 -----------------------------
+// 这几条不能只扫源码：99% 卡住的根因正是数学没错、展示语义错。用真实
+// renderJobs() 验 3/9 线型页是 33%，并让 partial / 历史任务各走一次过滤。
+{
+  const problems = [];
+  const savedJobs = vm.runInContext("JOBS", context);
+  const jobs = context.document.getElementById("jobs");
+  const top = context.document.getElementById("jobStatus");
+  const renderOne = (job) => {
+    context.__jobCase = { [job.slug]: job };
+    vm.runInContext("JOBS = __jobCase", context, { filename: "job-card-case" });
+    context.renderJobs();
+    return { html: (jobs.children[0] && jobs.children[0].innerHTML) || jobs.innerHTML,
+      top: top.innerHTML, count: jobs.children.length,
+      className: jobs.children[0] ? jobs.children[0].className : "" };
+  };
+  try {
+    const now = Date.now() / 1000;
+    let card = renderOne({slug:"line_progress",done:false,ok:false,stage:"linetypes",
+      progress:.9867,stage_done:3,stage_total:9,stage_unit:"sheets",
+      updated_at:now-4,detail:"Line-type engine active",warnings:[]});
+    if (!card.html.includes("Extra · Line types · 3/9 sheets"))
+      problems.push("线型阶段没有显示 3/9 sheets");
+    if (!card.html.includes("width:33%") || !card.html.includes(">33%</span>"))
+      problems.push("3/9 sheets 没有画成 33%");
+    if (!card.top.includes("3/9 sheets") || !card.top.includes(">33%</b>"))
+      problems.push("顶栏没有同步显示当前阶段 33%");
+    if (!card.html.includes("Engine active · updated ") || !card.html.includes("s ago"))
+      problems.push("active 卡没有 updated_at 心跳");
+
+    card = renderOne({slug:"percent_progress",done:false,stage:"text",progress:.5,
+      stage_done:67,stage_total:100,stage_unit:"percent",warnings:[]});
+    if (!card.html.includes("Step 1 · Find text · 67%"))
+      problems.push("percent 阶段没有显示百分比");
+    if (card.html.includes("67/100") || card.html.includes("sheets"))
+      problems.push("percent 阶段误写了 sheets/fraction");
+
+    card = renderOne({slug:"not_done_100",done:false,stage:"linetypes",progress:1,
+      stage_done:9,stage_total:9,stage_unit:"sheets",warnings:[]});
+    if (!card.html.includes("width:99%") || card.html.includes("width:100%"))
+      problems.push("未完成任务被四舍五入成 100%");
+
+    card = renderOne({slug:"overall_fallback",done:false,stage:"queued",progress:.42,
+      stage_done:0,stage_total:0,warnings:[]});
+    if (!card.html.includes("width:42%"))problems.push("无 stage_total 时没有回退 overall progress");
+
+    card = renderOne({slug:"partial_job",done:true,ok:true,outcome:"partial",
+      results_available:true,progress:1,warnings:["P17 remains unresolved"]});
+    if (card.count !== 1 || !card.className.includes("warn"))
+      problems.push("partial 卡被过滤或没有琥珀状态");
+    if (!card.html.includes("P17 remains unresolved")
+        || !card.html.includes("Retry unresolved sheets"))
+      problems.push("partial 卡没有 warning / Retry unresolved sheets");
+
+    card = renderOne({slug:"failed_job",done:true,ok:false,outcome:"failed",
+      results_available:false,error:"worker failed",warnings:[]});
+    if (!card.html.includes("Retry unresolved sheets") || !card.html.includes("Delete project"))
+      problems.push("failed 卡没有安全重试和删除按钮");
+
+    card = renderOne({slug:"legacy_ok",done:true,ok:true,progress:1,
+      warnings:["historical warning"]});
+    if (card.count || !jobs.innerHTML.includes("No jobs"))
+      problems.push("旧 done+ok 历史卡重新冒出");
+    card = renderOne({slug:"new_success",done:true,ok:true,outcome:"success",
+      results_available:true,progress:1,warnings:[]});
+    if (card.count)problems.push("新 success 卡没有过滤");
+  } catch (error) {
+    problems.push(`抛出 -> ${String(error).slice(0, 160)}`);
+  } finally {
+    context.__savedJobs = savedJobs;
+    vm.runInContext("JOBS = __savedJobs", context, { filename: "restore-jobs" });
+    context.renderJobs();
+  }
+  if (problems.length) {
+    console.log(`  FAIL 任务 UX: ${problems.join("; ")}`);
+    failures += 1;
+  } else {
+    console.log("  OK   任务 UX: 当前阶段进度、99% cap、partial/failed/legacy 状态均正确");
+  }
+}
+
+// Retry 按钮必须复用当前 cache，只修没完成的页；同时静态钉住完成后刷新
+// results_available 的分支（失败但已有部分结果也能立刻看到）。
+{
+  const problems = [];
+  const oldFetch = context.fetch;
+  const calls = [];
+  const savedState = vm.runInContext(
+    "({jobs:JOBS,poll:POLL,timer:POLL_TIMER,inflight:POLL_INFLIGHT,seq:POLL_SEQ})",
+    context);
+  try {
+    context.fetch = async (url, opt) => {
+      calls.push({url:String(url),opt:opt||{}});
+      const isRetry=String(url).includes("/api/rerun/retry_case");
+      return {ok:true,status:200,json:async()=>isRetry
+        ? {slug:"retry_case",job:{slug:"retry_case",done:false,stage:"queued",progress:0}}
+        : (String(url).includes("/api/overview")?[]:{})};
+    };
+    context.__retryJobs = {retry_case:{slug:"retry_case",done:true,ok:true,
+      outcome:"partial",results_available:true,warnings:["one unresolved sheet"]}};
+    vm.runInContext(
+      "JOBS = __retryJobs; POLL = {}; POLL_TIMER = null; POLL_INFLIGHT = false;",
+      context, { filename: "retry-job" });
+    await context.retryUnresolved("retry_case");
+    const call = calls.find((x) => x.url.includes("/api/rerun/retry_case"));
+    if (!call || call.opt.method !== "POST")problems.push("Retry 没有 POST rerun endpoint");
+    else {
+      let body = null;
+      try { body = JSON.parse(call.opt.body); } catch (_error) {}
+      if (!body || body.reset !== false)problems.push("Retry 没有发送 reset:false");
+    }
+    if (!/j&&\(j\.results_available\|\|j\.ok\)&&CUR\)show\(j\.slug,CUR\.page\)/s
+      .test(scripts.join("\n")))
+      problems.push("批量 poll 完成后没有按 results_available 刷新当前页");
+  } catch (error) {
+    problems.push(`抛出 -> ${String(error).slice(0, 160)}`);
+  } finally {
+    context.fetch = oldFetch;
+    context.__savedRetryState = savedState;
+    vm.runInContext(
+      "JOBS = __savedRetryState.jobs; POLL = __savedRetryState.poll; "
+      + "POLL_TIMER = __savedRetryState.timer; "
+      + "POLL_INFLIGHT = __savedRetryState.inflight; POLL_SEQ = __savedRetryState.seq;",
+      context,
+      { filename: "restore-retry-job" });
+    context.renderJobs();
+  }
+  if (problems.length) {
+    console.log(`  FAIL 任务重试: ${problems.join("; ")}`);
+    failures += 1;
+  } else {
+    console.log("  OK   任务重试: POST reset:false；部分结果完成后会刷新当前页");
   }
 }
 
@@ -409,6 +941,35 @@ if (errors.length) {
   failures += errors.length;
 }
 
+// ---- 同一页重载也必须作废旧调试线型 --------------------------------------
+// 后台把 stale 主结果原子换成 current 后，show() 会再次打开同一 slug/page。
+// 若缓存 key 只有 slug|page，旧的 ALL_LT 几何会绕过后端签名闸继续重画。
+{
+  const problems = [];
+  try {
+    const state = JSON.parse(vm.runInContext(
+      "(()=>{if(!PAGE)return JSON.stringify({skip:true});"
+      + "if(!CUR)CUR={slug:'same_page_reload',page:PAGE.page};"
+      + "ALL_LT={types:[],residual:null}; ALL_LT_STATE='ok';"
+      + "ALL_LT_KEY=allKey(); const oldKey=ALL_LT_KEY; epoch+=1; build();"
+      + "return JSON.stringify({oldKey,newKey:allKey(),cleared:ALL_LT===null,state:ALL_LT_STATE});})()",
+      context, { filename: "same-page-linetype-generation" }));
+    if (!state.skip) {
+      if (state.oldKey === state.newKey) problems.push("同页重载没有更换缓存代次 key");
+      if (!state.cleared) problems.push("同页重载后旧 ALL_LT 仍在内存");
+      if (state.state !== "idle") problems.push(`清理后状态=${state.state}，应为 idle`);
+    }
+  } catch (error) {
+    problems.push(`抛出 -> ${String(error).slice(0, 160)}`);
+  }
+  if (problems.length) {
+    console.log(`  FAIL 同页调试线型作废: ${problems.join("; ")}`);
+    failures += 1;
+  } else {
+    console.log("  OK   同页调试线型作废: 页面代次变化会清除旧几何");
+  }
+}
+
 // ---- 列表里一次只能有一行高亮 ----------------------------------------------
 // 同一个 callout 只要绑到了线型，就会同时出现在 FENCE TEXT & GATES 和 FENCELINE
 // 两个分节里（scopeId 相同）。按 scope 匹配高亮会把两行一起点亮 —— 这里挑一个
@@ -450,6 +1011,89 @@ if (errors.length) {
     failures += 1;
   } else {
     console.log("  OK   单行高亮: 同一 callout 跨两节时只有被点的那一行是 on");
+  }
+}
+
+// ---- 从任意入口选 callout 都必须聚焦它绑定的线型 --------------------------
+// 真实故障：普通 FENCE TEXT & GATES 行曾显式传 withLines=false；后端已经把
+// callout 箭头末端绑到线型，点击那行却给所有线加 lt-dim。只有再点一遍重复的
+// FENCELINE 行才看得到线。这里实际点击普通行，再走一次图上箭头共用的入口；
+// 最后用一个无绑定 scope 验 gate / residual 不会继承上一条线的焦点。
+{
+  const problems = [];
+  let skipped = false;
+  try {
+    const snapshot = JSON.parse(vm.runInContext(
+      "JSON.stringify({rows:(LT_INDEX.rows||[]).map(r=>({scopeId:r.scopeId,number:r.number})),"
+      + "scopes:SCOPE_GROUPS.map(g=>({id:g.id,gate:!!g.gate}))})", context));
+    const boundRows = snapshot.rows.filter(
+      (row) => snapshot.scopes.some((g) => g.id === row.scopeId));
+    // Civil P4 的实际回归目标是 PROPOSED FENCE -> #24；该型存在时优先点它，
+    // 让冒烟测试不只碰巧验证同页排在前面的 #4。
+    const hit = boundRows.find((row) => row.number === 24) || boundRows[0];
+    if (!hit) {
+      skipped = true;
+      console.log("  SKIP 绑定线型选择: 这一页没有可点击的 bound callout");
+    } else {
+      context.__target = hit.scopeId;
+      context.__number = hit.number;
+      vm.runInContext("ALL_LT=null; clearScopeSelection();", context,
+        { filename: "reset-bound-focus" });
+      context.renderList();
+      const rows = (context.document.getElementById("list").children || [])
+        .filter((n) => n.classList && n.classList.contains("scope-item"));
+      const ordinary = rows.find((n) => n.dataset && n.dataset.scope === hit.scopeId
+        && n.dataset.row !== `FENCELINE|${hit.scopeId}`);
+      if (!ordinary || typeof ordinary.onclick !== "function") {
+        problems.push("找不到 bound callout 在普通分节里的可点击行");
+      } else {
+        ordinary.onclick();
+        const focusState = () => JSON.parse(vm.runInContext(
+          "JSON.stringify({selectedScope,layer:$('tgLt').querySelector('input').checked,"
+          + "target:[...(LT_NODES.get(__number)||[])].map(n=>({focus:n.classList.contains('lt-focus'),dim:n.classList.contains('lt-dim')})),"
+          + "other:[...LT_NODES].filter(([n])=>n!==__number).flatMap(([,nodes])=>nodes.map(n=>({focus:n.classList.contains('lt-focus'),dim:n.classList.contains('lt-dim')})))})",
+          context));
+        let state = focusState();
+        if (state.selectedScope !== hit.scopeId) problems.push("普通 callout 行没有选中目标 scope");
+        if (!state.layer) problems.push("普通 callout 行没有自动打开 Line types 图层");
+        if (!state.target.length) problems.push(`目标线型 #${hit.number} 没有 SVG 节点`);
+        if (state.target.some((n) => !n.focus || n.dim))
+          problems.push("普通 callout 行没有只聚焦目标线型");
+        if (state.other.some((n) => n.focus || !n.dim))
+          problems.push("普通 callout 行没有隐藏其他线型");
+
+        // 图上的文字 / 引线 / 箭头最终都调用 selectScope(scopeId, false)。
+        vm.runInContext("clearScopeSelection(); selectScope(__target,false);", context,
+          { filename: "arrow-scope-focus" });
+        state = focusState();
+        if (!state.target.length || state.target.some((n) => !n.focus || n.dim))
+          problems.push("图上 callout / 箭头入口没有聚焦目标线型");
+        if (state.other.some((n) => n.focus || !n.dim))
+          problems.push("图上 callout / 箭头入口没有隐藏其他线型");
+
+        const unbound = snapshot.scopes.find(
+          (scope) => scope.gate
+            && !snapshot.rows.some((row) => row.scopeId === scope.id))
+          || snapshot.scopes.find(
+            (scope) => !snapshot.rows.some((row) => row.scopeId === scope.id));
+        if (unbound) {
+          context.__unbound = unbound.id;
+          const none = JSON.parse(vm.runInContext(
+            "selectScope(__unbound,false); JSON.stringify([...LT_NODES.values()].flatMap(nodes=>nodes.map(n=>({focus:n.classList.contains('lt-focus'),dim:n.classList.contains('lt-dim')}))))",
+            context, { filename: "unbound-scope-focus" }));
+          if (none.some((n) => n.focus || !n.dim))
+            problems.push("gate / residual scope 仍继承了上一条线型焦点");
+        }
+      }
+    }
+  } catch (error) {
+    problems.push(`抛出 -> ${String(error).slice(0, 160)}`);
+  }
+  if (problems.length) {
+    console.log(`  FAIL 绑定线型选择: ${problems.join("; ")}`);
+    failures += 1;
+  } else if (!skipped) {
+    console.log("  OK   绑定线型选择: 普通 callout / 箭头自动聚焦；gate / residual 不继承焦点");
   }
 }
 

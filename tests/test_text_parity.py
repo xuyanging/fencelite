@@ -61,6 +61,50 @@ def _has_vecgeom():
 HAS_VECGEOM = _has_vecgeom()
 
 
+class TestScanResponseProtocol(unittest.TestCase):
+    """Provider text must be complete, but exact duplicate parts are harmless."""
+
+    def _parse(self, raw):
+        from steps.text.vlm import _parse_scan_response
+        return _parse_scan_response(raw)
+
+    def test_repeated_empty_array_is_one_complete_response(self):
+        self.assertEqual(self._parse("[]\n[]"), [])
+        self.assertEqual(self._parse("```json\n[]\n[]\n```"), [])
+
+    def test_repeated_identical_nonempty_array_is_not_duplicated(self):
+        raw = ('[{"text":"FENCE","box_2d":[1,2,3,4]}]\n'
+               '[{"text":"FENCE","box_2d":[1,2,3,4]}]')
+        self.assertEqual(self._parse(raw), [
+            {"text": "FENCE", "box_2d": [1, 2, 3, 4]}])
+
+    def test_different_complete_documents_remain_ambiguous(self):
+        for raw in ("[]\n[1]", "[true]\n[1]", "[1]\n[1.0]"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                    RuntimeError, "incomplete/unparseable"):
+                self._parse(raw)
+
+    def test_trailing_garbage_and_truncated_second_value_still_fail(self):
+        for raw in ("[] trailing", "[]\n[{\"text\":", "[]\n```",
+                    "[]\u00a0[]"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                    RuntimeError, "incomplete/unparseable"):
+                self._parse(raw)
+
+    def test_malformed_payload_text_cannot_impersonate_a_timeout(self):
+        from core.gemini import is_timeout_error, should_retry_model_error
+        from steps.text.vlm import VLMResponseError
+
+        error = VLMResponseError(
+            'incomplete response: [{"text":"TIMEOUT AREA"}')
+        self.assertFalse(is_timeout_error(error))
+        self.assertTrue(should_retry_model_error(
+            error, attempt=0, total_attempts=3, timeout_retries=0))
+        # Once persisted, only the type prefix survives in the error string.
+        stored = RuntimeError(f"{type(error).__name__}: {error}")
+        self.assertFalse(is_timeout_error(stored))
+
+
 @unittest.skipUnless(HAS_REF, f"reference data not found at {REF}")
 class TestFusePageParity(unittest.TestCase):
     """新 fuse_page 必须逐字段重现生产 results.json 的页记录。"""
@@ -326,7 +370,7 @@ class TestStripMarkerCodesParity(unittest.TestCase):
 
 
 class TestVlmNeeded(unittest.TestCase):
-    """付费判据：当期 primary 记录缺失 且（有矢量命中 或 本页记过）。"""
+    """付费判据：当期 primary 缺失，准确率模式全页扫，选择模式按需扫。"""
 
     IDENT = {"pdf_revision": "aa-bb", "model": "m", "prompt_sha256": "d"}
 
@@ -378,8 +422,19 @@ class TestVlmNeeded(unittest.TestCase):
             vlm_needed(3, [], store, self.IDENT, has_text=False))
 
     def test_text_layer_without_instances_stays_free(self):
-        """有文字层但判词没命中：确定性矢量地板已覆盖，这里就是省钱的地方。"""
-        self.assertFalse(vlm_needed(3, [], {}, self.IDENT, has_text=True))
+        """选择性模式仍保留原来的省钱口径。"""
+        self.assertFalse(vlm_needed(
+            3, [], {}, self.IDENT, has_text=True, scan_all=False))
+
+    def test_accuracy_mode_scans_mixed_cad_page(self):
+        """页上有标题栏文字，fence 却可能是纯 path，必须读图。"""
+        self.assertTrue(vlm_needed(
+            3, [], {}, self.IDENT, has_text=True, scan_all=True))
+
+    def test_accuracy_mode_still_respects_current_cache(self):
+        store = {"3": self._current()}
+        self.assertFalse(vlm_needed(
+            3, [], store, self.IDENT, has_text=True, scan_all=True))
 
 
 class TestDebugViewFloorFlag(unittest.TestCase):

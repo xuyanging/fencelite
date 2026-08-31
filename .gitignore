@@ -2,11 +2,16 @@
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Runtime/customer data
 data/
 projects/
 _jobs/
+testdata/
 
 # Python
 __pycache__/
@@ -16,13 +21,21 @@ __pycache__/
 .ruff_cache/
 venv/
 .venv/
+.venv-local/
 
 # Node.js sidecars
 node_modules/
+
+# Local service/runtime snapshots
+*.log
+_server_systemd/
+
+# One-off editor/manual backup copies
+*.orig
+*.before-*
 
 # Editors and operating systems
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-

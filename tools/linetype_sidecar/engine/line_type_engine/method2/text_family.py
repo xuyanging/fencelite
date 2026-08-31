@@ -1468,18 +1468,94 @@ def _nearest_endpoint_connection(
     return best
 
 
+def _candidate_carrier_pairs(
+    geometries: Sequence[_CarrierGeometry],
+    junction_tolerance: float,
+) -> Iterable[tuple[int, int]]:
+    """Yield every pair that can have endpoints within the tolerance.
+
+    The former route-graph builder compared every carrier with every other
+    carrier.  A large CAD group can contain tens of thousands of unrelated
+    paths, making that quadratic scan dominate the complete page run.  Index
+    the two endpoints in tolerance-sized cells and return a strict superset
+    of the possible neighbours instead.  The caller still performs the
+    original distance/tangent calculation and exact threshold check.
+
+    Pair order deliberately remains the old lexicographic ``left, right``
+    order.  Dijkstra tie-breaking and therefore emitted ownership stay bit
+    for bit deterministic.  The extra cell on every side protects boundary
+    cases from floating-point rounding; it can only add candidates, never
+    omit a pair accepted by the exact check.
+    """
+
+    count = len(geometries)
+    if count < 2:
+        return
+    finite_endpoints = all(
+        math.isfinite(point.x) and math.isfinite(point.y)
+        for geometry in geometries
+        for point in geometry.endpoints
+    )
+    if junction_tolerance <= 0.0 or not math.isfinite(junction_tolerance) \
+            or not finite_endpoints:
+        for left in range(count):
+            for right in range(left + 1, count):
+                yield left, right
+        return
+
+    cell_size = junction_tolerance
+    spatial_index_safe = all(
+        all(math.isfinite(value) for value in (
+            point.x / cell_size,
+            point.y / cell_size,
+            (point.x - junction_tolerance) / cell_size,
+            (point.x + junction_tolerance) / cell_size,
+            (point.y - junction_tolerance) / cell_size,
+            (point.y + junction_tolerance) / cell_size,
+        ))
+        for geometry in geometries
+        for point in geometry.endpoints
+    )
+    if not spatial_index_safe:
+        for left in range(count):
+            for right in range(left + 1, count):
+                yield left, right
+        return
+
+    endpoint_grid: dict[tuple[int, int], list[int]] = {}
+    for index, geometry in enumerate(geometries):
+        for point in geometry.endpoints:
+            cell = (
+                math.floor(point.x / cell_size),
+                math.floor(point.y / cell_size),
+            )
+            endpoint_grid.setdefault(cell, []).append(index)
+
+    for left, geometry in enumerate(geometries):
+        candidates: set[int] = set()
+        for point in geometry.endpoints:
+            min_x = math.floor((point.x - junction_tolerance) / cell_size) - 1
+            max_x = math.floor((point.x + junction_tolerance) / cell_size) + 1
+            min_y = math.floor((point.y - junction_tolerance) / cell_size) - 1
+            max_y = math.floor((point.y + junction_tolerance) / cell_size) + 1
+            for cell_x in range(min_x, max_x + 1):
+                for cell_y in range(min_y, max_y + 1):
+                    candidates.update(endpoint_grid.get((cell_x, cell_y), ()))
+        for right in sorted(index for index in candidates if index > left):
+            yield left, right
+
+
 def _carrier_route_graph_for(
     geometries: Sequence[_CarrierGeometry],
     junction_tolerance: float,
 ) -> _CarrierRouteGraph:
     adjacency: list[list[_CarrierEdge]] = [[] for _ in geometries]
-    for left in range(len(geometries)):
-        for right in range(left + 1, len(geometries)):
-            gap, tangent = _nearest_endpoint_connection(geometries[left], geometries[right])
-            if gap > junction_tolerance:
-                continue
-            adjacency[left].append(_CarrierEdge(right, gap, tangent))
-            adjacency[right].append(_CarrierEdge(left, gap, tangent))
+    for left, right in _candidate_carrier_pairs(geometries, junction_tolerance):
+        gap, tangent = _nearest_endpoint_connection(geometries[left], geometries[right])
+        if gap > junction_tolerance:
+            continue
+        adjacency[left].append(_CarrierEdge(right, gap, tangent))
+        adjacency[right].append(_CarrierEdge(left, gap, tangent))
     return _CarrierRouteGraph(
         tuple(geometries),
         {geometry.op_index: index for index, geometry in enumerate(geometries)},
@@ -1487,35 +1563,50 @@ def _carrier_route_graph_for(
     )
 
 
-def _shortest_carrier_bridge(
+@dataclass(frozen=True, slots=True)
+class _CarrierShortestPaths:
+    source_indices: frozenset[int]
+    previous: tuple[int, ...]
+    settled_order: tuple[int, ...]
+
+
+def _carrier_shortest_paths(
     graph: _CarrierRouteGraph,
     source_ops: set[int],
-    target_ops: set[int],
     junction_tolerance: float,
-) -> tuple[_CarrierGeometry, ...] | None:
+    stop_indices: set[int] | None = None,
+) -> _CarrierShortestPaths | None:
+    """Run the deterministic carrier Dijkstra to completion for one source.
+
+    A family can ask thousands of target questions about the same source on
+    the same graph.  Completing the search once preserves the exact heap key,
+    relaxation rule and predecessor tree used by the former per-target run.
+    ``settled_order`` lets each target query select the same first target that
+    the early-exit implementation would have popped.
+    """
+
     source_indices = [
         graph.index_by_op[index] for index in source_ops if index in graph.index_by_op
     ]
-    targets = {
-        graph.index_by_op[index] for index in target_ops if index in graph.index_by_op
-    }
-    if not source_indices or not targets:
+    if not source_indices:
         return None
     costs = [math.inf] * len(graph.geometries)
     previous = [-1] * len(graph.geometries)
+    settled_order = [-1] * len(graph.geometries)
     queue: list[tuple[float, int, int]] = []
     for index in source_indices:
         costs[index] = graph.geometries[index].length
         heapq.heappush(queue, (
             costs[index], graph.geometries[index].op_index, index
         ))
-    reached = -1
+    order = 0
     while queue:
         cost, _op_index, current = heapq.heappop(queue)
         if cost != costs[current]:
             continue
-        if current in targets:
-            reached = current
+        settled_order[current] = order
+        order += 1
+        if stop_indices is not None and current in stop_indices:
             break
         for edge in graph.adjacency[current]:
             turn_penalty = (1.0 - edge.tangent_similarity) * junction_tolerance * 2.5
@@ -1530,19 +1621,80 @@ def _shortest_carrier_bridge(
             heapq.heappush(queue, (
                 next_cost, graph.geometries[edge.index].op_index, edge.index
             ))
-    if reached < 0:
+    return _CarrierShortestPaths(
+        frozenset(source_indices), tuple(previous), tuple(settled_order)
+    )
+
+
+def _carrier_bridge_from_paths(
+    graph: _CarrierRouteGraph,
+    paths: _CarrierShortestPaths | None,
+    source_ops: set[int],
+    target_ops: set[int],
+) -> tuple[_CarrierGeometry, ...] | None:
+    if paths is None:
         return None
+    targets = {
+        graph.index_by_op[index] for index in target_ops if index in graph.index_by_op
+    }
+    reachable = [
+        index for index in targets if paths.settled_order[index] >= 0
+    ]
+    if not reachable:
+        return None
+    reached = min(reachable, key=paths.settled_order.__getitem__)
     route: list[_CarrierGeometry] = []
     current = reached
     while current >= 0:
         route.append(graph.geometries[current])
-        if current in source_indices:
+        if current in paths.source_indices:
             break
-        current = previous[current]
+        current = paths.previous[current]
     route.reverse()
     if not route or route[0].op_index not in source_ops:
         return None
     return tuple(route)
+
+
+def _shortest_carrier_bridge(
+    graph: _CarrierRouteGraph,
+    source_ops: set[int],
+    target_ops: set[int],
+    junction_tolerance: float,
+) -> tuple[_CarrierGeometry, ...] | None:
+    """Run one historical early-exit query, including on unusual weights."""
+
+    targets = {
+        graph.index_by_op[index] for index in target_ops if index in graph.index_by_op
+    }
+    if not targets:
+        return None
+    return _carrier_bridge_from_paths(
+        graph,
+        _carrier_shortest_paths(
+            graph, source_ops, junction_tolerance, stop_indices=targets
+        ),
+        source_ops,
+        target_ops,
+    )
+
+
+def _carrier_steps_can_be_reused(
+    graph: _CarrierRouteGraph,
+    junction_tolerance: float,
+) -> bool:
+    """Whether settled predecessors are final for every directed graph step."""
+
+    for edges in graph.adjacency:
+        for edge in edges:
+            step = (
+                graph.geometries[edge.index].length
+                + edge.gap * 8.0
+                + (1.0 - edge.tangent_similarity) * junction_tolerance * 2.5
+            )
+            if not math.isfinite(step) or step < 0.0:
+                return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1712,6 +1864,9 @@ def _bridge_same_family_carrier_routes(
                 minimum_minor * 0.20, line_width * 3.0,
             )
             graph = _carrier_route_graph_for(geometries, junction_tolerance)
+            can_reuse_shortest_paths = _carrier_steps_can_be_reused(
+                graph, junction_tolerance
+            )
             anchor_ops: dict[int, set[int]] = {}
             for signature_index in group_signature_indices:
                 signature = signatures[signature_index]
@@ -1740,6 +1895,9 @@ def _bridge_same_family_carrier_routes(
                         ops.add(geometry.op_index)
                 anchor_ops[signature_index] = ops
             for left_order, left_index in enumerate(group_signature_indices):
+                source_ops = anchor_ops.get(left_index, set())
+                shortest_paths: _CarrierShortestPaths | None = None
+                shortest_paths_ready = False
                 for right_index in group_signature_indices[left_order + 1:]:
                     left_signature = signatures[left_index]
                     right_signature = signatures[right_index]
@@ -1759,12 +1917,25 @@ def _bridge_same_family_carrier_routes(
                         )
                     ):
                         connected.add(family_index)
-                    route = _shortest_carrier_bridge(
-                        graph,
-                        anchor_ops.get(left_index, set()),
-                        anchor_ops.get(right_index, set()),
-                        junction_tolerance,
-                    )
+                    if can_reuse_shortest_paths:
+                        if not shortest_paths_ready:
+                            shortest_paths = _carrier_shortest_paths(
+                                graph, source_ops, junction_tolerance
+                            )
+                            shortest_paths_ready = True
+                        route = _carrier_bridge_from_paths(
+                            graph,
+                            shortest_paths,
+                            source_ops,
+                            anchor_ops.get(right_index, set()),
+                        )
+                    else:
+                        route = _shortest_carrier_bridge(
+                            graph,
+                            source_ops,
+                            anchor_ops.get(right_index, set()),
+                            junction_tolerance,
+                        )
                     if route is None:
                         continue
                     route_length = sum(geometry.length for geometry in route)

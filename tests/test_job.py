@@ -4,9 +4,12 @@
 重启后的 interrupted 语义、费用合并、进度映射、协作式取消。四个阶段函数
 一律用假实现替换，所以整套测试不碰 PDF、不碰 Gemini、不写真实 data/。
 """
+import io
 import tempfile
 import shutil
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -38,9 +41,16 @@ class JobTestBase(unittest.TestCase):
             self.addCleanup(p.stop)
         job.JOBS.clear()
         job._CANCEL.clear()
-        job._RUNNING.update({"slug": None, "base": None, "base_wall": 0.0})
+        job._CANCEL_USERS.clear()
+        job._RUNNING.clear()
+        job._STARTING.clear()
+        job._SLOT_POOLS.clear()
         self.addCleanup(job.JOBS.clear)
         self.addCleanup(job._CANCEL.clear)
+        self.addCleanup(job._CANCEL_USERS.clear)
+        self.addCleanup(job._RUNNING.clear)
+        self.addCleanup(job._STARTING.clear)
+        self.addCleanup(job._SLOT_POOLS.clear)
 
     def write_results(self, slug, extra=None):
         res = {"slug": slug, "fused_v": 2, "page_count": 1, "pages": {}}
@@ -71,6 +81,38 @@ class TestProjectSetup(JobTestBase):
         self.assertEqual(long_slug, "a" * 60)
         self.assertTrue(job.is_valid_slug(long_slug))
 
+    def test_stream_upload_writes_incrementally(self):
+        payload = b"%PDF-1.4" + (b"x" * (2 * 1024 * 1024 + 17))
+
+        class ChunkOnly(io.BytesIO):
+            def read(self, size=-1):
+                self.assert_chunk(size)
+                return super().read(size)
+
+            @staticmethod
+            def assert_chunk(size):
+                if not 0 < size <= 1024 * 1024:
+                    raise AssertionError(f"unbounded stream read: {size}")
+
+        slug = job.create_project_stream(ChunkOnly(payload), "large.pdf")
+        self.assertEqual(slug, "large")
+        self.assertEqual((self.projects / slug / "input.pdf").read_bytes(),
+                         payload)
+
+    def test_simultaneous_same_name_uploads_never_overwrite(self):
+        payloads = [f"%PDF-1.4 upload {i}".encode() for i in range(8)]
+
+        def upload(data):
+            slug = job.create_project(data, "same.pdf")
+            return slug, data
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            uploaded = list(pool.map(upload, payloads))
+        self.assertEqual(len({slug for slug, _data in uploaded}), 8)
+        for slug, data in uploaded:
+            self.assertEqual((self.projects / slug / "input.pdf").read_bytes(),
+                             data)
+
     def test_delete_project_removes_all_three_places(self):
         slug = job.create_project(b"x", "gone.pdf")
         store.save_json(store.slug_dir(slug) / "results.json", {"slug": slug})
@@ -87,6 +129,15 @@ class TestProjectSetup(JobTestBase):
         with self.assertRaises(ValueError):
             job.delete_project("../etc")
 
+    def test_delete_project_rejects_queued_or_running_owner(self):
+        slug = job.create_project(b"x", "keep-running.pdf")
+        job._set(slug, stage="queued", done=False)
+        with self.assertRaises(job.JobStartError):
+            job.delete_project(slug)
+        self.assertTrue((self.projects / slug / "input.pdf").exists())
+        self.assertTrue((self.jobs / f"{slug}.json").exists())
+        self.assertNotIn(slug, job._STARTING)
+
     def test_page_count_of_unreadable_pdf_is_zero(self):
         slug = job.create_project(b"not a pdf", "broken.pdf")
         self.assertEqual(job.page_count_of(slug), 0)
@@ -98,8 +149,11 @@ class TestJobState(JobTestBase):
     def test_set_persists_and_reloads(self):
         job._set("alpha", stage="text", progress=0.25, warnings=[])
         on_disk = store.load_json(self.jobs / "alpha.json", None)
-        self.assertEqual(on_disk, {"slug": "alpha", "stage": "text",
-                                   "progress": 0.25, "warnings": []})
+        self.assertEqual(on_disk["slug"], "alpha")
+        self.assertEqual(on_disk["stage"], "text")
+        self.assertEqual(on_disk["progress"], 0.25)
+        self.assertEqual(on_disk["warnings"], [])
+        self.assertIsInstance(on_disk["updated_at"], float)
         job._set("alpha", progress=0.5)
         self.assertEqual(
             store.load_json(self.jobs / "alpha.json", None)["progress"], 0.5)
@@ -133,32 +187,119 @@ class TestJobState(JobTestBase):
             store.load_json(self.jobs / "alpha.json", None)["warnings"],
             ["P1 boom", "P2 boom"])
 
+    def test_concurrent_persistence_cannot_replace_new_state_with_old(self):
+        """Heartbeat/progress writers must preserve the newest disk snapshot."""
+        job.JOBS["alpha"] = {"slug": "alpha", "done": False,
+                             "progress": 0.25}
+        first_inside_save = threading.Event()
+        release_first = threading.Event()
+        second_inside_save = threading.Event()
+        call_lock = threading.Lock()
+        calls = 0
+
+        def controlled_save(path, payload):
+            nonlocal calls
+            with call_lock:
+                calls += 1
+                number = calls
+            if number == 1:
+                first_inside_save.set()
+                self.assertTrue(release_first.wait(2))
+            else:
+                second_inside_save.set()
+            store.save_json(path, payload)
+
+        with mock.patch.object(job, "save_json", side_effect=controlled_save):
+            older = threading.Thread(target=job._persist_job, args=("alpha",))
+            older.start()
+            self.assertTrue(first_inside_save.wait(2))
+            with job._JOBS_LOCK:
+                job.JOBS["alpha"].update(done=True, progress=1.0)
+            newer = threading.Thread(target=job._persist_job, args=("alpha",))
+            newer.start()
+            # Snapshot+save is one serialized region: the newer writer cannot
+            # even enter save_json until the older fsync/replace has finished.
+            self.assertFalse(second_inside_save.wait(0.1))
+            release_first.set()
+            older.join(2)
+            newer.join(2)
+
+        self.assertFalse(older.is_alive())
+        self.assertFalse(newer.is_alive())
+        self.assertTrue(second_inside_save.is_set())
+        persisted = store.load_json(self.jobs / "alpha.json", {})
+        self.assertTrue(persisted["done"])
+        self.assertEqual(persisted["progress"], 1.0)
+
     def test_request_cancel_without_running_job(self):
         out = job.request_cancel("alpha")
         self.assertFalse(out["was_running"])
         self.assertTrue(job.JOBS["alpha"]["cancel_requested"])
 
-    def test_resume_interrupted_marks_but_never_reruns(self):
+    def test_carry_baseline_uses_newer_zero_cost_card_ledger(self):
+        slug = job.create_project(b"x", "ledger.pdf")
+        self.write_results(slug, {
+            "llm_summary": {"calls": 1, "model_seconds": 0.1,
+                            "input_tokens": 0, "output_tokens": 0,
+                            "thoughts_tokens": 0, "cost_usd": 0.0},
+            "wall_seconds": 3.0,
+        })
+        store.save_json(self.jobs / f"{slug}.json", {
+            "slug": slug,
+            "llm": {"calls": 2, "model_seconds": 0.2,
+                    "input_tokens": 0, "output_tokens": 0,
+                    "thoughts_tokens": 0, "cost_usd": 0.0},
+            "processing_started": 100.0,
+            "wall_seconds": 4.0,
+        })
+        baseline, wall = job._carry_baseline(slug)
+        self.assertEqual(baseline["calls"], 2)
+        self.assertEqual(wall, 4.0)
+
+    def test_carry_baseline_ignores_legacy_queue_inflated_wall(self):
+        slug = job.create_project(b"x", "legacy-wall.pdf")
+        store.save_json(self.jobs / f"{slug}.json", {
+            "slug": slug, "done": False, "stage": "text",
+            "wall_seconds": 1800.0,
+        })
+        _baseline, wall = job._carry_baseline(slug)
+        self.assertEqual(wall, 0.0)
+
+    def test_resume_interrupted_relaunches_from_page_checkpoints(self):
         store.save_json(self.jobs / "finished.json",
                         {"slug": "finished", "done": True, "ok": True,
                          "stage": "done"})
+        (self.projects / "inflight").mkdir()
+        (self.projects / "inflight" / "input.pdf").write_bytes(b"%PDF-1.4")
         store.save_json(self.jobs / "inflight.json",
                         {"slug": "inflight", "done": False, "stage": "symbols",
-                         "progress": 0.6})
+                         "progress": 0.6, "target": "find every fence",
+                         "model": job.MODEL_NAME})
+        store.save_json(self.jobs / "cancelled.json",
+                        {"slug": "cancelled", "done": False,
+                         "cancel_requested": True, "stage": "linetypes"})
         store.save_json(self.jobs / "junk.json", {"slug": "not/a/slug"})
-        with mock.patch.object(job, "_run",
-                               side_effect=AssertionError("must not re-run")):
+        with mock.patch.object(job, "start_job") as start:
             self.assertIsNone(job.resume_interrupted())
+        start.assert_called_once_with(
+            "inflight", target="find every fence", model=job.MODEL_NAME,
+            _resume=True)
         done = job.JOBS["finished"]
         self.assertEqual((done["done"], done["ok"], done["stage"]),
                          (True, True, "done"))
         hit = job.JOBS["inflight"]
         self.assertEqual((hit["done"], hit["ok"], hit["cancelled"],
-                          hit["stage"]), (True, False, True, "interrupted"))
-        self.assertEqual(hit["progress"], 0.6)   # 保留原进度，只改状态
+                          hit["stage"]), (False, None, False, "queued"))
+        # 这是交给 start_job 前的恢复卡；真实 start_job 会把本次
+        # 进度条重置为 0，但逐页缓存仍会复用。
+        self.assertEqual(hit["progress"], 0.6)
         self.assertEqual(
             store.load_json(self.jobs / "inflight.json", None)["stage"],
-            "interrupted")
+            "queued")
+        stopped = job.JOBS["cancelled"]
+        self.assertEqual(
+            (stopped["done"], stopped["cancelled"], stopped["stage"]),
+            (True, True, "cancelled"))
         self.assertNotIn("not/a/slug", job.JOBS)
 
 
@@ -278,21 +419,216 @@ class TestPipeline(JobTestBase):
 
 class TestRun(JobTestBase):
 
+    def test_same_slug_second_start_is_rejected_before_state_mutation(self):
+        slug = job.create_project(b"x", "one-owner.pdf")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def owned(*_args, **_kwargs):
+            entered.set()
+            self.assertTrue(release.wait(2))
+
+        with mock.patch.object(job, "_run_owned", side_effect=owned):
+            first = job.start_job(slug)
+            self.assertTrue(entered.wait(2))
+            with job._CANCEL_LOCK:
+                original_cancel = job._CANCEL[slug]
+            with self.assertRaises(job.JobStartError):
+                job.start_job(slug, target="find every manhole")
+            with job._CANCEL_LOCK:
+                self.assertIs(job._CANCEL[slug], original_cancel)
+            current = job.get_job(slug)
+            self.assertEqual(current["target"], first["target"])
+            job.request_cancel(slug)
+            self.assertTrue(original_cancel.is_set())
+            release.set()
+
+        for _ in range(100):
+            with job._STARTING_LOCK:
+                if slug not in job._STARTING:
+                    break
+            threading.Event().wait(0.01)
+        self.assertNotIn(slug, job._STARTING)
+
+    def test_restart_claim_covers_cache_reset(self):
+        slug = job.create_project(b"x", "atomic-rerun.pdf")
+        job._set(slug, done=True, stage="done")
+        reset_entered = threading.Event()
+        release_reset = threading.Event()
+
+        def slow_reset(_slug):
+            reset_entered.set()
+            self.assertTrue(release_reset.wait(2))
+            return ["old-cache.json"]
+
+        def claimed(*_args, **_kwargs):
+            job._release_job_start(slug)
+            return {"slug": slug, "stage": "queued"}
+
+        with mock.patch.object(job, "reset_project_cache",
+                               side_effect=slow_reset) as reset, \
+                mock.patch.object(job, "_start_job_claimed",
+                                  side_effect=claimed), \
+                ThreadPoolExecutor(max_workers=1) as executor:
+            first = executor.submit(job.restart_job, slug)
+            self.assertTrue(reset_entered.wait(2))
+            with self.assertRaises(job.JobStartError):
+                job.restart_job(slug)
+            release_reset.set()
+            status, cleared = first.result(timeout=2)
+
+        self.assertEqual(status["stage"], "queued")
+        self.assertEqual(cleared, ["old-cache.json"])
+        reset.assert_called_once_with(slug)
+
+    def test_pre_pipeline_lock_error_becomes_terminal_failure(self):
+        slug = job.create_project(b"x", "lock-error.pdf")
+        job._set(slug, started=job.time.time(), done=False, stage="queued")
+        with mock.patch.object(job, "stable_named_lock",
+                               side_effect=OSError("flock unavailable")):
+            job._run(slug, None)
+        status = job.get_job(slug)
+        self.assertTrue(status["done"])
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["stage"], "error")
+        self.assertIn("flock unavailable", status["error"])
+
+    def test_two_projects_run_together_but_third_waits_for_capacity(self):
+        slugs = [job.create_project(b"x", f"parallel-{i}.pdf")
+                 for i in range(3)]
+        for slug in slugs:
+            job._set(slug, started=job.time.time(), done=False,
+                     stage="queued")
+        lock = threading.Lock()
+        release = threading.Event()
+        two_live = threading.Event()
+        counts = {"live": 0, "peak": 0, "entered": 0}
+
+        def fake_owned(slug, *_args, **_kwargs):
+            with lock:
+                counts["live"] += 1
+                counts["entered"] += 1
+                counts["peak"] = max(counts["peak"], counts["live"])
+                if counts["live"] == 2:
+                    two_live.set()
+            release.wait(timeout=3)
+            with lock:
+                counts["live"] -= 1
+
+        with mock.patch.object(job, "MAX_PARALLEL_JOBS", 2), \
+                mock.patch.object(job, "_run_owned", side_effect=fake_owned):
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(job._run, slug, None)
+                           for slug in slugs]
+                self.assertTrue(two_live.wait(timeout=2))
+                with lock:
+                    self.assertEqual(counts["entered"], 2)
+                    self.assertEqual(counts["peak"], 2)
+                release.set()
+                for future in futures:
+                    future.result(timeout=3)
+        self.assertEqual(counts["entered"], 3)
+        self.assertEqual(counts["peak"], 2)
+
+    def test_queued_project_can_cancel_before_a_slot_is_free(self):
+        slugs = [job.create_project(b"x", f"cancel-queued-{i}.pdf")
+                 for i in range(3)]
+        for slug in slugs:
+            job._set(slug, started=job.time.time(), done=False,
+                     stage="queued")
+        release = threading.Event()
+        two_live = threading.Event()
+        lock = threading.Lock()
+        live = {"count": 0, "entered": []}
+
+        def fake_owned(slug, *_args, **_kwargs):
+            with lock:
+                live["count"] += 1
+                live["entered"].append(slug)
+                if live["count"] == 2:
+                    two_live.set()
+            release.wait(timeout=3)
+            with lock:
+                live["count"] -= 1
+
+        with mock.patch.object(job, "MAX_PARALLEL_JOBS", 2), \
+                mock.patch.object(job, "_run_owned", side_effect=fake_owned):
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                first = [executor.submit(job._run, slug, None)
+                         for slug in slugs[:2]]
+                self.assertTrue(two_live.wait(timeout=2))
+                queued = executor.submit(job._run, slugs[2], None)
+                for _ in range(20):
+                    if slugs[2] in job._CANCEL:
+                        break
+                    threading.Event().wait(0.02)
+                job.request_cancel(slugs[2])
+                queued.result(timeout=2)
+                self.assertTrue(job.JOBS[slugs[2]]["cancelled"])
+                self.assertEqual(job.JOBS[slugs[2]]["stage"], "cancelled")
+                with lock:
+                    self.assertNotIn(slugs[2], live["entered"])
+                release.set()
+                for future in first:
+                    future.result(timeout=3)
+
+    def test_auto_resume_skips_card_finished_by_old_worker(self):
+        slug = job.create_project(b"x", "overlap.pdf")
+        # Simulate the replacement worker's stale in-memory queued card while
+        # the old worker has just published the authoritative done card.
+        job.JOBS[slug] = {"slug": slug, "done": False, "stage": "queued"}
+        finished = {"slug": slug, "done": True, "ok": True,
+                    "stage": "done", "progress": 1.0}
+        store.save_json(self.jobs / f"{slug}.json", finished)
+        with mock.patch.object(job, "_run_owned") as owned:
+            job._run(slug, None, _resume=True)
+        owned.assert_not_called()
+        self.assertEqual(job.JOBS[slug], finished)
+        self.assertNotIn(slug, job._CANCEL)
+
+    def test_cancel_requested_before_thread_registration_is_honoured(self):
+        slug = job.create_project(b"x", "early-cancel.pdf")
+        fake = _FakeStages(self)
+        job._set(slug, started=job.time.time(), cancel_requested=True,
+                 done=False)
+        job._run(slug, None)
+        st = job.JOBS[slug]
+        self.assertEqual((st["done"], st["ok"], st["cancelled"], st["stage"]),
+                         (True, False, True, "cancelled"))
+        self.assertEqual(fake.calls, [])
+
     def test_successful_run_publishes_cost_and_wall(self):
         slug = job.create_project(b"x", "ok.pdf")
         self.write_results(slug)
         fake = _FakeStages(self)
         job._set(slug, started=job.time.time())
-        job._run(slug, None)
+        with mock.patch.object(job, "page_count_of", return_value=7):
+            job._run(slug, None)
         st = job.JOBS[slug]
         self.assertEqual((st["done"], st["ok"], st["stage"], st["error"]),
                          (True, True, "done", None))
+        self.assertEqual(st["outcome"], "success")
+        self.assertTrue(st["results_available"])
         self.assertEqual(len(fake.calls), 4)
         res = store.load_json(store.results_path(slug), None)
         self.assertEqual(res["llm_summary"], job._ZERO_LLM)
         self.assertIsInstance(res["wall_seconds"], float)
-        self.assertIsNone(job._RUNNING["slug"])
+        self.assertNotIn(slug, job._RUNNING)
         self.assertNotIn(slug, job._CANCEL)
+        self.assertEqual(st["pages_total"], 7)
+
+    def test_completed_run_with_unresolved_warnings_is_partial(self):
+        slug = job.create_project(b"x", "partial.pdf")
+        self.write_results(slug)
+        _FakeStages(self, text=["P3 image scan still incomplete"])
+        job._set(slug, started=job.time.time())
+        job._run(slug, None)
+        st = job.JOBS[slug]
+        self.assertEqual((st["done"], st["ok"], st["outcome"]),
+                         (True, True, "partial"))
+        self.assertTrue(st["results_available"])
+        self.assertEqual(st["warnings"],
+                         ["P3 image scan still incomplete"])
 
     def test_cancel_during_text_stage_publishes_nothing(self):
         slug = job.create_project(b"x", "cancel.pdf")
@@ -315,6 +651,7 @@ class TestRun(JobTestBase):
         self.assertEqual((st["done"], st["ok"], st["stage"]),
                          (True, False, "error"))
         self.assertEqual(st["error"], "RuntimeError: kaboom")
+        self.assertEqual(st["outcome"], "failed")
 
     def test_start_job_initialises_state_and_carries_baseline(self):
         slug = job.create_project(b"x", "resume.pdf")
@@ -322,7 +659,8 @@ class TestRun(JobTestBase):
             "llm_summary": {"calls": 7, "cost_usd": 1.25,
                             "peak_concurrency": 4},
             "wall_seconds": 42.0})
-        with mock.patch.object(job, "_run") as run:
+        with mock.patch.object(job, "_run") as run, \
+                mock.patch.object(job, "page_count_of") as page_count:
             st = job.start_job(slug)
         run.assert_called_once()
         self.assertEqual(run.call_args.args[0], slug)
@@ -331,9 +669,13 @@ class TestRun(JobTestBase):
         self.assertEqual(st["progress"], 0.0)
         self.assertEqual(st["pages_total"], 0)
         self.assertEqual(st["warnings"], [])
+        self.assertIsNone(st["outcome"])
+        self.assertFalse(st["results_available"])
+        self.assertIsNone(st["stage_unit"])
         self.assertEqual(st["llm"]["calls"], 7)
         self.assertEqual(st["wall_seconds"], 42.0)
         self.assertEqual(st["target"], job.TARGET_DEFAULT)
+        page_count.assert_not_called()
 
     def test_start_job_custom_target_switches_mode(self):
         slug = job.create_project(b"x", "custom.pdf")
@@ -548,18 +890,308 @@ class TestPlacementsStage(JobTestBase):
         self.assertEqual(self.seen, [])
 
 
+class TestLinetypeCompletionBounds(JobTestBase):
+    """A bad local clustering page must have a small, deterministic tail."""
+
+    def setUp(self):
+        super().setUp()
+        self.slug = job.create_project(b"%PDF-1.4 fake", "lines.pdf")
+        self.items = [{"text": "FENCE", "box_2d": [1, 1, 2, 2],
+                       "label": "callout", "tbl": False}]
+        self.write_results(self.slug, {"pages": {"1": {
+            "vlm_items": [dict(self.items[0])], "vec_added": []}}})
+        revision = store.pdf_revision(store.pdf_path(self.slug))
+        arrows_sig = job.arrows.arrows_signature(
+            self.items, revision, [])
+        self.arrow_entry = {
+            "sig": arrows_sig, "v": job.arrows.ARROWS_VERSION,
+            "geometry": {"state": "vector",
+                         "vector_paths": job.LINETYPE_DENSE_PATHS - 1},
+            "items": {"0": {"targets": [{"tip": [10, 10]}]}}}
+        store.save_json(store.slug_dir(self.slug) / "arrows.json",
+                        {"1": self.arrow_entry})
+        self.sig = job.linetypes.linetypes_signature(arrows_sig)
+        self.success = {"sig": self.sig,
+                        "v": job.linetypes.LINETYPE_VERSION,
+                        "used_all": [3],
+                        "bindings": [], "line_types": []}
+
+    def test_timeout_is_adaptive_at_dense_path_boundary(self):
+        self.assertEqual(job._linetype_timeout_for(
+            self.slug, 1, self.arrow_entry), job.LINETYPE_TIMEOUT)
+        dense = {**self.arrow_entry,
+                 "geometry": {"vector_paths": job.LINETYPE_DENSE_PATHS}}
+        self.assertEqual(job._linetype_timeout_for(
+            self.slug, 1, dense), job.LINETYPE_DENSE_TIMEOUT)
+
+        with mock.patch.object(job.linetypes, "compute_page_linetypes",
+                               return_value=self.success) as compute:
+            page, count, error = job._linetype_one(
+                self.slug, 1, self.items, dense, self.sig)
+        self.assertEqual((page, count, error), (1, 1, None))
+        self.assertEqual(compute.call_args.kwargs["timeout"],
+                         job.LINETYPE_DENSE_TIMEOUT)
+
+    def test_old_timeout_marker_is_retryable_only_with_larger_budget(self):
+        normal_error = "linetype sidecar timeout after 600s (sheet 1)"
+        old_dense_error = "linetype sidecar timeout after 1800s (sheet 1)"
+        current_dense_error = (
+            f"linetype sidecar timeout after {job.LINETYPE_DENSE_TIMEOUT}s "
+            "(sheet 1)"
+        )
+        dense = {**self.arrow_entry,
+                 "geometry": {"vector_paths": job.LINETYPE_DENSE_PATHS}}
+        self.assertFalse(job._linetype_failure_budget_increased(
+            self.slug, 1, self.arrow_entry, normal_error))
+        self.assertTrue(job._linetype_failure_budget_increased(
+            self.slug, 1, dense, normal_error))
+        self.assertTrue(job._linetype_failure_budget_increased(
+            self.slug, 1, dense, old_dense_error))
+        self.assertFalse(job._linetype_failure_budget_increased(
+            self.slug, 1, dense, current_dense_error))
+        self.assertFalse(job._linetype_failure_budget_increased(
+            self.slug, 1, dense, "deterministic PAGE_IR_ERROR"))
+
+    def test_arrow_success_persists_geometry_for_linetype_deadline(self):
+        geometry = {"state": "vector", "vector_paths": 12345,
+                    "images": 0, "image_coverage": 0.0}
+        found = {0: {"targets": [{"tip": [10, 10]}]}}
+        diagnostics = {0: {"state": "found"}}
+        with mock.patch.object(job.arrows, "page_geometry_status",
+                               return_value=geometry), \
+                mock.patch.object(job.arrows, "find_page_arrows",
+                                  return_value=(found, diagnostics)):
+            page, count, error = job._arrow_one(
+                self.slug, 1, self.items, "arrow-sig", [], [])
+        self.assertEqual((page, count, error), (1, 1, None))
+        cached = store.load_json(
+            store.slug_dir(self.slug) / "arrows.json", {})["1"]
+        self.assertEqual(cached["geometry"], geometry)
+
+    def test_arrow_waiting_for_heavy_slot_can_cancel(self):
+        cancelled = threading.Event()
+        geometry_seen = threading.Event()
+
+        def geometry(*_args, **_kwargs):
+            geometry_seen.set()
+            return {"state": "vector", "vector_paths": 10}
+
+        with mock.patch.object(job, "HEAVY_SIDECAR_SLOTS", 1), \
+                mock.patch.object(job.arrows, "page_geometry_status",
+                                  side_effect=geometry), \
+                mock.patch.object(job.arrows,
+                                  "find_page_arrows") as compute, \
+                job._slot_pool("heavy-sidecar", 1).slot(), \
+                ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                job._arrow_one, self.slug, 1, self.items, "arrow-sig", [], [],
+                cancelled.is_set)
+            self.assertTrue(geometry_seen.wait(2))
+            cancelled.set()
+            with self.assertRaises(job.Cancelled):
+                future.result(timeout=2)
+        compute.assert_not_called()
+
+    def test_linetype_waiting_for_heavy_slot_can_cancel(self):
+        cancelled = threading.Event()
+        with mock.patch.object(job, "HEAVY_SIDECAR_SLOTS", 1), \
+                mock.patch.object(job.linetypes,
+                                  "compute_page_linetypes") as compute, \
+                job._slot_pool("heavy-sidecar", 1).slot(), \
+                ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                job._linetype_one, self.slug, 1, self.items,
+                self.arrow_entry, self.sig, cancelled.is_set)
+            threading.Event().wait(0.1)
+            cancelled.set()
+            with self.assertRaises(job.Cancelled):
+                future.result(timeout=2)
+        compute.assert_not_called()
+
+    def test_timeout_and_structured_errors_are_not_retried(self):
+        errors = [
+            "linetype sidecar timeout after 600s (sheet 1)",
+            "linetype sidecar PAGE_IR_ERROR: bad page",
+            "SourceAlignmentError: source paints disagree",
+        ]
+        for message in errors:
+            with self.subTest(message=message), \
+                    mock.patch.object(
+                        job.linetypes, "compute_page_linetypes",
+                        side_effect=RuntimeError(message)) as compute, \
+                    mock.patch("time.sleep") as sleep:
+                page, count, error = job._linetype_one(
+                    self.slug, 1, self.items, self.arrow_entry, self.sig)
+            self.assertEqual((page, count), (1, None))
+            self.assertIn(message, error)
+            self.assertEqual(compute.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_transient_sidecar_exit_keeps_bounded_retry(self):
+        with mock.patch.object(
+                job.linetypes, "compute_page_linetypes",
+                side_effect=[RuntimeError("sidecar exit 137 with no output"),
+                             self.success]) as compute, \
+                mock.patch("time.sleep") as sleep:
+            page, count, error = job._linetype_one(
+                self.slug, 1, self.items, self.arrow_entry, self.sig)
+        self.assertEqual((page, count, error), (1, 1, None))
+        self.assertEqual(compute.call_count, 2)
+        sleep.assert_called_once_with(5)
+
+    def test_stale_prerequisite_skips_before_compute_and_write(self):
+        with mock.patch.object(job, "_linetype_jobs",
+                               return_value=([], [])), \
+                mock.patch.object(job.linetypes,
+                                  "compute_page_linetypes") as compute, \
+                mock.patch.object(job.linetypes, "save_page") as save:
+            result = job._linetype_one(
+                self.slug, 1, self.items, self.arrow_entry, self.sig)
+        self.assertEqual(result, (1, 0, None))
+        compute.assert_not_called()
+        save.assert_not_called()
+
+    def test_superseded_prerequisite_discards_computed_entry(self):
+        captured = (1, self.items, self.arrow_entry, self.sig)
+        with mock.patch.object(
+                job, "_linetype_jobs",
+                side_effect=[([captured], []), ([], [])]) as jobs, \
+                mock.patch.object(
+                    job.linetypes, "compute_page_linetypes",
+                    return_value=self.success) as compute, \
+                mock.patch.object(job.linetypes, "save_page") as save:
+            result = job._linetype_one(
+                self.slug, 1, self.items, self.arrow_entry, self.sig)
+        self.assertEqual(result, (1, 0, None))
+        self.assertEqual(jobs.call_count, 2)
+        compute.assert_called_once()
+        save.assert_not_called()
+
+    def test_same_page_callers_compute_once_under_advisory_lock(self):
+        entered = threading.Event()
+        release = threading.Event()
+        second_started = threading.Event()
+
+        def compute(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("test did not release line-type compute")
+            return self.success
+
+        def second_call():
+            second_started.set()
+            return job._linetype_one(
+                self.slug, 1, self.items, self.arrow_entry, self.sig)
+
+        with mock.patch.object(
+                job.linetypes, "compute_page_linetypes",
+                side_effect=compute) as run_compute, \
+                ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                job._linetype_one, self.slug, 1, self.items,
+                self.arrow_entry, self.sig)
+            self.assertTrue(entered.wait(2))
+            second = pool.submit(second_call)
+            self.assertTrue(second_started.wait(2))
+            release.set()
+            self.assertEqual(first.result(timeout=2), (1, 1, None))
+            self.assertEqual(second.result(timeout=2), (1, 0, None))
+
+        self.assertEqual(run_compute.call_count, 1)
+        self.assertTrue(job._linetype_page_lock_path(
+            self.slug, 1).is_file())
+
+
+class TestRemoteModelTimeoutBounds(JobTestBase):
+    """Remote stalls get one recall retry; local deterministic stalls do not."""
+
+    def test_serialized_timeout_names_remain_detectable(self):
+        self.assertTrue(job.is_timeout_error(
+            RuntimeError("ReadTimeout: upstream socket closed")))
+        self.assertTrue(job.is_timeout_error(
+            RuntimeError("DeadlineExceeded: provider request")))
+
+    def test_symbol_timeout_recovers_on_one_bounded_retry(self):
+        slug = job.create_project(b"%PDF-1.4 fake", "symbol-timeout.pdf")
+        entry = {
+            "sig": "sig", "v": 1, "pv": 1, "model": job.MODEL_NAME,
+            "raw": {"groups": [], "symbols": []},
+            "result": {"groups": [], "symbols": []},
+        }
+        with mock.patch(
+                "steps.symbols.compute_page_symbols",
+                side_effect=[TimeoutError("provider timed out"),
+                             (entry, True)]) as compute, \
+                mock.patch("steps.legend_sweep.sweep_needed",
+                           return_value=[]), \
+                mock.patch.object(job.time, "sleep") as sleep:
+            result = job._symbol_one(
+                slug, 1, [{"text": "FENCE", "box_2d": [1, 1, 2, 2]}],
+                "sig")
+        self.assertEqual((result[0], result[1], result[2]), (1, 0, None))
+        self.assertEqual(compute.call_count, 2)
+        sleep.assert_called_once_with(15)
+
+    def test_view_timeout_stops_after_two_total_attempts(self):
+        slug = job.create_project(b"%PDF-1.4 fake", "view-timeout.pdf")
+        with mock.patch(
+                "steps.views.compute_view_types",
+                side_effect=TimeoutError("provider timed out")) as compute, \
+                mock.patch.object(job.time, "sleep") as sleep:
+            page, summary, error = job._view_one(
+                slug, 1, store.pdf_path(slug), [], "revision")
+        self.assertEqual((page, summary), (1, None))
+        self.assertIn("TimeoutError", error)
+        self.assertEqual(compute.call_count, 2)
+        sleep.assert_called_once_with(10)
+
+    def test_text_judge_timeout_recovers_on_second_attempt(self):
+        from steps.text import judge as text_judge
+
+        response = mock.Mock(text="[]", usage_metadata=None)
+        with mock.patch.object(
+                text_judge, "gen_json",
+                side_effect=[TimeoutError("provider timed out"), response]
+                ) as generate, \
+                mock.patch.object(text_judge.time, "sleep") as sleep:
+            verdicts, _usage = text_judge.judge_strings(["SECURITY GATE"])
+        self.assertEqual(verdicts, {"SECURITY GATE": False})
+        self.assertEqual(generate.call_count, 2)
+        sleep.assert_called_once_with(15)
+
+    def test_text_judge_checkpoints_other_chunks_before_raising(self):
+        from steps.text import judge as text_judge
+
+        successful = {}
+
+        def generate(_model, contents, **_kwargs):
+            if "FAIL CHUNK" in contents[0]:
+                raise TimeoutError("provider timed out")
+            return mock.Mock(text="[]", usage_metadata=None)
+
+        with mock.patch.object(text_judge, "gen_json", side_effect=generate), \
+                mock.patch.object(text_judge.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "1 of 2 judge chunks"):
+                text_judge.judge_strings(
+                    ["FAIL CHUNK", "OK CHUNK"], chunk=1,
+                    on_chunk=successful.update)
+        self.assertEqual(successful, {"OK CHUNK": False})
+
+
 class TestTextStageOffline(JobTestBase):
     """真跑一遍 text 阶段：真 PDF、真矢量层、真融合，但一次模型调用都不许发生.
 
-    做法：判词候选全被关键词地板吃掉（零 judge 调用），vlm.json 预置一条当期
-    身份的 raw（零 VLM 调用），并把两个模块里的 gen_json 直接换成会炸的假函数
+    做法：判词候选全被关键词地板吃掉（零 judge 调用），主模型和 Flash
+    的 raw 都预置当期身份（零 VLM 调用），并把两个模块里的 gen_json
+    直接换成会炸的假函数
     —— 只要还有任何付费路径被走到，测试就会红。
     """
 
     def setUp(self):
         super().setUp()
         import fitz
-        from steps.text import build_vlm_prompt, make_vlm_record, vlm_identity
+        from steps.text import (SECONDARY_UNION_ROLE, build_vlm_prompt,
+                                make_vlm_record, vlm_identity)
 
         self.text = "6 FT CHAIN LINK FENCE"
         doc = fitz.open()
@@ -575,7 +1207,8 @@ class TestTextStageOffline(JobTestBase):
         line = vector_scan(pdf, 0)["lines"][0]
         self.box = [int(line["box_2d"][0]), int(line["box_2d"][1]),
                     int(line["box_2d"][2]) + 1, int(line["box_2d"][3]) + 1]
-        identity = vlm_identity(pdf, None, build_vlm_prompt(None))
+        prompt = build_vlm_prompt(None)
+        identity = vlm_identity(pdf, None, prompt)
         store.save_json(store.slug_dir(self.slug) / "vlm.json", {
             "1": make_vlm_record(
                 identity=identity,
@@ -583,6 +1216,11 @@ class TestTextStageOffline(JobTestBase):
                         "label": "note"}],
                 elapsed=1.0,
                 usage={"input_tokens": 10, "output_tokens": 5})})
+        flash_identity = vlm_identity(pdf, job.FLASH_MODEL, prompt)
+        store.save_json(store.slug_dir(self.slug) / "vlm_flash.json", {
+            "1": make_vlm_record(
+                identity=flash_identity, items=[], elapsed=1.0, usage={},
+                role=SECONDARY_UNION_ROLE)})
 
         self.blocked_calls = []
 
@@ -624,20 +1262,198 @@ class TestTextStageOffline(JobTestBase):
         again = store.load_json(store.results_path(self.slug), None)
         self.assertEqual(again["pages"], res["pages"])
 
+    def test_malformed_vlm_retries_change_bytes_but_keep_base_identity(self):
+        """A retry must escape provider caching without poisoning cache identity."""
+        from steps.text import is_current_primary_record, vlm_identity
+
+        base_prompt = "find every fence and return one JSON array"
+        prompts = []
+        item = {"text": "FENCE", "box_2d": [100, 100, 120, 180],
+                "label": "callout"}
+
+        def fake_scan(_pdf, _page, **kwargs):
+            prompts.append(kwargs["prompt"])
+            if len(prompts) < 3:
+                raise RuntimeError("malformed JSON")
+            return [item], 1.0, {"input_tokens": 1, "output_tokens": 1}
+
+        raw = {}
+        raw_path = store.slug_dir(self.slug) / "retry_nonce_test.json"
+        with mock.patch("steps.text.scan_page", side_effect=fake_scan), \
+                mock.patch.object(job.time, "sleep"), \
+                mock.patch.object(job.time, "time_ns", side_effect=[101, 102]):
+            page, count, _error = job._run_vlm(
+                self.slug, store.pdf_path(self.slug), 1, raw, raw_path,
+                prompt=base_prompt)
+
+        self.assertEqual((page, count), (1, 1))
+        self.assertEqual(prompts[0], base_prompt)
+        self.assertIn("ATTEMPT 2", prompts[1])
+        self.assertIn("ATTEMPT 3", prompts[2])
+        self.assertEqual(len(set(prompts)), 3)
+        expected = vlm_identity(
+            store.pdf_path(self.slug), None, base_prompt)
+        self.assertTrue(is_current_primary_record(raw["1"], expected))
+        self.assertEqual(store.load_json(raw_path, {})["1"], raw["1"])
+
     def test_custom_target_needs_a_paid_scan_so_it_reports_the_failure(self):
         """换目标 → VLM 缓存身份失配 → 必须重扫（证明 prompt 参与缓存身份）."""
         with mock.patch.object(job, "_judge_project",
                                return_value=(set(), None)), \
                 mock.patch("time.sleep") as sleep:      # 别真等退避
             warnings = job._stage_text(self.slug, "find every manhole cover")
-        self.assertTrue(any("text VLM failed" in w for w in warnings), warnings)
-        self.assertTrue(any("stale sheets" in w for w in warnings), warnings)
-        # RETRIES=2 → 共 3 次尝试，退避 20*(n+1) 秒
-        self.assertEqual(len(self.blocked_calls), 3)
-        self.assertEqual([c.args[0] for c in sleep.call_args_list], [20, 40])
+        self.assertEqual(len(warnings), 2, warnings)
+        self.assertTrue(any("primary image scan incomplete" in w
+                            for w in warnings), warnings)
+        self.assertTrue(any("second image scan incomplete" in w
+                            for w in warnings), warnings)
+        # 两个独立模型各执行正常的 3 次策略，然后只对仍失败的来源各补
+        # 一个带新 nonce 的最终修复请求。
+        self.assertEqual(len(self.blocked_calls), 8)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list],
+                         [20, 40, 20, 40])
         # 取消/失败都不能让已发布的结果消失：这页没有结果，但 raw 的 error 记录在
         vlm = store.load_json(store.slug_dir(self.slug) / "vlm.json", {})
         self.assertIn("AssertionError", vlm["1"]["error"])
+
+    def test_primary_timeout_is_salvaged_by_independent_flash(self):
+        """One timed-out model must not erase a result the other model found."""
+        from steps.text.vlmcache import is_current_secondary_record
+        from steps.text import build_vlm_prompt, vlm_identity
+
+        (store.slug_dir(self.slug) / "vlm.json").unlink()
+        (store.slug_dir(self.slug) / "vlm_flash.json").unlink()
+        calls = []
+        flash_item = {
+            "text": "ORANGE PLASTIC SNOW FENCE",
+            "box_2d": [700, 100, 730, 420], "label": "note"}
+
+        def fake_scan(_pdf, _page, model=None, **_kwargs):
+            calls.append(model)
+            if model == job.FLASH_MODEL:
+                return [flash_item], 1.0, {"input_tokens": 1}
+            raise TimeoutError("model timed out")
+
+        with mock.patch.object(job, "_judge_project",
+                               return_value=(set(), None)), \
+                mock.patch("steps.text.scan_page", side_effect=fake_scan), \
+                mock.patch("time.sleep") as sleep:
+            warnings = job._stage_text(self.slug, None)
+        self.assertEqual(calls, [job.MODEL_NAME, job.FLASH_MODEL,
+                                 job.MODEL_NAME])
+        # Flash gets its first chance before the timed-out Pro request is
+        # repeated; the deferred retry itself is exactly one call.
+        sleep.assert_not_called()
+        self.assertTrue(any("primary image scan incomplete" in w
+                            for w in warnings))
+        result = store.load_json(store.results_path(self.slug), {})
+        self.assertEqual(
+            [item["text"] for item in result["pages"]["1"]["vlm_items"]],
+            [flash_item["text"]])
+        self.assertIn("TimeoutError", result["pages"]["1"]["vlm_error"])
+        flash = store.load_json(store.slug_dir(self.slug) / "vlm_flash.json", {})
+        expected = vlm_identity(
+            store.pdf_path(self.slug), job.FLASH_MODEL,
+            build_vlm_prompt(None))
+        self.assertTrue(is_current_secondary_record(flash["1"], expected))
+
+        # The failed primary remains explicit rework, but the successful Flash
+        # raw is reused and its published detection cannot disappear.
+        calls.clear()
+        with mock.patch.object(job, "_judge_project",
+                               return_value=(set(), None)), \
+                mock.patch("steps.text.scan_page", side_effect=fake_scan), \
+                mock.patch("time.sleep"):
+            job._stage_text(self.slug, None)
+        self.assertEqual(calls, [job.MODEL_NAME, job.MODEL_NAME])
+        again = store.load_json(store.results_path(self.slug), {})
+        self.assertEqual(
+            [item["text"] for item in again["pages"]["1"]["vlm_items"]],
+            [flash_item["text"]])
+
+    def test_malformed_source_is_repaired_once_without_warning(self):
+        """All residual failures get one fresh request after both models run."""
+        from steps.text import (build_vlm_prompt, is_current_primary_record,
+                                vlm_identity)
+
+        (store.slug_dir(self.slug) / "vlm.json").unlink()
+        (store.slug_dir(self.slug) / "vlm_flash.json").unlink()
+        primary_calls = []
+        item = {"text": "FENCE", "box_2d": [100, 100, 120, 180],
+                "label": "callout"}
+
+        def fake_scan(_pdf, _page, model=None, **kwargs):
+            if model == job.FLASH_MODEL:
+                return [], 1.0, {"input_tokens": 1}
+            primary_calls.append(kwargs["prompt"])
+            if len(primary_calls) <= 3:
+                raise RuntimeError("malformed provider JSON")
+            return [item], 1.0, {"input_tokens": 1}
+
+        with mock.patch.object(job, "_judge_project",
+                               return_value=(set(), None)), \
+                mock.patch("steps.text.scan_page", side_effect=fake_scan), \
+                mock.patch.object(job.time, "sleep"), \
+                mock.patch.object(job.time, "time_ns",
+                                  side_effect=[101, 102, 103]):
+            warnings = job._stage_text(self.slug, None)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(primary_calls), 4)
+        self.assertIn("ATTEMPT 2", primary_calls[1])
+        self.assertIn("ATTEMPT 3", primary_calls[2])
+        self.assertIn("ATTEMPT 4", primary_calls[3])
+        identity = vlm_identity(store.pdf_path(self.slug), None,
+                                build_vlm_prompt(None))
+        raw = store.load_json(store.slug_dir(self.slug) / "vlm.json", {})
+        self.assertTrue(is_current_primary_record(raw["1"], identity))
+
+    def test_persisted_error_recovery_starts_with_fresh_nonce(self):
+        """A reset=false rerun must not resend the failed base bytes."""
+        from steps.text import (build_vlm_prompt, make_vlm_record,
+                                vlm_identity)
+
+        prompt = build_vlm_prompt(None)
+        identity = vlm_identity(store.pdf_path(self.slug), None, prompt)
+        path = store.slug_dir(self.slug) / "vlm.json"
+        store.save_json(path, {"1": make_vlm_record(
+            identity=identity, error="RuntimeError: previous bad response")})
+        seen = []
+
+        def fake_scan(_pdf, _page, **kwargs):
+            seen.append(kwargs["prompt"])
+            return [], 1.0, {"input_tokens": 1}
+
+        with mock.patch.object(job, "_judge_project",
+                               return_value=(set(), None)), \
+                mock.patch("steps.text.scan_page", side_effect=fake_scan), \
+                mock.patch.object(job.time, "time_ns", return_value=777):
+            self.assertEqual(job._stage_text(self.slug, None), [])
+        self.assertEqual(len(seen), 1)
+        self.assertIn("ATTEMPT 2", seen[0])
+        self.assertIn("nonce=text-scan-retry-2-777", seen[0])
+
+    def test_accuracy_mode_unions_both_models_on_text_layer_page(self):
+        """Flash is not limited to empty Pro pages or raster-only pages."""
+        (store.slug_dir(self.slug) / "vlm.json").unlink()
+        (store.slug_dir(self.slug) / "vlm_flash.json").unlink()
+        primary = {"text": "EXISTING RETAINING WALL & FENCE",
+                   "box_2d": [300, 100, 330, 420], "label": "callout"}
+        secondary = {"text": "STEEL FENCE POST @ 6 FT O.C.",
+                     "box_2d": [700, 100, 730, 420], "label": "note"}
+
+        def fake_scan(_pdf, _page, model=None, **_kwargs):
+            item = secondary if model == job.FLASH_MODEL else primary
+            return [item], 1.0, {"input_tokens": 1}
+
+        with mock.patch.object(job, "_judge_project",
+                               return_value=(set(), None)), \
+                mock.patch("steps.text.scan_page", side_effect=fake_scan):
+            self.assertEqual(job._stage_text(self.slug, None), [])
+        result = store.load_json(store.results_path(self.slug), {})
+        texts = {item["text"] for item in
+                 result["pages"]["1"]["vlm_items"]}
+        self.assertEqual(texts, {primary["text"], secondary["text"]})
 
 
 if __name__ == "__main__":

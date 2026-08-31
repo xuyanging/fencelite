@@ -1,6 +1,6 @@
 # fence_lite systemd 单元。装法见同目录 setup_ubuntu.sh。
 #
-# 路径按 /home/ubuntu/fence_lite2 写死。换目录的话这里、setup 脚本、反代三处一起改。
+# 路径按 /home/ubuntu/fence_lite 写死。换目录的话这里、setup 脚本、反代三处一起改。
 [Unit]
 Description=fence_lite (six-stage pipeline: vec/judge/text/symbols/placements/arrows/linetypes)
 After=network-online.target
@@ -9,8 +9,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/fence_lite2
-EnvironmentFile=/home/ubuntu/fence_lite2/.env
+WorkingDirectory=/home/ubuntu/fence_lite
+EnvironmentFile=/home/ubuntu/fence_lite/.env
 Environment=PYTHONUTF8=1
 Environment=PYTHONUNBUFFERED=1
 # glibc 的 arena 会攥着渲染峰值不还。实测把常驻 RSS 从 777M 压到 111M。
@@ -26,7 +26,7 @@ Environment=LINETYPES=1
 # arrows_signature 既不含 node 版本也不含 sidecar.mjs 摘要：换了解释器结果变了
 # 缓存**不会**失效。所以必须写死，不能靠 PATH 上碰巧是哪个。
 Environment=ARROWS_NODE=/home/ubuntu/.local/opt/node/bin/node
-Environment=LINETYPE_PYTHON=/home/ubuntu/fence_lite2/tools/linetype_sidecar/venv/bin/python
+Environment=LINETYPE_PYTHON=/home/ubuntu/fence_lite/tools/linetype_sidecar/venv/bin/python
 
 # --- 并发旋钮全部显式给值 ---
 # core/hw.py 会按机器推，但它在容器里读到的是宿主规格，而且 clamp 的下限
@@ -49,7 +49,12 @@ Environment=LINETYPE_CPU_BUDGET=2
 # arrows.json 那些「整文件读-改-写」跨进程互相覆盖 —— 已付费的 raw 成批消失且零报错。
 # --timeout 900：/img 首渲是 600 DPI / 长边 5000px，且串在全局 FITZ_LOCK 后，
 # gunicorn 默认的 30s 会把 worker 杀掉，而 -w 1 下那等于整服务瞬断。
-ExecStart=/home/ubuntu/fence_lite2/venv/bin/gunicorn -w 1 --threads 4 \
+# Browsers open about six image downloads in parallel.  ``send_file`` keeps a
+# gthread occupied while a remote client drains a multi-megabyte drawing; four
+# threads therefore let thumbnails starve /api/job and make a completed upload
+# look frozen.  Keep the required single process, but leave ample I/O threads
+# for status/API traffic.  Pipeline mutations remain serialized inside job.py.
+ExecStart=/home/ubuntu/fence_lite/venv/bin/gunicorn -w 1 --threads 16 \
           --worker-class gthread --timeout 900 --graceful-timeout 60 \
           --access-logfile - --error-logfile - \
           -b 0.0.0.0:5051 wsgi:app

@@ -20,9 +20,11 @@ import base64
 import io
 import json
 import sys
+import threading
 import time
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from PIL import Image
@@ -30,7 +32,8 @@ from PIL import Image
 from core import gemini as core_gemini
 from core import llm
 from core.config import (MODEL_NAME, PRICING, compute_cost, get_model_override,
-                         provider_of, resolve_model, set_model_override)
+                         provider_of, resolve_model, set_model_override,
+                         submit_with_context)
 
 
 def _part(data, mime="image/png"):
@@ -98,6 +101,67 @@ class TestModelOverride(unittest.TestCase):
         set_model_override("claude-opus-5")
         set_model_override(None)
         self.assertEqual(resolve_model(None), MODEL_NAME)
+
+    def test_concurrent_threads_keep_different_job_models(self):
+        barrier = threading.Barrier(2)
+        seen = {}
+
+        def run(label, model):
+            set_model_override(model)
+            barrier.wait(timeout=2)
+            seen[label] = resolve_model(None)
+
+        left = threading.Thread(
+            target=run, args=("left", "claude-sonnet-5"))
+        right = threading.Thread(
+            target=run, args=("right", "gemini-2.5-flash"))
+        left.start(); right.start()
+        left.join(timeout=3); right.join(timeout=3)
+        self.assertEqual(seen, {
+            "left": "claude-sonnet-5",
+            "right": "gemini-2.5-flash",
+        })
+
+
+class TestConcurrentRecorder(unittest.TestCase):
+    def test_worker_context_keeps_two_job_ledgers_separate(self):
+        outer = threading.Barrier(2)
+
+        def run(slug, model, calls):
+            set_model_override(model)
+            core_gemini.RECORDER.start(slug)
+
+            def paid_call():
+                self.assertEqual(resolve_model(None), model)
+                core_gemini.RECORDER.enter()
+                try:
+                    time.sleep(0.01)
+                    core_gemini.RECORDER.add(
+                        model, 0.01,
+                        {"input_tokens": 10, "output_tokens": 2})
+                finally:
+                    core_gemini.RECORDER.leave()
+
+            outer.wait(timeout=2)
+            with ThreadPoolExecutor(max_workers=calls) as executor:
+                futures = [submit_with_context(executor, paid_call)
+                           for _ in range(calls)]
+                for future in futures:
+                    future.result(timeout=2)
+            return core_gemini.RECORDER.stop(slug)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            left = executor.submit(
+                run, "pdf-left", "claude-sonnet-5", 2)
+            right = executor.submit(
+                run, "pdf-right", "gemini-2.5-flash", 3)
+            left_summary = left.result(timeout=4)
+            right_summary = right.result(timeout=4)
+
+        self.assertEqual(left_summary["calls"], 2)
+        self.assertEqual(set(left_summary["by_model"]), {"claude-sonnet-5"})
+        self.assertEqual(right_summary["calls"], 3)
+        self.assertEqual(set(right_summary["by_model"]), {"gemini-2.5-flash"})
 
 
 class TestGenJsonDispatch(unittest.TestCase):
@@ -422,8 +486,8 @@ class TestConcurrencyGate(unittest.TestCase):
     """并发闸：账号的 concurrent-connections 限额比流水线的 worker 数低，
     越限返回 429 且重试也会继续相撞，所以必须在这一层挡住。"""
 
-    def test_semaphore_matches_configured_cap(self):
-        self.assertEqual(llm._slots._initial_value, llm.MAX_CONCURRENCY)
+    def test_slot_pool_matches_configured_cap(self):
+        self.assertEqual(llm._slots.capacity, llm.MAX_CONCURRENCY)
 
     def test_cap_is_at_least_one(self):
         self.assertGreaterEqual(llm.MAX_CONCURRENCY, 1)

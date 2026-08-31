@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically refresh stale fence_lite line-type pages
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=2min
+AccuracySec=10s
+Persistent=true
+Unit=fence-linetype-refresh.service
+
+[Install]
+WantedBy=timers.target
